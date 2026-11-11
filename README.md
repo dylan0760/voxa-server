@@ -59,6 +59,14 @@ runs as a service, even when the manager is closed.
   clients, topic and description, codec quality, moderated channels (talk power).
 * Server and channel groups with a permission editor, privilege keys, bans, kick, move,
   poke, channel commander.
+* **Images in chat:**
+  * Images posted by 1.5.0 clients are stored encrypted in the database alongside the
+    chat history, with the same permissions as sending text there.
+  * Only people who can see that chat can open them: everyone for server chat, channel
+    members for a channel, and the two participants for a private chat.
+  * Deleting the message, clearing the chat, deleting the channel or the chat retention
+    period removes them too.
+  * PNG, JPEG, GIF, WebP and BMP, up to 10 MB each.
 * **Chat moderation:**
   * Delete single messages: your own always, anyone's with *Delete anyone's chat
     messages*.

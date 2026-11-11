@@ -20,6 +20,10 @@ const PRIVKEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("privilege_k
 const CHAT: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("chat");
 /// Per-user permission bits granted on top of the user's groups.
 const CLIENT_PERMS: TableDefinition<&str, u64> = TableDefinition::new("client_perms");
+/// Chat images (1.5.0+): small sealed metadata and the sealed image bytes, kept apart
+/// so clean-ups never have to decrypt whole images.
+const IMAGE_META: TableDefinition<u64, &[u8]> = TableDefinition::new("image_meta");
+const IMAGE_DATA: TableDefinition<u64, &[u8]> = TableDefinition::new("image_data");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StoredSettings {
@@ -69,6 +73,20 @@ pub struct StoredMessage {
     pub text: String,
 }
 
+/// Where a chat image was posted and who may see it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ImageMeta {
+    /// Stored chat it belongs to (`SERVER_CHAT_CHANNEL` for the server chat), or None
+    /// for a private conversation.
+    pub ch: Option<ChannelId>,
+    /// Message carrying the image (0 for private conversations).
+    pub msg: MessageId,
+    /// Participants of a private conversation.
+    pub uids: Vec<String>,
+    pub ts: u64,
+    pub name: String,
+}
+
 pub struct Store {
     db: Database,
     cipher: XChaCha20Poly1305,
@@ -98,6 +116,8 @@ impl Store {
             w.open_table(PRIVKEYS)?;
             w.open_table(CHAT)?;
             w.open_table(CLIENT_PERMS)?;
+            w.open_table(IMAGE_META)?;
+            w.open_table(IMAGE_DATA)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -328,6 +348,7 @@ impl Store {
             }
         }
         w.commit()?;
+        self.delete_images_where(|m| m.ch == Some(id))?;
         Ok(())
     }
 
@@ -461,6 +482,83 @@ impl Store {
     }
 
     // ---------- chat (encrypted at rest) ----------
+
+    fn seal_raw(&self, aad: &[u8], pt: &[u8]) -> Vec<u8> {
+        let nonce: [u8; 24] = crate::secrets::random_bytes();
+        let ct = self.cipher.encrypt(XNonce::from_slice(&nonce), Payload { msg: pt, aad }).expect("encrypt");
+        [nonce.as_slice(), &ct].concat()
+    }
+
+    fn unseal_raw(&self, aad: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+        if data.len() < 24 {
+            return None;
+        }
+        self.cipher.decrypt(XNonce::from_slice(&data[..24]), Payload { msg: &data[24..], aad }).ok()
+    }
+
+    fn image_aad(kind: &[u8], id: u64) -> Vec<u8> {
+        [b"voxa-image-".as_slice(), kind, &id.to_be_bytes()].concat()
+    }
+
+    pub fn new_image_id(&self) -> R<u64> {
+        self.next_id("next_image")
+    }
+
+    pub fn put_image(&self, id: u64, meta: &ImageMeta, data: &[u8]) -> R<()> {
+        let m = self.seal_raw(&Self::image_aad(b"meta", id), &enc(meta));
+        let d = self.seal_raw(&Self::image_aad(b"data", id), data);
+        let w = self.db.begin_write()?;
+        w.open_table(IMAGE_META)?.insert(id, m.as_slice())?;
+        w.open_table(IMAGE_DATA)?.insert(id, d.as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn image_meta(&self, id: u64) -> R<Option<ImageMeta>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(IMAGE_META)?;
+        Ok(t.get(id)?.and_then(|v| self.unseal_raw(&Self::image_aad(b"meta", id), v.value())).and_then(|p| dec(&p)))
+    }
+
+    pub fn image_data(&self, id: u64) -> R<Option<Vec<u8>>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(IMAGE_DATA)?;
+        Ok(t.get(id)?.and_then(|v| self.unseal_raw(&Self::image_aad(b"data", id), v.value())))
+    }
+
+    /// Deletes every image whose metadata matches `doomed`. Returns the count.
+    pub fn delete_images_where(&self, doomed: impl Fn(&ImageMeta) -> bool) -> R<usize> {
+        let ids: Vec<u64> = {
+            let r = self.db.begin_read()?;
+            let t = r.open_table(IMAGE_META)?;
+            let mut v = Vec::new();
+            for row in t.iter()? {
+                let (k, val) = row?;
+                let id = k.value();
+                match self.unseal_raw(&Self::image_aad(b"meta", id), val.value()).and_then(|p| dec::<ImageMeta>(&p)) {
+                    Some(m) if doomed(&m) => v.push(id),
+                    // Unreadable metadata: nobody could ever be allowed to see it.
+                    None => v.push(id),
+                    _ => {}
+                }
+            }
+            v
+        };
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let w = self.db.begin_write()?;
+        {
+            let mut m = w.open_table(IMAGE_META)?;
+            let mut d = w.open_table(IMAGE_DATA)?;
+            for id in &ids {
+                m.remove(*id)?;
+                d.remove(*id)?;
+            }
+        }
+        w.commit()?;
+        Ok(ids.len())
+    }
 
     fn seal(&self, ch: u64, id: u64, m: &StoredMessage) -> Vec<u8> {
         let nonce: [u8; 24] = crate::secrets::random_bytes();

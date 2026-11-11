@@ -161,6 +161,13 @@ pub enum BulkC2S {
     UploadEnd { id: u32 },
     Download { id: u32, channel: ChannelId, path: String },
     Cancel { id: u32 },
+
+    // --- added in 1.5.0; only sent to servers that are 1.5.0 or newer ---
+    /// Posts an image to a chat; it is stored encrypted like the chat text. Answered
+    /// with `ChatImageSent` or `TransferError` carrying the same id.
+    ChatImage { id: u32, target: TextTarget, name: String, width: u32, height: u32, data: Vec<u8> },
+    /// Fetches a chat image (answered with `Image` or `ImageError`).
+    GetImage(u64),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -174,6 +181,11 @@ pub enum BulkS2C {
     DownloadChunk { id: u32, data: Vec<u8> },
     DownloadEnd { id: u32 },
     TransferError { id: u32, message: String },
+
+    // --- added in 1.5.0; only sent in answer to the 1.5.0 requests above ---
+    ChatImageSent { id: u32 },
+    Image { image: u64, data: Vec<u8> },
+    ImageError { image: u64, message: String },
 }
 
 pub const FILE_CHUNK: usize = 256 * 1024;

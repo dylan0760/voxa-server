@@ -970,7 +970,8 @@ impl Server {
                 };
                 let by = s.info.nickname.clone();
                 let n = db(self.store.clear_chat(ch))?;
-                info!("{by} cleared the chat history of {target:?} ({n} messages)");
+                let imgs = self.store.delete_images_where(|m| m.ch == Some(ch)).unwrap_or(0);
+                info!("{by} cleared the chat history of {target:?} ({n} messages, {imgs} images)");
                 let ids: Vec<ClientId> = st
                     .sessions
                     .values()
@@ -1452,6 +1453,15 @@ impl Server {
             self.need(p, perm::CHAT_DELETE)?;
         }
         db(self.store.delete_chat(ch, id))?;
+        // An image message takes its image with it (only the image really posted with
+        // this message, not one a typed tag merely points to).
+        if let Some(img) = ImageRef::parse(&m.text) {
+            if let Ok(Some(meta)) = self.store.image_meta(img.id) {
+                if meta.ch == Some(ch) && meta.msg == id {
+                    let _ = self.store.delete_images_where(|x| x.ch == Some(ch) && x.msg == id);
+                }
+            }
+        }
         info!("{} deleted a chat message by {} in {target:?}", s.info.nickname, m.from_name);
         match target {
             TextTarget::Channel(c) => st.broadcast_channel(c, S2C::MessageDeleted { target, id }),
@@ -1669,6 +1679,104 @@ impl Server {
             Err(e) => warn!("chat retention failed: {e:#}"),
             _ => {}
         }
+        match self.store.delete_images_where(|m| m.ts < cutoff) {
+            Ok(n) if n > 0 => info!("chat retention: removed {n} old images"),
+            Err(e) => warn!("chat image retention failed: {e:#}"),
+            _ => {}
+        }
+    }
+
+    // ------------------------------------------------------------------ chat images
+
+    /// Posts an image to a chat (bulk connection, clients 1.5.0+). Same permissions as
+    /// sending text there; the image is stored encrypted next to the message.
+    pub fn post_image(&self, me: ClientId, target: TextTarget, name: &str, width: u32, height: u32, data: Vec<u8>) -> Res {
+        if data.is_empty() || data.len() > MAX_CHAT_IMAGE {
+            return Err(format!("Images can be at most {} MB", MAX_CHAT_IMAGE / (1024 * 1024)));
+        }
+        let ext = image_kind(&data).ok_or("Not a supported image (PNG, JPEG, GIF, WebP or BMP)")?;
+        let name: String = name.chars().filter(|c| !c.is_control()).collect();
+        let mut name = truncate(name.trim(), 100);
+        if name.is_empty() {
+            name = format!("image.{ext}");
+        }
+        let mut guard = self.state.lock();
+        let st = &mut *guard;
+        let s = st.session(me)?;
+        let from_uid = s.info.uid.clone();
+        let from_name = s.info.nickname.clone();
+        let ts = now_unix();
+        let (width, height) = (width.min(100_000), height.min(100_000));
+        let size = data.len();
+        match target {
+            TextTarget::Server | TextTarget::Channel(_) => {
+                let ch = match target {
+                    TextTarget::Channel(ch) => {
+                        if s.info.channel != ch {
+                            return Err("You can only post to the channel you are in".into());
+                        }
+                        self.need(self.perms_in(st, s, ch), perm::CHANNEL_CHAT)?;
+                        ch
+                    }
+                    _ => {
+                        self.need(st.server_perms(s), perm::SERVER_CHAT)?;
+                        SERVER_CHAT_CHANNEL
+                    }
+                };
+                let image = db(self.store.new_image_id())?;
+                let text = ImageRef { id: image, width, height, name: name.clone() }.to_text();
+                let stored = StoredMessage { from_uid: from_uid.clone(), from_name: from_name.clone(), ts, text: text.clone() };
+                let id = db(self.store.append_chat(ch, &stored))?;
+                let meta = ImageMeta { ch: Some(ch), msg: id, uids: Vec::new(), ts, name: name.clone() };
+                if let Err(e) = db(self.store.put_image(image, &meta, &data)) {
+                    let _ = self.store.delete_chat(ch, id);
+                    return Err(e);
+                }
+                let m = ChatMessage { id, target, from: Some(me), from_uid, from_name: from_name.clone(), ts, text };
+                if ch == SERVER_CHAT_CHANNEL {
+                    st.broadcast(S2C::Text(m));
+                } else {
+                    st.broadcast_channel(ch, S2C::Text(m));
+                }
+            }
+            TextTarget::Private(other) => {
+                self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
+                let other_uid = st.session(other)?.info.uid.clone();
+                let image = db(self.store.new_image_id())?;
+                let text = ImageRef { id: image, width, height, name: name.clone() }.to_text();
+                let meta = ImageMeta { ch: None, msg: 0, uids: vec![from_uid.clone(), other_uid], ts, name: name.clone() };
+                db(self.store.put_image(image, &meta, &data))?;
+                let m = ChatMessage { id: 0, target: TextTarget::Private(me), from: Some(me), from_uid, from_name: from_name.clone(), ts, text };
+                st.send(other, S2C::Text(m.clone()));
+                st.send(me, S2C::Text(ChatMessage { target: TextTarget::Private(other), ..m }));
+            }
+        }
+        info!("{from_name} posted image \"{name}\" ({} KB) to {target:?}", size / 1024);
+        Ok(())
+    }
+
+    /// Returns a chat image if `me` may see it: server chat images to everyone,
+    /// channel images to members of that channel, private ones to the two participants.
+    pub fn chat_image(&self, me: ClientId, image: u64) -> Res<Vec<u8>> {
+        let meta = db(self.store.image_meta(image))?.ok_or("Image not found (it may have been deleted)")?;
+        {
+            let st = self.state.lock();
+            let s = st.session(me)?;
+            match meta.ch {
+                Some(SERVER_CHAT_CHANNEL) => {}
+                Some(ch) => {
+                    if s.info.channel != ch && st.server_perms(s) & perm::CHANNEL_EDIT == 0 {
+                        return Err("Join the channel to see its images".into());
+                    }
+                }
+                None => {
+                    if !meta.uids.contains(&s.info.uid) {
+                        return Err("This image belongs to someone else's conversation".into());
+                    }
+                }
+            }
+        }
+        db(self.store.image_data(image))?.ok_or_else(|| "Image not found (it may have been deleted)".to_string())
     }
 
     // ------------------------------------------------------------------ screen share

@@ -299,6 +299,53 @@ pub struct ChatMessage {
     pub text: String,
 }
 
+/// Largest image that can be posted to a chat.
+pub const MAX_CHAT_IMAGE: usize = 10 * 1024 * 1024;
+
+const IMAGE_TAG: &str = "[voxa-image:";
+
+/// An image posted to a chat. It travels inside the message text as a tag, so clients
+/// that don't know images still show "📷 name" instead of nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageRef {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub name: String,
+}
+
+impl ImageRef {
+    pub fn to_text(&self) -> String {
+        format!("📷 {}\n{IMAGE_TAG}{}:{}x{}]", self.name, self.id, self.width, self.height)
+    }
+
+    pub fn parse(text: &str) -> Option<ImageRef> {
+        let (head, tail) = text.rsplit_once('\n')?;
+        let inner = tail.strip_prefix(IMAGE_TAG)?.strip_suffix(']')?;
+        let (id, dims) = inner.split_once(':')?;
+        let (w, h) = dims.split_once('x')?;
+        let name = head.strip_prefix("📷 ")?.to_string();
+        Some(ImageRef { id: id.parse().ok()?, width: w.parse().ok()?, height: h.parse().ok()?, name })
+    }
+}
+
+/// Recognised image formats (by their first bytes): returns the file extension.
+pub fn image_kind(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if data.len() > 12 && &data[..4] == b"RIFF" && &data[8..12] == b"WEBP" {
+        Some("webp")
+    } else if data.starts_with(b"BM") {
+        Some("bmp")
+    } else {
+        None
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct BanEntry {
     pub id: u64,
@@ -366,4 +413,17 @@ pub struct StreamFrame {
     pub height: u32,
     pub keyframe: bool,
     pub tiles: Vec<Tile>,
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_ref_round_trip() {
+        let r = ImageRef { id: 42, width: 1920, height: 1080, name: "cover art.jpg".into() };
+        assert_eq!(ImageRef::parse(&r.to_text()), Some(r));
+        assert_eq!(ImageRef::parse("hello"), None);
+        assert_eq!(ImageRef::parse("📷 x\n[voxa-image:abc:1x1]"), None);
+    }
 }

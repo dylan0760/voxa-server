@@ -221,6 +221,32 @@ async fn bulk(
                     h.abort();
                 }
             }
+            BulkC2S::ChatImage { id: tid, target, name, width, height, data } => {
+                let (srv, tx) = (server.clone(), btx.clone());
+                tokio::spawn(async move {
+                    let r = tokio::task::spawn_blocking(move || srv.post_image(id, target, &name, width, height, data))
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                    let _ = tx
+                        .send(match r {
+                            Ok(()) => BulkS2C::ChatImageSent { id: tid },
+                            Err(message) => BulkS2C::TransferError { id: tid, message },
+                        })
+                        .await;
+                });
+            }
+            BulkC2S::GetImage(image) => {
+                let (srv, tx) = (server.clone(), btx.clone());
+                tokio::spawn(async move {
+                    let r = tokio::task::spawn_blocking(move || srv.chat_image(id, image)).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let _ = tx
+                        .send(match r {
+                            Ok(data) => BulkS2C::Image { image, data },
+                            Err(message) => BulkS2C::ImageError { image, message },
+                        })
+                        .await;
+                });
+            }
         }
         downloads.retain(|_, h| !h.is_finished());
     }
