@@ -73,7 +73,10 @@ runs as a service, even when the manager is closed.
   configurable.
 * **Server-relayed screen sharing.** The server forwards changed screen tiles to
   viewers in the same channel.
-* Per-channel file storage with upload limits and quotas.
+* Per-channel file storage with a **max file size** and **storage per channel**, both
+  unlimited if you like. Admins set them in the client: click the server name ▸
+  **Edit Virtual Server** ▸ **File transfers**. `max_upload_mb` / `channel_quota_mb` in
+  `server.toml` are only the initial defaults (0 = unlimited).
 
 ## Data & configuration
 Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,

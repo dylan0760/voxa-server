@@ -8,9 +8,11 @@ pub struct Config {
     /// Address to bind TCP (control, bulk) and UDP (voice) sockets to.
     pub bind: String,
     pub port: u16,
-    /// Maximum size of a single uploaded file in megabytes.
+    /// Default maximum size of a single uploaded file in megabytes (0 = unlimited).
+    /// Only used until an administrator changes it in the client (Edit Virtual Server).
     pub max_upload_mb: u64,
-    /// Maximum total size of all files stored per channel in megabytes (0 = unlimited).
+    /// Default maximum total size of all files per channel in megabytes (0 = unlimited).
+    /// Only used until an administrator changes it in the client.
     pub channel_quota_mb: u64,
     /// Log level: error, warn, info, debug, trace.
     pub log_level: String,

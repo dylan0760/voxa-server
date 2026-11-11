@@ -244,13 +244,16 @@ async fn begin_upload(
     overwrite: bool,
 ) -> Result<Upload, String> {
     server.file_perm(me, channel, perm::FILE_UPLOAD)?;
-    if size > server.cfg.max_upload_mb * 1024 * 1024 {
-        return Err(format!("File too large (limit {} MB)", server.cfg.max_upload_mb));
+    let limits = server.state.lock().file_limits;
+    const MB: u64 = 1024 * 1024;
+    if limits.max_upload_mb > 0 && size > limits.max_upload_mb.saturating_mul(MB) {
+        return Err(format!("File too large (server limit {} MB)", limits.max_upload_mb));
     }
-    if server.cfg.channel_quota_mb > 0 {
-        let used = crate::files::dir_size(&crate::files::channel_root(&server.data_dir, channel));
-        if used + size > server.cfg.channel_quota_mb * 1024 * 1024 {
-            return Err("Channel file quota exceeded".into());
+    if limits.channel_quota_mb > 0 {
+        let root = crate::files::channel_root(&server.data_dir, channel);
+        let used = tokio::task::spawn_blocking(move || crate::files::dir_size(&root)).await.unwrap_or(0);
+        if used.saturating_add(size) > limits.channel_quota_mb.saturating_mul(MB) {
+            return Err(format!("Channel file quota exceeded ({} MB per channel)", limits.channel_quota_mb));
         }
     }
     let target = crate::files::resolve(&server.data_dir, channel, path)?;

@@ -227,6 +227,20 @@ impl Store {
         Ok(())
     }
 
+    /// File browser limits set by an administrator (None = never set, use server.toml).
+    pub fn load_file_limits(&self) -> R<Option<FileLimits>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(META)?;
+        Ok(t.get("file_limits")?.and_then(|v| dec(v.value())))
+    }
+
+    pub fn save_file_limits(&self, l: &FileLimits) -> R<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(META)?.insert("file_limits", enc(l).as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn next_id(&self, name: &str) -> R<u64> {
         let w = self.db.begin_write()?;
         let id = {

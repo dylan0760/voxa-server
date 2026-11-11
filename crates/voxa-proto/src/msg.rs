@@ -65,6 +65,12 @@ pub enum C2S {
     StartStream(StreamInfo),
     StopStream,
     WatchStream { streamer: ClientId, watch: bool },
+
+    // --- added in 1.3.0 (appended to stay wire compatible with 1.2.x) ---
+    /// Ask for the file transfer limits (answered with `S2C::FileLimits`).
+    GetFileLimits,
+    /// Change the file transfer limits (requires "Edit virtual server").
+    SetFileLimits(FileLimits),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -126,6 +132,9 @@ pub enum S2C {
     BanList(Vec<BanEntry>),
     PrivilegeKeyCreated(String),
     FileList { channel: ChannelId, path: String, entries: Vec<FileEntry> },
+
+    // --- added in 1.3.0; only sent to clients that asked with GetFileLimits ---
+    FileLimits(FileLimits),
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file

@@ -315,6 +315,15 @@ pub enum BanTarget {
     Ip(String),
 }
 
+/// File browser limits. `0` means unlimited.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct FileLimits {
+    /// Largest single file that can be uploaded, in megabytes.
+    pub max_upload_mb: u64,
+    /// Total storage per channel, in megabytes.
+    pub channel_quota_mb: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FileEntry {
     pub name: String,

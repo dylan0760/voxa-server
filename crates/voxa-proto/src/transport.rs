@@ -54,6 +54,13 @@ pub struct SecureReader<R> {
     plain: Vec<u8>,
     frame: Vec<u8>,
     scratch: Vec<u8>,
+    // Partial-frame progress lives in the struct (not in the future) so that `recv`
+    // is cancel-safe: it may be used in `tokio::select!` next to timers without
+    // losing bytes that were already read from the socket.
+    hdr: [u8; 2],
+    hdr_have: usize,
+    body_len: Option<usize>,
+    frame_have: usize,
 }
 
 pub struct SecureWriter<W> {
@@ -84,6 +91,10 @@ fn split<R, W>(r: R, w: W, state: StatelessTransportState) -> Result<Secured<R, 
             plain: Vec::new(),
             frame: Vec::new(),
             scratch: vec![0u8; NOISE_MAX],
+            hdr: [0; 2],
+            hdr_have: 0,
+            body_len: None,
+            frame_have: 0,
         },
         writer: SecureWriter { inner: w, state, nonce: 0, scratch: vec![0u8; NOISE_MAX] },
         remote_static,
@@ -135,7 +146,43 @@ where
 }
 
 impl<R: AsyncRead + Unpin> SecureReader<R> {
-    /// Reads the next application message.
+    /// Reads one complete `[u16 len][ciphertext]` frame into `self.frame`.
+    ///
+    /// Cancel-safe: the only await point is a single `read`, which either completes
+    /// (and its bytes are recorded in `self`) or consumes nothing when cancelled.
+    async fn next_frame(&mut self) -> Result<()> {
+        loop {
+            match self.body_len {
+                None => {
+                    let n = self.inner.read(&mut self.hdr[self.hdr_have..]).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                    }
+                    self.hdr_have += n;
+                    if self.hdr_have == 2 {
+                        let len = u16::from_be_bytes(self.hdr) as usize;
+                        self.hdr_have = 0;
+                        self.body_len = Some(len);
+                        self.frame.resize(len, 0);
+                        self.frame_have = 0;
+                    }
+                }
+                Some(len) => {
+                    if self.frame_have == len {
+                        self.body_len = None;
+                        return Ok(());
+                    }
+                    let n = self.inner.read(&mut self.frame[self.frame_have..len]).await?;
+                    if n == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                    }
+                    self.frame_have += n;
+                }
+            }
+        }
+    }
+
+    /// Reads the next application message. Cancel-safe (see `next_frame`).
     pub async fn recv<T: DeserializeOwned>(&mut self) -> Result<T> {
         loop {
             if self.plain.len() >= 4 {
@@ -150,7 +197,7 @@ impl<R: AsyncRead + Unpin> SecureReader<R> {
                     return msg;
                 }
             }
-            read_frame(&mut self.inner, &mut self.frame).await?;
+            self.next_frame().await?;
             let n = self.state.read_message(self.nonce, &self.frame, &mut self.scratch)?;
             self.nonce += 1;
             self.plain.extend_from_slice(&self.scratch[..n]);
@@ -177,5 +224,46 @@ impl<W: AsyncWrite + Unpin> SecureWriter<W> {
         self.inner.write_all(&out).await?;
         self.inner.flush().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::identity::KeyPair;
+
+    /// Regression test for transfers hanging: `recv` used to lose partially read
+    /// frames when raced against a timer in `tokio::select!`.
+    #[tokio::test]
+    async fn recv_survives_cancellation() {
+        // 64-byte pipe: every frame arrives in many small pieces.
+        let (a, b) = tokio::io::duplex(64);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let (ck, sk) = (KeyPair::generate(), KeyPair::generate());
+        let client = tokio::spawn(async move { connect(ar, aw, &ck.private).await.unwrap() });
+        let server = accept(br, bw, &sk.private).await.unwrap();
+        let client = client.await.unwrap();
+
+        let messages: Vec<Vec<u8>> = (0..6u8).map(|i| vec![i; 150_000 + i as usize * 7_919]).collect();
+        let expected = messages.clone();
+        let mut writer = client.writer;
+        tokio::spawn(async move {
+            for m in messages {
+                writer.send(&m).await.unwrap();
+            }
+        });
+
+        let mut reader = server.reader;
+        let mut got = Vec::new();
+        let mut cancellations = 0u32;
+        while got.len() < expected.len() {
+            tokio::select! {
+                m = reader.recv::<Vec<u8>>() => got.push(m.unwrap()),
+                _ = tokio::time::sleep(std::time::Duration::from_micros(200)) => cancellations += 1,
+            }
+        }
+        assert_eq!(got, expected);
+        assert!(cancellations > 10, "test did not exercise cancellation ({cancellations})");
     }
 }

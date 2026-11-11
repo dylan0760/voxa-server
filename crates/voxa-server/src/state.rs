@@ -48,6 +48,8 @@ pub struct State {
     pub channels: BTreeMap<ChannelId, ChannelRec>,
     pub groups: BTreeMap<GroupId, GroupInfo>,
     pub sessions: HashMap<ClientId, Session>,
+    /// File browser limits (0 = unlimited); editable by admins from the client.
+    pub file_limits: FileLimits,
 }
 
 pub struct Server {
@@ -313,7 +315,17 @@ impl Server {
             channels.insert(id, ChannelRec { info, password_hash: None });
         }
         let srv = Server {
-            state: Mutex::new(State { settings, channels, groups, sessions: HashMap::new() }),
+            state: Mutex::new(State {
+                settings,
+                channels,
+                groups,
+                sessions: HashMap::new(),
+                // Values saved from the client win; server.toml only provides the default.
+                file_limits: store.load_file_limits()?.unwrap_or(FileLimits {
+                    max_upload_mb: cfg.max_upload_mb,
+                    channel_quota_mb: cfg.channel_quota_mb,
+                }),
+            }),
             store,
             cfg,
             data_dir,
@@ -914,6 +926,18 @@ impl Server {
                 s.info.streaming = None;
                 s.viewers.clear();
                 st.broadcast_client(me);
+                Ok(())
+            }
+            C2S::GetFileLimits => {
+                st.send(me, S2C::FileLimits(st.file_limits));
+                Ok(())
+            }
+            C2S::SetFileLimits(l) => {
+                self.need(st.server_perms(st.session(me)?), perm::SERVER_EDIT)?;
+                db(self.store.save_file_limits(&l))?;
+                st.file_limits = l;
+                info!("file limits changed: max upload {} MB, channel quota {} MB (0 = unlimited)", l.max_upload_mb, l.channel_quota_mb);
+                st.send(me, S2C::FileLimits(l));
                 Ok(())
             }
             C2S::WatchStream { streamer, watch } => {
