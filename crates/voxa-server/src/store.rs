@@ -18,6 +18,8 @@ const CHANNEL_GROUPS: TableDefinition<(&str, u64), u64> = TableDefinition::new("
 const BANS: TableDefinition<u64, &[u8]> = TableDefinition::new("bans");
 const PRIVKEYS: TableDefinition<&str, &[u8]> = TableDefinition::new("privilege_keys");
 const CHAT: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("chat");
+/// Per-user permission bits granted on top of the user's groups.
+const CLIENT_PERMS: TableDefinition<&str, u64> = TableDefinition::new("client_perms");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StoredSettings {
@@ -95,6 +97,7 @@ impl Store {
             w.open_table(BANS)?;
             w.open_table(PRIVKEYS)?;
             w.open_table(CHAT)?;
+            w.open_table(CLIENT_PERMS)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -518,6 +521,41 @@ impl Store {
         let r = self.db.begin_read()?;
         let t = r.open_table(CHAT)?;
         Ok(t.get((ch, id))?.and_then(|v| self.unseal(ch, id, v.value())))
+    }
+
+    /// Deletes every stored message of a channel (or the server chat). Returns the count.
+    pub fn clear_chat(&self, ch: ChannelId) -> R<usize> {
+        let w = self.db.begin_write()?;
+        let n = {
+            let mut t = w.open_table(CHAT)?;
+            let keys: Vec<(u64, u64)> = t.range((ch, 0)..=(ch, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, _)| k.value()).collect();
+            for k in &keys {
+                t.remove(*k)?;
+            }
+            keys.len()
+        };
+        w.commit()?;
+        Ok(n)
+    }
+
+    pub fn client_perms(&self, uid: &str) -> R<u64> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(CLIENT_PERMS)?;
+        Ok(t.get(uid)?.map(|v| v.value()).unwrap_or(0))
+    }
+
+    pub fn set_client_perms(&self, uid: &str, perms: u64) -> R<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(CLIENT_PERMS)?;
+            if perms == 0 {
+                t.remove(uid)?;
+            } else {
+                t.insert(uid, perms)?;
+            }
+        }
+        w.commit()?;
+        Ok(())
     }
 
     pub fn delete_chat(&self, ch: ChannelId, id: MessageId) -> R<()> {

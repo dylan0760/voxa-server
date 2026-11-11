@@ -36,6 +36,15 @@ pub struct Session {
     /// Clients currently watching this client's screen share.
     pub viewers: HashSet<ClientId>,
     pub last_keyframe_req: Option<Instant>,
+    /// Per-user permissions granted on top of the user's groups.
+    pub extra_perms: u64,
+}
+
+impl Session {
+    /// Feature detection for messages added after 1.2 (old clients cannot decode them).
+    pub fn client_at_least(&self, min: &str) -> bool {
+        !voxa_proto::update::is_newer(min, &self.info.version)
+    }
 }
 
 pub struct ChannelRec {
@@ -197,8 +206,18 @@ impl State {
         self.groups.get(&g).map(|g| g.perms).unwrap_or(0)
     }
 
+    /// Server-wide permissions: all server groups plus the user's own permissions.
     pub fn server_perms(&self, s: &Session) -> u64 {
-        s.info.server_groups.iter().fold(0, |acc, g| acc | self.group_perms(*g))
+        s.info.server_groups.iter().fold(s.extra_perms, |acc, g| acc | self.group_perms(*g))
+    }
+
+    /// Sends a message only to clients new enough to understand it.
+    fn send_if_supported(&self, id: ClientId, min: &str, msg: S2C) {
+        if let Some(s) = self.sessions.get(&id) {
+            if s.client_at_least(min) {
+                let _ = s.tx.send(Out::Msg(msg));
+            }
+        }
     }
 
     pub fn talk_power(&self, s: &Session) -> i32 {
@@ -543,6 +562,10 @@ impl Server {
             bulk_token,
         };
         let _ = tx.send(Out::Msg(welcome));
+        let extra_perms = self.store.client_perms(&uid).unwrap_or(0);
+        if !voxa_proto::update::is_newer("1.4.0", &info.version) {
+            let _ = tx.send(Out::Msg(S2C::YourPerms(extra_perms)));
+        }
         st.broadcast(S2C::ClientJoined(info.clone()));
         info!("client {} ({}) connected from {ip} as id {id}", info.nickname, uid);
         st.sessions.insert(
@@ -560,6 +583,7 @@ impl Server {
                 bulk_tx: None,
                 viewers: HashSet::new(),
                 last_keyframe_req: None,
+                extra_perms,
             },
         );
         Ok(id)
@@ -926,6 +950,67 @@ impl Server {
                 s.info.streaming = None;
                 s.viewers.clear();
                 st.broadcast_client(me);
+                Ok(())
+            }
+            C2S::ClearChat(target) => {
+                let s = st.session(me)?;
+                let ch = match target {
+                    TextTarget::Server => {
+                        self.need(st.server_perms(s), perm::CHAT_CLEAR)?;
+                        SERVER_CHAT_CHANNEL
+                    }
+                    TextTarget::Channel(ch) => {
+                        if !st.channels.contains_key(&ch) {
+                            return Err("Channel not found".into());
+                        }
+                        self.need(self.perms_in(st, s, ch), perm::CHAT_CLEAR)?;
+                        ch
+                    }
+                    TextTarget::Private(_) => return Err("Private conversations are not stored".into()),
+                };
+                let by = s.info.nickname.clone();
+                let n = db(self.store.clear_chat(ch))?;
+                info!("{by} cleared the chat history of {target:?} ({n} messages)");
+                let ids: Vec<ClientId> = st
+                    .sessions
+                    .values()
+                    .filter(|x| matches!(target, TextTarget::Server) || x.info.channel == ch)
+                    .map(|x| x.info.id)
+                    .collect();
+                for id in ids {
+                    st.send_if_supported(id, "1.4.0", S2C::ChatCleared { target, by: by.clone() });
+                }
+                Ok(())
+            }
+            C2S::GetClientPerms(uid) => {
+                self.need(st.server_perms(st.session(me)?), perm::GROUP_MANAGE)?;
+                let perms = db(self.store.client_perms(&uid))?;
+                st.send(me, S2C::ClientPerms { uid, perms });
+                Ok(())
+            }
+            C2S::SetClientPerms { uid, perms } => {
+                let s = st.session(me)?;
+                let mine = st.server_perms(s);
+                self.need(mine, perm::GROUP_MANAGE)?;
+                let perms = perms & perm::ALL;
+                let old = db(self.store.client_perms(&uid))?;
+                // Nobody can hand out permissions they do not have themselves.
+                if (perms & !old) & !mine != 0 {
+                    return Err("You cannot grant permissions you do not have".into());
+                }
+                if db(self.store.get_client(&uid))?.is_none() {
+                    return Err("Unknown client".into());
+                }
+                db(self.store.set_client_perms(&uid, perms))?;
+                let by = s.info.nickname.clone();
+                let affected: Vec<ClientId> = st.sessions.values().filter(|x| x.info.uid == uid).map(|x| x.info.id).collect();
+                for id in affected {
+                    st.sessions.get_mut(&id).unwrap().extra_perms = perms;
+                    st.send_if_supported(id, "1.4.0", S2C::YourPerms(perms));
+                    st.send(id, S2C::Notice(format!("{by} changed your permissions")));
+                }
+                info!("{by} set personal permissions of {uid} to {perms:#x}");
+                st.send(me, S2C::ClientPerms { uid, perms });
                 Ok(())
             }
             C2S::GetFileLimits => {
@@ -1367,6 +1452,7 @@ impl Server {
             self.need(p, perm::CHAT_DELETE)?;
         }
         db(self.store.delete_chat(ch, id))?;
+        info!("{} deleted a chat message by {} in {target:?}", s.info.nickname, m.from_name);
         match target {
             TextTarget::Channel(c) => st.broadcast_channel(c, S2C::MessageDeleted { target, id }),
             _ => st.broadcast(S2C::MessageDeleted { target, id }),

@@ -59,6 +59,14 @@ runs as a service, even when the manager is closed.
   clients, topic and description, codec quality, moderated channels (talk power).
 * Server and channel groups with a permission editor, privilege keys, bans, kick, move,
   poke, channel commander.
+* **Chat moderation:**
+  * Delete single messages: your own always, anyone's with *Delete anyone's chat
+    messages*.
+  * Clear a whole channel or server chat with *Clear entire chat history*.
+  * Both remove the messages for everyone and from the encrypted history, and every
+    deletion is written to the server log.
+* **Personal permissions:** grant individual permissions to a single user on top of
+  their groups (client: right-click user ▸ **Permissions…**).
 * **Channel access control:**
   * The **Join / switch channels** permission controls whether a group can change
     channels at all.

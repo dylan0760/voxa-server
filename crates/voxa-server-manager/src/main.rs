@@ -67,6 +67,31 @@ struct TrayMenu {
     last: Option<(Svc, usize)>,
 }
 
+/// Per-user state of the manager (last version whose change log was shown).
+fn state_dir() -> PathBuf {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".into());
+    PathBuf::from(base).join("Voxa Server Manager")
+}
+
+/// Shows the change log once after the manager / server was updated to a new version.
+fn whats_new_on_start(ctx: &egui::Context) -> Option<updater::WhatsNew> {
+    let file = state_dir().join("last_seen_version.txt");
+    let current = voxa_proto::APP_VERSION;
+    let last = std::fs::read_to_string(&file).ok().map(|s| s.trim().to_string());
+    let _ = std::fs::create_dir_all(state_dir());
+    let _ = std::fs::write(&file, current);
+    let updated = match last {
+        Some(v) => v != current,
+        // No record yet: only treat it as an update if the server existed before
+        // (its database is older than a few minutes), not on a fresh install.
+        None => std::fs::metadata(data_dir().join("voxa.db"))
+            .and_then(|m| m.created())
+            .map(|t| t.elapsed().map(|e| e.as_secs() > 600).unwrap_or(false))
+            .unwrap_or(false),
+    };
+    updated.then(|| updater::WhatsNew::fetch(UPDATE_REPO, current, Some(state_dir()), ctx.clone()))
+}
+
 fn data_dir() -> PathBuf {
     let base = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into());
     PathBuf::from(base).join("Voxa Server")
@@ -119,6 +144,7 @@ struct ManagerApp {
     tray: Option<TrayMenu>,
     tray_rx: Receiver<RawTray>,
     updater: updater::Updater,
+    whats_new: Option<updater::WhatsNew>,
     quitting: bool,
     ctx: egui::Context,
 }
@@ -183,10 +209,11 @@ impl ManagerApp {
             tray,
             tray_rx: rx,
             updater: {
-                let mut u = updater::Updater::new(UPDATE_REPO, is_server_msi, cc.egui_ctx.clone());
+                let mut u = updater::Updater::new(UPDATE_REPO, is_server_msi, cc.egui_ctx.clone()).with_notes_dir(state_dir());
                 u.check();
                 u
             },
+            whats_new: whats_new_on_start(&cc.egui_ctx),
             quitting: false,
             ctx,
         }
@@ -358,6 +385,11 @@ impl eframe::App for ManagerApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if let Some(wn) = &self.whats_new {
+            if !updater::whats_new_window(ui.ctx(), wn, "Voxa Server") {
+                self.whats_new = None;
+            }
+        }
         let busy = self.busy.lock().unwrap().clone();
         egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(16))).show(ui, |ui| {
             // Header.
@@ -431,6 +463,9 @@ impl eframe::App for ManagerApp {
 
             card(ui, "Updates", |ui| {
                 updater::ui(&mut self.updater, ui, "Voxa Server");
+                if ui.button("🎉 What's new in this version").clicked() {
+                    self.whats_new = Some(updater::WhatsNew::fetch(UPDATE_REPO, voxa_proto::APP_VERSION, Some(state_dir()), self.ctx.clone()));
+                }
             });
 
             card(ui, "Server Admin privilege key", |ui| match &self.key {

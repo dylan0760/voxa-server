@@ -47,8 +47,10 @@ pub mod perm {
     pub const CHANNEL_JOIN: u64 = 1 << 32;
     /// Join channels even when the group's join power is below the channel's needed join power.
     pub const CHANNEL_JOIN_IGNORE_POWER: u64 = 1 << 33;
+    /// Wipe an entire channel / server chat, live and from the stored history.
+    pub const CHAT_CLEAR: u64 = 1 << 34;
 
-    pub const ALL: u64 = (1 << 34) - 1;
+    pub const ALL: u64 = (1 << 35) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -71,7 +73,8 @@ pub mod perm {
         (SERVER_CHAT, "Send server chat messages"),
         (CHANNEL_CHAT, "Send channel chat messages"),
         (CHAT_HISTORY, "Read chat history"),
-        (CHAT_DELETE, "Delete chat messages of others"),
+        (CHAT_DELETE, "Delete anyone's chat messages (incl. history)"),
+        (CHAT_CLEAR, "Clear entire chat history"),
         (GROUP_MANAGE, "Create, edit and delete groups"),
         (GROUP_ASSIGN_SERVER, "Assign server groups"),
         (GROUP_ASSIGN_CHANNEL, "Assign channel groups"),

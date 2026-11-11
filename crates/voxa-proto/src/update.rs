@@ -90,6 +90,28 @@ pub fn check(repo: &str, current: &str, asset_matches: impl Fn(&str) -> bool) ->
     }))
 }
 
+/// Release notes of one specific version (`/releases/tags/v<version>`), used to show
+/// "What's new" after an update. Returns `(title, notes, page url)`.
+pub fn release_notes(repo: &str, version: &str) -> Result<(String, String, String), String> {
+    let tag = format!("v{}", version.trim_start_matches(['v', 'V']));
+    let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
+    let mut resp = agent()
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::StatusCode(404) => format!("No release notes published for {tag}"),
+            e => format!("Could not reach GitHub: {e}"),
+        })?;
+    let text = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    Ok((
+        json["name"].as_str().unwrap_or(&tag).to_string(),
+        json["body"].as_str().unwrap_or_default().to_string(),
+        json["html_url"].as_str().unwrap_or_default().to_string(),
+    ))
+}
+
 /// Downloads the release installer, reporting `(downloaded, total)` bytes.
 pub fn download(rel: &Release, progress: impl Fn(u64, u64)) -> Result<PathBuf, String> {
     if !rel.asset_url.starts_with("https://") {

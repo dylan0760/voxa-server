@@ -1,5 +1,6 @@
 //! Background update checks / installs against GitHub Releases.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,11 +24,19 @@ pub struct Updater {
     pub state: Arc<Mutex<UpdState>>,
     last_check: Option<Instant>,
     ctx: egui::Context,
+    /// Folder where the notes of an update being installed are saved, so "What's new"
+    /// can be shown after the restart even without internet.
+    notes_dir: Option<PathBuf>,
 }
 
 impl Updater {
     pub fn new(repo: &'static str, matcher: fn(&str) -> bool, ctx: egui::Context) -> Updater {
-        Updater { repo, matcher, state: Arc::new(Mutex::new(UpdState::Idle)), last_check: None, ctx }
+        Updater { repo, matcher, state: Arc::new(Mutex::new(UpdState::Idle)), last_check: None, ctx, notes_dir: None }
+    }
+
+    pub fn with_notes_dir(mut self, dir: PathBuf) -> Updater {
+        self.notes_dir = Some(dir);
+        self
     }
 
     pub fn get(&self) -> UpdState {
@@ -76,6 +85,9 @@ impl Updater {
             return;
         }
         *self.state.lock().unwrap() = UpdState::Downloading(rel.clone(), 0, rel.size);
+        if let Some(dir) = &self.notes_dir {
+            save_pending_notes(dir, &rel);
+        }
         let (state, ctx) = (self.state.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             let st = state.clone();
@@ -93,6 +105,130 @@ impl Updater {
             ctx.request_repaint();
         });
     }
+}
+
+// ------------------------------------------------------------------ what's new
+
+const NOTES_FILE: &str = "update-notes.json";
+
+fn save_pending_notes(dir: &Path, rel: &Release) {
+    let _ = std::fs::create_dir_all(dir);
+    let json = serde_json::json!({ "version": rel.version, "title": rel.name, "notes": rel.notes, "url": rel.page_url });
+    let _ = std::fs::write(dir.join(NOTES_FILE), json.to_string());
+}
+
+fn load_pending_notes(dir: &Path, version: &str) -> Option<(String, String, String)> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(NOTES_FILE)).ok()?).ok()?;
+    if v["version"].as_str()?.trim_start_matches('v') != version.trim_start_matches('v') {
+        return None;
+    }
+    Some((v["title"].as_str()?.to_string(), v["notes"].as_str()?.to_string(), v["url"].as_str().unwrap_or_default().to_string()))
+}
+
+#[derive(Clone)]
+pub enum NotesState {
+    Loading,
+    Ready { title: String, notes: String, url: String },
+    Failed(String),
+}
+
+/// "What's new" for the running version: fetched from GitHub, falling back to the
+/// notes saved when the update was installed.
+pub struct WhatsNew {
+    pub version: String,
+    pub state: Arc<Mutex<NotesState>>,
+}
+
+impl WhatsNew {
+    pub fn fetch(repo: &'static str, version: &str, notes_dir: Option<PathBuf>, ctx: egui::Context) -> WhatsNew {
+        let state = Arc::new(Mutex::new(NotesState::Loading));
+        let (st, v) = (state.clone(), version.to_string());
+        std::thread::spawn(move || {
+            let r = match update::release_notes(repo, &v) {
+                Ok((title, notes, url)) => NotesState::Ready { title, notes, url },
+                Err(e) => match notes_dir.as_deref().and_then(|d| load_pending_notes(d, &v)) {
+                    Some((title, notes, url)) => NotesState::Ready { title, notes, url },
+                    None => NotesState::Failed(e),
+                },
+            };
+            *st.lock().unwrap() = r;
+            ctx.request_repaint();
+        });
+        WhatsNew { version: version.to_string(), state }
+    }
+}
+
+/// Minimal Markdown rendering for release notes (headings, bullets, bold, links).
+pub fn render_notes(ui: &mut egui::Ui, text: &str) {
+    use egui::RichText;
+    for raw in text.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        let indent = (line.len() - trimmed.len()) as f32 * 6.0;
+        let clean = |s: &str| s.replace("**", "").replace('`', "");
+        if trimmed.is_empty() {
+            ui.add_space(4.0);
+        } else if let Some(h) = trimmed.strip_prefix("### ").or_else(|| trimmed.strip_prefix("## ")).or_else(|| trimmed.strip_prefix("# ")) {
+            ui.add_space(6.0);
+            ui.label(RichText::new(clean(h)).strong().size(16.0));
+        } else if let Some(item) = trimmed.strip_prefix("* ").or_else(|| trimmed.strip_prefix("- ")) {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(indent + 6.0);
+                ui.label("•");
+                ui.label(clean(item));
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(indent);
+                ui.label(clean(trimmed));
+            });
+        }
+    }
+}
+
+/// The "What's new" window. Returns false once the user closed it.
+pub fn whats_new_window(ctx: &egui::Context, wn: &WhatsNew, product: &str) -> bool {
+    use egui::RichText;
+    let mut open = true;
+    let mut close = false;
+    egui::Window::new(format!("🎉 What's new in {product} {}", wn.version))
+        .id(egui::Id::unique("voxa_whats_new"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size([520.0, 440.0])
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            let state = wn.state.lock().unwrap().clone();
+            match state {
+                NotesState::Loading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading the change log...");
+                    });
+                }
+                NotesState::Failed(e) => {
+                    ui.label(format!("{product} was updated to {}.", wn.version));
+                    ui.label(RichText::new(format!("The change log could not be loaded: {e}")).weak());
+                }
+                NotesState::Ready { title, notes, url } => {
+                    ui.label(RichText::new(title).heading());
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(340.0).auto_shrink([false, true]).show(ui, |ui| {
+                        render_notes(ui, &notes);
+                    });
+                    ui.separator();
+                    if !url.is_empty() && ui.link("View this release on GitHub").clicked() {
+                        open_url(&url);
+                    }
+                }
+            }
+            ui.add_space(4.0);
+            if ui.button("Got it").clicked() {
+                close = true;
+            }
+        });
+    open && !close
 }
 
 pub fn open_url(url: &str) {

@@ -71,6 +71,13 @@ pub enum C2S {
     GetFileLimits,
     /// Change the file transfer limits (requires "Edit virtual server").
     SetFileLimits(FileLimits),
+
+    // --- added in 1.4.0 ---
+    /// Delete every message of a channel / server chat (requires "Clear entire chat history").
+    ClearChat(TextTarget),
+    /// Per-user permissions granted on top of the user's groups (requires "Manage groups").
+    GetClientPerms(String),
+    SetClientPerms { uid: String, perms: u64 },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -135,6 +142,12 @@ pub enum S2C {
 
     // --- added in 1.3.0; only sent to clients that asked with GetFileLimits ---
     FileLimits(FileLimits),
+
+    // --- added in 1.4.0; only sent to clients that are 1.4.0 or newer ---
+    ChatCleared { target: TextTarget, by: String },
+    ClientPerms { uid: String, perms: u64 },
+    /// Your own per-user permissions (in addition to your groups).
+    YourPerms(u64),
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
