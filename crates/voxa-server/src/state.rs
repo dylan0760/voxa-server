@@ -96,13 +96,23 @@ fn default_groups() -> Vec<GroupInfo> {
         | FILE_BROWSE
         | FILE_DOWNLOAD
         | SCREEN_SHARE
-        | CHANNEL_COMMANDER;
+        | CHANNEL_COMMANDER
+        | CHANNEL_JOIN;
+    // Join power mirrors TeamSpeak: Admin 75, Normal 10, Guest 0. A channel with
+    // "needed join power" 10 is therefore members-only, 75 is admins-only.
     let g = |id, kind, name: &str, perms, talk_power, sort, show_name| GroupInfo {
         id,
         kind,
         name: name.into(),
         perms,
         talk_power,
+        join_power: match id {
+            GROUP_ADMIN => 75,
+            GROUP_NORMAL => 10,
+            GROUP_CHANNEL_ADMIN => 50,
+            GROUP_CHANNEL_OPERATOR => 35,
+            _ => 0,
+        },
         sort,
         builtin: true,
         show_name,
@@ -110,7 +120,7 @@ fn default_groups() -> Vec<GroupInfo> {
     vec![
         g(GROUP_ADMIN, GroupKind::Server, "Server Admin", ALL, 75, 10, true),
         g(GROUP_NORMAL, GroupKind::Server, "Normal", normal, 0, 20, false),
-        g(GROUP_GUEST, GroupKind::Server, "Guest", SERVER_CHAT | CHANNEL_CHAT | CHAT_HISTORY | FILE_BROWSE, 0, 30, false),
+        g(GROUP_GUEST, GroupKind::Server, "Guest", CHANNEL_JOIN | SERVER_CHAT | CHANNEL_CHAT | CHAT_HISTORY | FILE_BROWSE, 0, 30, false),
         g(
             GROUP_CHANNEL_ADMIN,
             GroupKind::Channel,
@@ -200,6 +210,17 @@ impl State {
             .unwrap_or(0)
     }
 
+    /// Highest join power of the given server groups plus a channel group.
+    pub fn join_power(&self, server_groups: &[GroupId], channel_group: GroupId) -> i32 {
+        server_groups
+            .iter()
+            .chain(std::iter::once(&channel_group))
+            .filter_map(|g| self.groups.get(g))
+            .map(|g| g.join_power)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn can_talk(&self, s: &Session) -> bool {
         if s.info.input_muted {
             return false;
@@ -258,6 +279,14 @@ impl Server {
         for g in store.load_groups()? {
             groups.insert(g.id, g);
         }
+        // The Server Admin group always holds every permission, including ones added
+        // in newer versions.
+        if let Some(g) = groups.get_mut(&GROUP_ADMIN) {
+            if g.perms != perm::ALL {
+                g.perms = perm::ALL;
+                store.save_group(g)?;
+            }
+        }
         let mut channels = BTreeMap::new();
         for c in store.load_channels()? {
             channels.insert(c.info.id, ChannelRec { info: c.info, password_hash: c.password_hash });
@@ -277,6 +306,7 @@ impl Server {
                 is_default: true,
                 codec_quality: 6,
                 needed_talk_power: 0,
+                needed_join_power: 0,
                 voice_encrypted: true,
             };
             store.save_channel(&StoredChannel { info: info.clone(), password_hash: None })?;
@@ -451,7 +481,12 @@ impl Server {
                 };
                 let full = c.info.max_clients.map(|m| st.clients_in(ch) as u32 >= m).unwrap_or(false)
                     && group_perms & perm::CHANNEL_JOIN_IGNORE_MAXCLIENTS == 0;
-                if pw_ok && !full {
+                let cg = self.channel_group_for(&st, &uid, ch);
+                let perms_there = group_perms | st.group_perms(cg);
+                let may_join = perms_there & perm::CHANNEL_JOIN != 0
+                    && (perms_there & perm::CHANNEL_JOIN_IGNORE_POWER != 0
+                        || st.join_power(&record.server_groups, cg) >= c.info.needed_join_power);
+                if pw_ok && !full && may_join {
                     channel = ch;
                 }
             }
@@ -727,13 +762,18 @@ impl Server {
                 if name.is_empty() {
                     return Err("Group name required".into());
                 }
-                let (perms, tp) = copy_from.and_then(|g| st.groups.get(&g)).map(|g| (g.perms, g.talk_power)).unwrap_or((0, 0));
+                // Without a template, new server groups start like the default group so their
+                // members can still join channels and chat.
+                let template = copy_from.or((kind == GroupKind::Server).then_some(st.settings.default_server_group));
+                let (perms, tp, jp) =
+                    template.and_then(|g| st.groups.get(&g)).map(|g| (g.perms, g.talk_power, g.join_power)).unwrap_or((0, 0, 0));
                 let g = GroupInfo {
                     id: db(self.store.next_id("next_group"))?,
                     kind,
                     name,
                     perms,
                     talk_power: tp,
+                    join_power: jp,
                     sort: 50,
                     builtin: false,
                     show_name: false,
@@ -964,6 +1004,19 @@ impl Server {
             return Ok(());
         }
         let p = self.perms_in(st, s, ch);
+        if p & perm::CHANNEL_JOIN == 0 {
+            return Err("Your group is not allowed to join channels".into());
+        }
+        if c.info.needed_join_power > 0 && p & perm::CHANNEL_JOIN_IGNORE_POWER == 0 {
+            let cg = self.channel_group_for(st, &s.info.uid, ch);
+            let have = st.join_power(&s.info.server_groups, cg);
+            if have < c.info.needed_join_power {
+                return Err(format!(
+                    "Your group cannot join \"{}\" (needs join power {}, you have {have})",
+                    c.info.name, c.info.needed_join_power
+                ));
+            }
+        }
         if let Some(h) = &c.password_hash {
             if p & perm::CHANNEL_JOIN_IGNORE_PASSWORD == 0 && !password.map(|pw| verify_password(pw, h)).unwrap_or(false) {
                 return Err("Invalid channel password".into());
@@ -1087,6 +1140,7 @@ impl Server {
             is_default: e.is_default,
             codec_quality: e.codec_quality,
             needed_talk_power: e.needed_talk_power,
+            needed_join_power: e.needed_join_power.max(0),
             voice_encrypted: e.voice_encrypted,
         };
         let rec = ChannelRec { info: info.clone(), password_hash };
@@ -1157,6 +1211,7 @@ impl Server {
             is_default: e.is_default,
             codec_quality: e.codec_quality,
             needed_talk_power: e.needed_talk_power,
+            needed_join_power: e.needed_join_power.max(0),
             voice_encrypted: e.voice_encrypted,
         };
         let info = c.info.clone();

@@ -43,8 +43,12 @@ pub mod perm {
     pub const CHAT_HISTORY: u64 = 1 << 29;
     pub const CLIENT_DESCRIPTION_EDIT: u64 = 1 << 30;
     pub const IGNORE_SERVER_MAXCLIENTS: u64 = 1 << 31;
+    /// Allowed to join / switch to channels at all.
+    pub const CHANNEL_JOIN: u64 = 1 << 32;
+    /// Join channels even when the group's join power is below the channel's needed join power.
+    pub const CHANNEL_JOIN_IGNORE_POWER: u64 = 1 << 33;
 
-    pub const ALL: u64 = (1 << 32) - 1;
+    pub const ALL: u64 = (1 << 34) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -53,6 +57,8 @@ pub mod perm {
         (CHANNEL_CREATE_TEMPORARY, "Create temporary channels"),
         (CHANNEL_EDIT, "Edit channels"),
         (CHANNEL_DELETE, "Delete channels"),
+        (CHANNEL_JOIN, "Join / switch channels"),
+        (CHANNEL_JOIN_IGNORE_POWER, "Join channels regardless of join power"),
         (CHANNEL_JOIN_IGNORE_PASSWORD, "Join channels without password"),
         (CHANNEL_JOIN_IGNORE_MAXCLIENTS, "Join full channels"),
         (CLIENT_MOVE, "Move clients"),
@@ -113,6 +119,8 @@ pub struct ChannelInfo {
     pub is_default: bool,
     pub codec_quality: u8,
     pub needed_talk_power: i32,
+    /// Minimum group join power required to enter (0 = anyone with Join permission).
+    pub needed_join_power: i32,
     pub voice_encrypted: bool,
 }
 
@@ -136,6 +144,7 @@ pub struct ChannelEdit {
     pub is_default: bool,
     pub codec_quality: u8,
     pub needed_talk_power: i32,
+    pub needed_join_power: i32,
     pub voice_encrypted: bool,
     pub password: PasswordChange,
 }
@@ -153,6 +162,7 @@ impl ChannelEdit {
             is_default: c.is_default,
             codec_quality: c.codec_quality,
             needed_talk_power: c.needed_talk_power,
+            needed_join_power: c.needed_join_power,
             voice_encrypted: c.voice_encrypted,
             password: PasswordChange::Keep,
         }
@@ -170,6 +180,7 @@ impl ChannelEdit {
             is_default: false,
             codec_quality: 6,
             needed_talk_power: 0,
+            needed_join_power: 0,
             voice_encrypted: true,
             password: PasswordChange::Keep,
         }
@@ -226,6 +237,8 @@ pub struct GroupInfo {
     pub name: String,
     pub perms: u64,
     pub talk_power: i32,
+    /// Compared against a channel's needed join power.
+    pub join_power: i32,
     pub sort: i32,
     /// Built-in groups cannot be deleted.
     pub builtin: bool,

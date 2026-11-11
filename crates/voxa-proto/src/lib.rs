@@ -18,7 +18,7 @@ pub use msg::*;
 /// Default port for both the TCP control connection and the UDP voice socket.
 pub const DEFAULT_PORT: u16 = 9987;
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Opus is always run at 48 kHz mono with 20 ms frames.

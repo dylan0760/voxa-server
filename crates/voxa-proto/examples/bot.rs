@@ -43,7 +43,7 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let _ = w.send(&C2S::SwitchChannel { channel: ch, password: None }).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    for t in ["Hey everyone! 👋", "Anyone up for a game tonight?", "Chat history is now stored encrypted on the server, nice."] {
+    for t in ["Hey everyone! 👋", "Anyone up for a game tonight? 🎮🔥", "Chat history is now stored encrypted on the server, nice. 🔒😎", "🎉🥳👍"] {
         let _ = w.send(&C2S::SendText { target: TextTarget::Channel(ch), text: t.into() }).await;
         tokio::time::sleep(Duration::from_millis(400)).await;
     }

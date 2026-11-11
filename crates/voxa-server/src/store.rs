@@ -98,7 +98,118 @@ impl Store {
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
-        Ok(Store { db, cipher })
+        let store = Store { db, cipher };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// Upgrades records written by older versions. Schema 1 (Voxa 1.0/1.1) had no
+    /// join power on groups/channels and no "join channels" permission.
+    fn migrate(&self) -> R<()> {
+        const SCHEMA: u64 = 2;
+        let current = {
+            let r = self.db.begin_read()?;
+            let t = r.open_table(META)?;
+            let has_settings = t.get("settings")?.is_some();
+            match t.get("schema")? {
+                Some(v) => u64::from_le_bytes(v.value().try_into().unwrap_or([0; 8])),
+                // A fresh database is created directly in the current schema.
+                None if !has_settings => SCHEMA,
+                None => 1,
+            }
+        };
+        if current < 2 {
+            #[derive(Deserialize)]
+            struct GroupV1 {
+                id: GroupId,
+                kind: GroupKind,
+                name: String,
+                perms: u64,
+                talk_power: i32,
+                sort: i32,
+                builtin: bool,
+                show_name: bool,
+            }
+            #[derive(Deserialize)]
+            struct ChannelInfoV1 {
+                id: ChannelId,
+                parent: Option<ChannelId>,
+                sort: i64,
+                name: String,
+                topic: String,
+                description: String,
+                has_password: bool,
+                max_clients: Option<u32>,
+                kind: ChannelKind,
+                is_default: bool,
+                codec_quality: u8,
+                needed_talk_power: i32,
+                voice_encrypted: bool,
+            }
+            #[derive(Deserialize)]
+            struct StoredChannelV1 {
+                info: ChannelInfoV1,
+                password_hash: Option<String>,
+            }
+            let w = self.db.begin_write()?;
+            {
+                let mut t = w.open_table(GROUPS)?;
+                let rows: Vec<(u64, Vec<u8>)> = t.iter()?.filter_map(|r| r.ok()).map(|(k, v)| (k.value(), v.value().to_vec())).collect();
+                for (k, v) in rows {
+                    let Some(g) = dec::<GroupV1>(&v) else { continue };
+                    let is_admin = g.perms & ((1u64 << 32) - 1) == (1u64 << 32) - 1;
+                    let join_power = if is_admin { 75 } else { g.talk_power.max(if g.kind == GroupKind::Server && g.id == 2 { 10 } else { 0 }) };
+                    // Everyone could join channels before; keep it that way.
+                    let perms = if is_admin { perm::ALL } else if g.kind == GroupKind::Server { g.perms | perm::CHANNEL_JOIN } else { g.perms };
+                    let ng = GroupInfo {
+                        id: g.id,
+                        kind: g.kind,
+                        name: g.name,
+                        perms,
+                        talk_power: g.talk_power,
+                        join_power,
+                        sort: g.sort,
+                        builtin: g.builtin,
+                        show_name: g.show_name,
+                    };
+                    t.insert(k, enc(&ng).as_slice())?;
+                }
+                let mut t = w.open_table(CHANNELS)?;
+                let rows: Vec<(u64, Vec<u8>)> = t.iter()?.filter_map(|r| r.ok()).map(|(k, v)| (k.value(), v.value().to_vec())).collect();
+                for (k, v) in rows {
+                    let Some(c) = dec::<StoredChannelV1>(&v) else { continue };
+                    let i = c.info;
+                    let nc = StoredChannel {
+                        info: ChannelInfo {
+                            id: i.id,
+                            parent: i.parent,
+                            sort: i.sort,
+                            name: i.name,
+                            topic: i.topic,
+                            description: i.description,
+                            has_password: i.has_password,
+                            max_clients: i.max_clients,
+                            kind: i.kind,
+                            is_default: i.is_default,
+                            codec_quality: i.codec_quality,
+                            needed_talk_power: i.needed_talk_power,
+                            needed_join_power: 0,
+                            voice_encrypted: i.voice_encrypted,
+                        },
+                        password_hash: c.password_hash,
+                    };
+                    t.insert(k, enc(&nc).as_slice())?;
+                }
+            }
+            w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
+            w.commit()?;
+            tracing::info!("database migrated to schema {SCHEMA}");
+        } else if current == SCHEMA {
+            let w = self.db.begin_write()?;
+            w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
+            w.commit()?;
+        }
+        Ok(())
     }
 
     // ---------- meta / settings ----------

@@ -59,6 +59,15 @@ runs as a service, even when the manager is closed.
   clients, topic and description, codec quality, moderated channels (talk power).
 * Server and channel groups with a permission editor, privilege keys, bans, kick, move,
   poke, channel commander.
+* **Channel access control:**
+  * The **Join / switch channels** permission controls whether a group can change
+    channels at all.
+  * Each group has a **join power**: Admin 75, Normal 10, Guest 0 by default.
+  * Each channel has a **needed join power**: 0 lets anyone in, 10 makes it
+    members-only, 75 admins-only.
+  * **Join channels regardless of join power** lets moderators bypass the check.
+  * A channel group assigned in a specific channel also counts, so you can let
+    individual people into one restricted channel.
 * **Persistent encrypted chat:** channel and server chat is stored on the server
   (XChaCha20-Poly1305). The master key is protected by Windows DPAPI. Retention is
   configurable.

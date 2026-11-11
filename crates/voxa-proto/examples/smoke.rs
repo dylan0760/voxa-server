@@ -122,6 +122,20 @@ async fn main() {
     let created = until(&mut ra, |m| if let S2C::ChannelCreated(c) = m { Some(c) } else { None }).await;
     until(&mut ra, |m| matches!(m, S2C::ClientMoved { id, channel, .. } if id == idb && channel == created.id).then_some(())).await;
     println!("temporary channel created and creator moved in");
+
+    // Join power: A creates a channel needing join power 50; B (Normal = 10) is refused.
+    let mut e = ChannelEdit::new_default(None);
+    e.name = format!("VIP {}", now_unix());
+    e.kind = ChannelKind::Temporary;
+    e.needed_join_power = 50;
+    wa.send(&C2S::CreateChannel(e)).await.unwrap();
+    let vip = until(&mut ra, |m| if let S2C::ChannelCreated(c) = m { Some(c) } else { None }).await;
+    assert_eq!(vip.needed_join_power, 50);
+    wb.send(&C2S::SwitchChannel { channel: vip.id, password: None }).await.unwrap();
+    let err = until(&mut rb, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
+    assert!(err.contains("join power"), "unexpected: {err}");
+    println!("join power enforced: \"{err}\"");
+    wa.send(&C2S::SwitchChannel { channel: ch, password: None }).await.unwrap();
     wb.send(&C2S::Disconnect("bye".into())).await.unwrap();
     until(&mut ra, |m| matches!(m, S2C::ChannelDeleted(id) if id == created.id).then_some(())).await;
     println!("temporary channel removed after it became empty");
