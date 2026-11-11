@@ -1,0 +1,33 @@
+[package]
+name = "voxa-server"
+description = "Voxa voice, chat and screen sharing server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "voxa-server"
+path = "src/main.rs"
+
+[dependencies]
+voxa-proto = { path = "../voxa-proto", features = ["update"] }
+anyhow = "1.0.104"
+argon2 = "0.5"
+base64 = "0.22"
+bincode = "1"
+chacha20poly1305 = "0.10"
+parking_lot = "0.12"
+rand = "0.8"
+redb = "4.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["full"] }
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+
+[build-dependencies]
+winresource = "0.1.34"

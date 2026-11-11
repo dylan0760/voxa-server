@@ -1,0 +1,8 @@
+[target.x86_64-pc-windows-gnullvm]
+linker = "x86_64-w64-mingw32-clang"
+# Link the LLVM unwinder and C++ runtime statically so the executables have no
+# dependencies beyond what ships with Windows.
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

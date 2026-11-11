@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/voxa-proto", "crates/voxa-server", "crates/voxa-server-manager"]
+
+[workspace.package]
+version = "1.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Voxa contributors"]
+repository = "https://github.com/dylan0760/voxa-server"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2

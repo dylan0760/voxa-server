@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Voxa server installer (WiX Toolset v3). Built by build.ps1.
+     Installs voxa-server.exe as the auto-start Windows service "VoxaServer" and opens
+     TCP 9987 + UDP 9987 in Windows Firewall. Server data lives in
+     %ProgramData%\Voxa Server and is kept on uninstall. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension"
+     xmlns:fire="http://schemas.microsoft.com/wix/FirewallExtension">
+  <Product Id="*" Name="Voxa Server" Language="1033" Version="$(var.Version)"
+           Manufacturer="Voxa Project" UpgradeCode="A3ED94D6-65F1-4538-BB52-C9E442646576">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
+             Description="Voxa voice, chat and screen sharing server" Comments="Free and open source software" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Voxa Server is already installed." AllowSameVersionUpgrades="yes" />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="ServerIcon" SourceFile="$(var.Assets)\voxa-server.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ServerIcon" />
+    <Property Id="ARPCOMMENTS" Value="Free and open source voice chat server. No license keys required." />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+              Value="Voxa Server now runs in the background as a Windows service on port 9987 (TCP and UDP). Use Voxa Server Manager (Start menu and system tray) to see its status, start/stop it and get the Server Admin privilege key." />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Open Voxa Server Manager" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#ManagerExe]" />
+    <CustomAction Id="LaunchManager" BinaryKey="WixCA" DllEntry="WixShellExec" Impersonate="yes" />
+    <PropertyRef Id="WIX_ACCOUNT_USERS" />
+    <!-- The manager hides to the tray on WM_CLOSE, so terminate it for upgrades/uninstall. -->
+    <util:CloseApplication Id="CloseManager" Target="voxa-server-manager.exe" CloseMessage="no" RebootPrompt="no" TerminateProcess="0" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.Assets)\license.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(var.Assets)\server-banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="$(var.Assets)\server-dialog.bmp" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLFOLDER" Name="Voxa Server" />
+      </Directory>
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="DATADIR" Name="Voxa Server" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="MenuFolder" Name="Voxa Server" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="ServerExe" Guid="*" Win64="yes">
+        <File Id="ServerExe" Source="$(var.Bin)\voxa-server.exe" KeyPath="yes" Checksum="yes" />
+        <ServiceInstall Id="VoxaService" Name="VoxaServer" DisplayName="Voxa Server"
+                        Description="Voxa voice, chat and screen sharing server (TCP/UDP 9987)."
+                        Type="ownProcess" Start="auto" ErrorControl="normal" Vital="yes"
+                        Arguments="--service">
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart" RestartServiceDelayInSeconds="5" ResetPeriodInDays="1" />
+          <!-- Lets Voxa Server Manager start/stop the service without administrator rights. -->
+          <util:PermissionEx User="[WIX_ACCOUNT_USERS]" ServiceQueryStatus="yes" ServiceQueryConfig="yes"
+                             ServiceInterrogate="yes" ServiceStart="yes" ServiceStop="yes" />
+        </ServiceInstall>
+        <ServiceControl Id="VoxaServiceControl" Name="VoxaServer" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <fire:FirewallException Id="FwTcp" Name="Voxa Server (TCP 9987)" Port="9987" Protocol="tcp" Scope="any" Profile="all" IgnoreFailure="yes" />
+        <fire:FirewallException Id="FwUdp" Name="Voxa Server (UDP 9987)" Port="9987" Protocol="udp" Scope="any" Profile="all" IgnoreFailure="yes" />
+      </Component>
+      <Component Id="ManagerExe" Guid="*" Win64="yes">
+        <File Id="ManagerExe" Source="$(var.Bin)\voxa-server-manager.exe" KeyPath="yes" Checksum="yes" />
+        <!-- Start the manager in the system tray at sign-in. -->
+        <RegistryValue Root="HKLM" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="VoxaServerManager"
+                       Type="string" Value="&quot;[INSTALLFOLDER]voxa-server-manager.exe&quot; --minimized" />
+      </Component>
+      <Component Id="DocReadme" Guid="*" Win64="yes"><File Id="Readme" Source="$(var.Docs)\README.txt" KeyPath="yes" /></Component>
+      <Component Id="DocMit" Guid="*" Win64="yes"><File Id="LicenseMit" Source="$(var.Docs)\LICENSE-MIT.txt" KeyPath="yes" /></Component>
+      <Component Id="DocApache" Guid="*" Win64="yes"><File Id="LicenseApache" Source="$(var.Docs)\LICENSE-APACHE.txt" KeyPath="yes" /></Component>
+      <Component Id="DocNotices" Guid="*" Win64="yes"><File Id="Notices" Source="$(var.Docs)\THIRD-PARTY-NOTICES.txt" KeyPath="yes" /></Component>
+    </DirectoryRef>
+
+    <!-- Server data (database, keys, files, logs) survives uninstall and upgrades. -->
+    <DirectoryRef Id="DATADIR">
+      <Component Id="DataFolder" Guid="6C1B7D1E-7E43-4E7E-9D44-0B5C2F7B9A11" Permanent="yes" Win64="yes">
+        <CreateFolder />
+        <RegistryValue Root="HKLM" Key="Software\Voxa Server" Name="DataDir" Type="string" Value="[DATADIR]" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="MenuFolder">
+      <Component Id="MenuShortcuts" Guid="*" Win64="yes">
+        <Shortcut Id="ScManager" Name="Voxa Server Manager" Description="Status, start/stop, admin key and log"
+                  Target="[INSTALLFOLDER]voxa-server-manager.exe" WorkingDirectory="INSTALLFOLDER" Icon="ServerIcon" />
+        <Shortcut Id="ScKey" Name="Admin Privilege Key" Description="Shows the initial Server Admin privilege key"
+                  Target="[DATADIR]privilege_key.txt" Icon="ServerIcon" />
+        <Shortcut Id="ScData" Name="Server Data Folder" Description="Database, configuration, files and logs"
+                  Target="[DATADIR]" Icon="ServerIcon" />
+        <Shortcut Id="ScConfig" Name="Server Configuration" Description="Edit server.toml (restart the service afterwards)"
+                  Target="[DATADIR]server.toml" />
+        <Shortcut Id="ScLog" Name="Server Log" Target="[DATADIR]logs\server.log" />
+        <Shortcut Id="ScReadme" Name="Read Me" Target="[INSTALLFOLDER]README.txt" />
+        <RemoveFolder Id="RemoveMenuFolder" On="uninstall" />
+        <RegistryValue Root="HKLM" Key="Software\Voxa Server" Name="MenuShortcuts" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- Top-level Start menu entry so the manager is easy to find. -->
+    <DirectoryRef Id="ProgramMenuFolder">
+      <Component Id="ManagerShortcut" Guid="*" Win64="yes">
+        <Shortcut Id="ScManagerTop" Name="Voxa Server Manager" Description="Status, start/stop, admin key and log"
+                  Target="[INSTALLFOLDER]voxa-server-manager.exe" WorkingDirectory="INSTALLFOLDER" Icon="ServerIcon" />
+        <RegistryValue Root="HKLM" Key="Software\Voxa Server" Name="ManagerShortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="Main" Title="Voxa Server" Level="1" ConfigurableDirectory="INSTALLFOLDER" Absent="disallow" AllowAdvertise="no">
+      <ComponentRef Id="ServerExe" />
+      <ComponentRef Id="DocReadme" />
+      <ComponentRef Id="DocMit" />
+      <ComponentRef Id="DocApache" />
+      <ComponentRef Id="DocNotices" />
+      <ComponentRef Id="DataFolder" />
+      <ComponentRef Id="MenuShortcuts" />
+      <ComponentRef Id="ManagerExe" />
+      <ComponentRef Id="ManagerShortcut" />
+    </Feature>
+
+    <!-- In-app updates run "msiexec /passive AUTOLAUNCH=1": reopen the manager when done. -->
+    <InstallExecuteSequence>
+      <Custom Action="LaunchManager" After="InstallFinalize">AUTOLAUNCH = "1" AND NOT REMOVE</Custom>
+    </InstallExecuteSequence>
+
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchManager">
+        WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT REMOVE
+      </Publish>
+    </UI>
+  </Product>
+</Wix>
