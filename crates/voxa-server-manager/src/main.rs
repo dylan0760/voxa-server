@@ -13,7 +13,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use egui::{Align, Align2, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, Sense, Vec2};
 use service::Svc;
@@ -38,7 +38,7 @@ const BG: Color32 = Color32::from_rgb(0x1F, 0x20, 0x25);
 const CARD: Color32 = Color32::from_rgb(0x27, 0x29, 0x30);
 const DIM: Color32 = Color32::from_rgb(0x9A, 0xA0, 0xA8);
 
-#[derive(serde::Deserialize, Default, Clone)]
+#[derive(serde::Deserialize, Default, Clone, PartialEq)]
 #[serde(default)]
 struct Status {
     version: String,
@@ -132,13 +132,68 @@ fn read_privilege_key(dir: &PathBuf) -> Option<String> {
     text.lines().map(str::trim).find(|l| l.len() >= 20 && !l.contains(' ')).map(|s| s.to_string())
 }
 
+/// What the background poller found (service state, status file, key, log tail).
+#[derive(Clone, PartialEq)]
+struct Polled {
+    svc: Svc,
+    status: Option<Status>,
+    key: Option<String>,
+    log: Arc<Vec<String>>,
+}
+
+/// Polls the service and the data folder every 2 s on its own thread and asks for a
+/// repaint only when something changed, so the manager costs nothing while idle (no
+/// periodic redraws, which are expensive on machines without a GPU).
+fn start_poller(dir: PathBuf, ctx: egui::Context) -> Arc<Mutex<(u64, Polled)>> {
+    let empty = Polled { svc: Svc::Unknown, status: None, key: None, log: Arc::new(Vec::new()) };
+    let shared = Arc::new(Mutex::new((0u64, empty)));
+    let out = shared.clone();
+    std::thread::spawn(move || {
+        let log_path = dir.join("logs").join("server.log");
+        let mut log_sig = None;
+        loop {
+            let svc = service::query();
+            let status = std::fs::read_to_string(dir.join("status.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<Status>(&t).ok())
+                // The server rewrites the file at least once a minute while running.
+                .filter(|s| now_unix().saturating_sub(s.updated) < 150 && svc == Svc::Running)
+                .map(|s| Status { updated: 0, ..s });
+            let key = read_privilege_key(&dir);
+            let sig = std::fs::metadata(&log_path).ok().map(|m| (m.len(), m.modified().ok()));
+            let mut guard = shared.lock().unwrap();
+            let (generation, cur) = &mut *guard;
+            let log = if sig != log_sig || cur.log.is_empty() {
+                log_sig = sig;
+                Arc::new(read_tail(&log_path, 48 * 1024))
+            } else {
+                cur.log.clone()
+            };
+            let next = Polled { svc, status, key, log };
+            if next != *cur {
+                *cur = next;
+                *generation += 1;
+                drop(guard);
+                ctx.request_repaint();
+            } else {
+                drop(guard);
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+    out
+}
+
 struct ManagerApp {
     dir: PathBuf,
     svc: Svc,
     status: Option<Status>,
     key: Option<String>,
-    log: Vec<String>,
-    last_poll: Option<Instant>,
+    log: Arc<Vec<String>>,
+    polled: Arc<Mutex<(u64, Polled)>>,
+    seen_generation: u64,
+    /// True while the window is hidden in the tray (no timed repaints then).
+    hidden: bool,
     busy: Arc<Mutex<Option<String>>>,
     message: Arc<Mutex<Option<(String, bool)>>>,
     tray: Option<TrayMenu>,
@@ -190,20 +245,16 @@ impl ManagerApp {
                 c.request_repaint();
             });
         }
-        // Keep polling the service state while the window is hidden in the tray.
-        let c = ctx.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(2));
-            c.request_repaint();
-        });
         let tray = build_tray();
         ManagerApp {
             dir: data_dir(),
             svc: Svc::Unknown,
             status: None,
             key: None,
-            log: Vec::new(),
-            last_poll: None,
+            log: Arc::new(Vec::new()),
+            polled: start_poller(data_dir(), ctx.clone()),
+            seen_generation: 0,
+            hidden: std::env::args().any(|a| a == "--minimized"),
             busy: Arc::new(Mutex::new(None)),
             message: Arc::new(Mutex::new(None)),
             tray,
@@ -220,17 +271,17 @@ impl ManagerApp {
     }
 
     fn poll(&mut self) {
-        if self.last_poll.map(|t| t.elapsed() < Duration::from_millis(1500)).unwrap_or(false) {
+        let guard = self.polled.lock().unwrap();
+        if guard.0 == self.seen_generation {
             return;
         }
-        self.last_poll = Some(Instant::now());
-        self.svc = service::query();
-        self.status = std::fs::read_to_string(self.dir.join("status.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str::<Status>(&t).ok())
-            .filter(|s| now_unix().saturating_sub(s.updated) < 15 && self.svc == Svc::Running);
-        self.key = read_privilege_key(&self.dir);
-        self.log = read_tail(&self.dir.join("logs").join("server.log"), 48 * 1024);
+        self.seen_generation = guard.0;
+        let p = guard.1.clone();
+        drop(guard);
+        self.svc = p.svc;
+        self.status = p.status;
+        self.key = p.key;
+        self.log = p.log;
     }
 
     fn run_op(&self, label: &str, f: fn() -> Result<(), String>) {
@@ -249,7 +300,8 @@ impl ManagerApp {
         });
     }
 
-    fn show(&self) {
+    fn show(&mut self) {
+        self.hidden = false;
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         self.ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -381,6 +433,11 @@ impl eframe::App for ManagerApp {
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.tray.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.hidden = true;
+        }
+        // While the window is open, refresh the uptime now and then. Hidden: no timer at all.
+        if !self.hidden {
+            ctx.request_repaint_after(Duration::from_secs(5));
         }
     }
 

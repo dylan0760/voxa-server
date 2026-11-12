@@ -209,13 +209,22 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
     let status_path = data_dir.join("status.json");
     let port = cfg.port;
     tokio::spawn(async move {
+        // Written only when something changed, plus a heartbeat once a minute. Rewriting
+        // the file every few seconds makes antivirus software rescan it each time.
         let mut t = tokio::time::interval(Duration::from_secs(3));
+        let mut last: Option<(usize, usize)> = None;
+        let mut last_write = std::time::Instant::now();
         loop {
             t.tick().await;
             let (online, channels) = {
                 let st = status_srv.state.lock();
                 (st.sessions.len(), st.channels.len())
             };
+            if last == Some((online, channels)) && last_write.elapsed() < Duration::from_secs(60) {
+                continue;
+            }
+            last = Some((online, channels));
+            last_write = std::time::Instant::now();
             let json = format!(
                 "{{\"running\":true,\"version\":\"{}\",\"port\":{},\"online\":{},\"channels\":{},\"started\":{},\"updated\":{},\"fingerprint\":\"{}\"}}",
                 voxa_proto::APP_VERSION,
