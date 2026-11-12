@@ -4,6 +4,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod gpu;
 mod icon;
 mod instance;
 mod service;
@@ -594,6 +595,7 @@ fn main() -> eframe::Result<()> {
             .with_min_inner_size([480.0, 420.0])
             .with_visible(!minimized)
             .with_icon(egui::IconData { rgba: icon::icon_rgba(64, true), width: 64, height: 64 }),
+        wgpu_options: gpu::wgpu_options(),
         ..Default::default()
     };
     eframe::run_native("Voxa Server Manager", options, Box::new(move |cc| Ok(Box::new(ManagerApp::new(cc, Some(inst))))))
