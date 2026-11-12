@@ -10,6 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::timeout;
 use tracing::{debug, info};
+use voxa_proto::traffic::{self, Cat, TRAFFIC};
 use voxa_proto::identity::uid_from_public;
 use voxa_proto::transport::{self, SecureReader, SecureWriter};
 use voxa_proto::*;
@@ -43,6 +44,7 @@ async fn handle(server: Arc<Server>, stream: TcpStream, addr: SocketAddr) -> any
     let mut reader = sec.reader;
     let mut writer = sec.writer;
     let first: C2S = timeout(Duration::from_secs(15), reader.recv()).await??;
+    TRAFFIC.received(Cat::Chat, reader.last_size);
     match first {
         C2S::AttachBulk(token) => bulk(server, reader, writer, token).await,
         hello @ C2S::Hello { .. } => control(server, reader, writer, uid, addr, hello).await,
@@ -78,6 +80,7 @@ async fn control(
                     if writer.send(&m).await.is_err() {
                         break;
                     }
+                    TRAFFIC.sent(Cat::Chat, writer.last_size);
                 }
                 Out::Close => break,
             }
@@ -85,7 +88,7 @@ async fn control(
     });
     let reason = loop {
         tokio::select! {
-            r = timeout(Duration::from_secs(45), reader.recv::<C2S>()) => match r {
+            r = timeout(Duration::from_secs(45), reader.recv::<C2S>()) => match r.inspect(|m| if m.is_ok() { TRAFFIC.received(Cat::Chat, reader.last_size) }) {
                 Ok(Ok(C2S::Disconnect(msg))) => break LeaveReason::Disconnected(state_trunc(&msg)),
                 Ok(Ok(msg)) => server.handle(id, msg),
                 Ok(Err(_)) => break LeaveReason::Disconnected("Connection lost".into()),
@@ -120,11 +123,13 @@ async fn bulk(
         return Ok(());
     };
     writer.send(&BulkS2C::Attached).await?;
+    TRAFFIC.sent(Cat::Chat, writer.last_size);
     tokio::spawn(async move {
         while let Some(m) = brx.recv().await {
             if writer.send(&m).await.is_err() {
                 break;
             }
+            TRAFFIC.sent(traffic::bulk_s2c(&m), writer.last_size);
         }
     });
     let mut uploads: HashMap<u32, Upload> = HashMap::new();
@@ -132,7 +137,13 @@ async fn bulk(
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         let msg = tokio::select! {
-            m = reader.recv::<BulkC2S>() => match m { Ok(m) => m, Err(_) => break },
+            m = reader.recv::<BulkC2S>() => match m {
+                Ok(m) => {
+                    TRAFFIC.received(traffic::bulk_c2s(&m), reader.last_size);
+                    m
+                }
+                Err(_) => break,
+            },
             _ = tick.tick() => {
                 if !server.state.lock().sessions.contains_key(&id) { break; }
                 continue;

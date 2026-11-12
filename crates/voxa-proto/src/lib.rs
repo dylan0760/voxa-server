@@ -7,6 +7,7 @@
 pub mod identity;
 pub mod model;
 pub mod msg;
+pub mod traffic;
 pub mod transport;
 #[cfg(feature = "update")]
 pub mod update;

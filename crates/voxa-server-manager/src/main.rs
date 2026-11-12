@@ -49,6 +49,7 @@ struct Status {
     started: u64,
     updated: u64,
     fingerprint: String,
+    traffic: voxa_proto::traffic::TrafficStats,
 }
 
 enum RawTray {
@@ -530,6 +531,31 @@ impl eframe::App for ManagerApp {
                     }
                 });
             });
+
+            if let Some(s) = &self.status {
+                card(ui, "Traffic since the server started", |ui| {
+                    use voxa_proto::traffic::fmt_bytes;
+                    let t = &s.traffic;
+                    egui::Grid::new("traffic").num_columns(3).spacing([24.0, 4.0]).show(ui, |ui| {
+                        ui.label("");
+                        ui.label(RichText::new("⬇ Received").small().color(DIM));
+                        ui.label(RichText::new("⬆ Sent").small().color(DIM));
+                        ui.end_row();
+                        for (name, rx, tx) in t.rows() {
+                            ui.label(RichText::new(name).color(DIM));
+                            ui.label(fmt_bytes(rx));
+                            ui.label(fmt_bytes(tx));
+                            ui.end_row();
+                        }
+                        ui.label(RichText::new("Total").strong());
+                        ui.label(RichText::new(fmt_bytes(t.total_in())).strong());
+                        ui.label(RichText::new(fmt_bytes(t.total_out())).strong());
+                        ui.end_row();
+                    });
+                    ui.label(RichText::new(format!("All traffic combined: {}", fmt_bytes(t.total_in() + t.total_out()))).small().color(DIM))
+                        .on_hover_text("Received = from clients, sent = to clients. Bytes as sent over the network (encrypted), without TCP/IP headers. Updated every few seconds.");
+                });
+            }
 
             card(ui, "Updates", |ui| {
                 updater::ui(&mut self.updater, ui, "Voxa Server");

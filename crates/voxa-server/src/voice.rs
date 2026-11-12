@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use tokio::net::UdpSocket;
 use tracing::warn;
+use voxa_proto::traffic::{Cat, TRAFFIC};
 use voxa_proto::voice::{self, Direction, Kind};
 
 use crate::state::Server;
@@ -24,9 +25,12 @@ pub async fn run(server: Arc<Server>, sock: UdpSocket) {
                 continue;
             }
         };
+        TRAFFIC.received(Cat::Voice, n);
         let out = route(&server, &buf[..n], src);
         for (addr, pkt) in out {
-            let _ = sock.send_to(&pkt, addr).await;
+            if sock.send_to(&pkt, addr).await.is_ok() {
+                TRAFFIC.sent(Cat::Voice, pkt.len());
+            }
         }
     }
 }

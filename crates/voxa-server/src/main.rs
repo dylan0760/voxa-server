@@ -212,7 +212,9 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
         // Written only when something changed, plus a heartbeat once a minute. Rewriting
         // the file every few seconds makes antivirus software rescan it each time.
         let mut t = tokio::time::interval(Duration::from_secs(3));
-        let mut last: Option<(usize, usize)> = None;
+        // Traffic totals change while people talk / transfer, so the file is then
+        // refreshed every 3 s; while idle nothing changes and nothing is written.
+        let mut last: Option<(usize, usize, voxa_proto::traffic::TrafficStats)> = None;
         let mut last_write = std::time::Instant::now();
         loop {
             t.tick().await;
@@ -220,20 +222,29 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
                 let st = status_srv.state.lock();
                 (st.sessions.len(), st.channels.len())
             };
-            if last == Some((online, channels)) && last_write.elapsed() < Duration::from_secs(60) {
+            let tr = voxa_proto::traffic::TRAFFIC.snapshot();
+            if last == Some((online, channels, tr)) && last_write.elapsed() < Duration::from_secs(60) {
                 continue;
             }
-            last = Some((online, channels));
+            last = Some((online, channels, tr));
             last_write = std::time::Instant::now();
             let json = format!(
-                "{{\"running\":true,\"version\":\"{}\",\"port\":{},\"online\":{},\"channels\":{},\"started\":{},\"updated\":{},\"fingerprint\":\"{}\"}}",
+                "{{\"running\":true,\"version\":\"{}\",\"port\":{},\"online\":{},\"channels\":{},\"started\":{},\"updated\":{},\"fingerprint\":\"{}\",\"traffic\":{{\"voice_in\":{},\"voice_out\":{},\"files_in\":{},\"files_out\":{},\"screen_in\":{},\"screen_out\":{},\"chat_in\":{},\"chat_out\":{}}}}}",
                 voxa_proto::APP_VERSION,
                 port,
                 online,
                 channels,
                 status_srv.started,
                 voxa_proto::now_unix(),
-                status_srv.fingerprint
+                status_srv.fingerprint,
+                tr.voice_in,
+                tr.voice_out,
+                tr.files_in,
+                tr.files_out,
+                tr.screen_in,
+                tr.screen_out,
+                tr.chat_in,
+                tr.chat_out
             );
             let _ = std::fs::write(&status_path, json);
         }

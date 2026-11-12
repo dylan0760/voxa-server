@@ -61,6 +61,8 @@ pub struct SecureReader<R> {
     hdr_have: usize,
     body_len: Option<usize>,
     frame_have: usize,
+    /// Bytes on the wire (length prefixes, encryption) of the last received message.
+    pub last_size: usize,
 }
 
 pub struct SecureWriter<W> {
@@ -68,6 +70,15 @@ pub struct SecureWriter<W> {
     state: Arc<StatelessTransportState>,
     nonce: u64,
     scratch: Vec<u8>,
+    /// Bytes on the wire of the last sent message.
+    pub last_size: usize,
+}
+
+/// Wire size of a message whose serialized body is ody_len bytes: a 4 byte length,
+/// split into Noise frames that each add a 2 byte length and a 16 byte tag.
+pub fn wire_size(body_len: usize) -> usize {
+    let plain = body_len + 4;
+    plain + plain.div_ceil(CHUNK_PLAIN) * (2 + TAG)
 }
 
 pub struct Secured<R, W> {
@@ -95,8 +106,9 @@ fn split<R, W>(r: R, w: W, state: StatelessTransportState) -> Result<Secured<R, 
             hdr_have: 0,
             body_len: None,
             frame_have: 0,
+            last_size: 0,
         },
-        writer: SecureWriter { inner: w, state, nonce: 0, scratch: vec![0u8; NOISE_MAX] },
+        writer: SecureWriter { inner: w, state, nonce: 0, scratch: vec![0u8; NOISE_MAX], last_size: 0 },
         remote_static,
     })
 }
@@ -194,6 +206,7 @@ impl<R: AsyncRead + Unpin> SecureReader<R> {
                     let msg = bincode::deserialize(&self.plain[4..4 + len])
                         .map_err(|e| TransportError::Codec(e.to_string()));
                     self.plain.drain(..4 + len);
+                    self.last_size = wire_size(len);
                     return msg;
                 }
             }
@@ -223,6 +236,7 @@ impl<W: AsyncWrite + Unpin> SecureWriter<W> {
         }
         self.inner.write_all(&out).await?;
         self.inner.flush().await?;
+        self.last_size = out.len();
         Ok(())
     }
 }
@@ -265,5 +279,25 @@ mod tests {
         }
         assert_eq!(got, expected);
         assert!(cancellations > 10, "test did not exercise cancellation ({cancellations})");
+    }
+
+    /// Traffic statistics: the receiver's computed wire size equals what was written.
+    #[tokio::test]
+    async fn last_size_matches_wire_bytes() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let (ck, sk) = (KeyPair::generate(), KeyPair::generate());
+        let client = tokio::spawn(async move { connect(ar, aw, &ck.private).await.unwrap() });
+        let mut server = accept(br, bw, &sk.private).await.unwrap();
+        let mut client = client.await.unwrap();
+        for len in [0usize, 1, 100, CHUNK_PLAIN - 12, CHUNK_PLAIN, 300_000] {
+            let msg = vec![7u8; len];
+            client.writer.send(&msg).await.unwrap();
+            let got: Vec<u8> = server.reader.recv().await.unwrap();
+            assert_eq!(got.len(), len);
+            assert_eq!(server.reader.last_size, client.writer.last_size, "message of {len} bytes");
+            assert_eq!(client.writer.last_size, wire_size(bincode::serialized_size(&msg).unwrap() as usize));
+        }
     }
 }
