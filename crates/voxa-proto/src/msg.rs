@@ -168,6 +168,10 @@ pub enum BulkC2S {
     ChatImage { id: u32, target: TextTarget, name: String, width: u32, height: u32, data: Vec<u8> },
     /// Fetches a chat image (answered with `Image` or `ImageError`).
     GetImage(u64),
+
+    // --- added in 1.6.0; only sent to servers that are 1.6.0 or newer ---
+    /// 20 ms of the shared screen / application's sound: one stereo 48 kHz Opus packet.
+    StreamAudio(Vec<u8>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -186,6 +190,10 @@ pub enum BulkS2C {
     ChatImageSent { id: u32 },
     Image { image: u64, data: Vec<u8> },
     ImageError { image: u64, message: String },
+
+    // --- added in 1.6.0; only sent to clients that are 1.8.0 or newer ---
+    /// Sound of a stream being watched (see `BulkC2S::StreamAudio`).
+    StreamAudio { from: ClientId, data: Vec<u8> },
 }
 
 pub const FILE_CHUNK: usize = 256 * 1024;

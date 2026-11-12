@@ -1801,6 +1801,26 @@ impl Server {
         }
     }
 
+    /// Forwards a stream's sound to its viewers (clients 1.8.0+ only: older ones cannot
+    /// decode the message). Dropped for a viewer whose connection is backed up.
+    pub fn relay_audio(&self, from: ClientId, data: Vec<u8>) {
+        if data.len() > 4000 {
+            return;
+        }
+        let st = self.state.lock();
+        let Some(s) = st.sessions.get(&from) else { return };
+        if s.info.streaming.is_none() {
+            return;
+        }
+        for v in &s.viewers {
+            if let Some(viewer) = st.sessions.get(v).filter(|x| x.client_at_least("1.8.0")) {
+                if let Some(b) = &viewer.bulk_tx {
+                    let _ = b.try_send(BulkS2C::StreamAudio { from, data: data.clone() });
+                }
+            }
+        }
+    }
+
     pub fn request_keyframe(&self, streamer: ClientId) {
         let mut st = self.state.lock();
         self.request_keyframe_locked(&mut st, streamer);

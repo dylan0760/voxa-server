@@ -115,6 +115,34 @@ async fn main() {
     let dir = std::env::args().nth(2).unwrap_or_default();
     // `--post <file>`: "Liam" posts a real image to the default channel and stays online
     // for a while (to look at it in a client).
+    // `--stream-audio`: the server relays a stream's sound to a viewer (clients 1.8.0+).
+    if std::env::args().nth(3).as_deref() == Some("--stream-audio") {
+        let mut a = login(&addr, "Streamer").await;
+        let mut b = login(&addr, "Viewer").await;
+        a.w.send(&C2S::StartStream(StreamInfo { kind: StreamKind::Screen, title: "Test".into(), width: 640, height: 360, fps: 15 }))
+            .await
+            .unwrap();
+        let aid = a.id;
+        until(&mut b, |m| matches!(m, S2C::ClientUpdated(c) if c.id == aid && c.streaming.is_some()).then_some(())).await;
+        b.w.send(&C2S::WatchStream { streamer: aid, watch: true }).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for i in 0..5u8 {
+            a.bw.send(&BulkC2S::StreamAudio(vec![i; 200])).await.unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < 5 {
+            let d = bulk_until(&mut b, |m| match m {
+                BulkS2C::StreamAudio { from, data } if from == aid => Some(data),
+                _ => None,
+            })
+            .await;
+            got.push(d[0]);
+        }
+        assert_eq!(got, vec![0, 1, 2, 3, 4]);
+        println!("viewer received all 5 sound packets of the stream, in order");
+        println!("STREAM AUDIO TEST PASSED");
+        return;
+    }
     // `--say <msg>...`: "Liam" sends text messages to the default channel and stays online.
     if std::env::args().nth(3).as_deref() == Some("--say") {
         let mut liam = login(&addr, "Liam").await;

@@ -99,7 +99,7 @@ impl TrafficStats {
 /// Category of a message on the bulk (files / screen share) connection.
 pub fn bulk_c2s(m: &BulkC2S) -> Cat {
     match m {
-        BulkC2S::Frame(_) | BulkC2S::RequestKeyframe(_) => Cat::Screen,
+        BulkC2S::Frame(_) | BulkC2S::RequestKeyframe(_) | BulkC2S::StreamAudio(_) => Cat::Screen,
         BulkC2S::UploadBegin { .. }
         | BulkC2S::UploadChunk { .. }
         | BulkC2S::UploadEnd { .. }
@@ -112,7 +112,7 @@ pub fn bulk_c2s(m: &BulkC2S) -> Cat {
 
 pub fn bulk_s2c(m: &BulkS2C) -> Cat {
     match m {
-        BulkS2C::Frame { .. } | BulkS2C::KeyframeRequested => Cat::Screen,
+        BulkS2C::Frame { .. } | BulkS2C::KeyframeRequested | BulkS2C::StreamAudio { .. } => Cat::Screen,
         BulkS2C::Attached => Cat::Chat,
         _ => Cat::Files,
     }

@@ -152,6 +152,7 @@ async fn bulk(
         match msg {
             BulkC2S::Frame(f) => server.relay_frame(id, f),
             BulkC2S::RequestKeyframe(streamer) => server.request_keyframe(streamer),
+            BulkC2S::StreamAudio(data) => server.relay_audio(id, data),
             BulkC2S::UploadBegin { id: tid, channel, path, size, overwrite } => {
                 match begin_upload(&server, id, channel, &path, size, overwrite).await {
                     Ok(u) => {
