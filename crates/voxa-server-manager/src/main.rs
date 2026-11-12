@@ -195,6 +195,8 @@ struct ManagerApp {
     seen_generation: u64,
     /// True while the window is hidden in the tray (no timed repaints then).
     hidden: bool,
+    /// Start of the previous frame (redraws are capped at 60 per second).
+    last_frame: Option<std::time::Instant>,
     busy: Arc<Mutex<Option<String>>>,
     message: Arc<Mutex<Option<(String, bool)>>>,
     tray: Option<TrayMenu>,
@@ -255,6 +257,7 @@ impl ManagerApp {
             log: Arc::new(Vec::new()),
             polled: start_poller(data_dir(), ctx.clone()),
             seen_generation: 0,
+            last_frame: None,
             hidden: std::env::args().any(|a| a == "--minimized"),
             busy: Arc::new(Mutex::new(None)),
             message: Arc::new(Mutex::new(None)),
@@ -422,6 +425,15 @@ fn card(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 impl eframe::App for ManagerApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // egui redraws on every mouse movement; on high refresh monitors that would be
+        // 240+ redraws a second (GPU spikes). 60 is plenty for this window.
+        let min = Duration::from_micros(16_667);
+        if let Some(prev) = self.last_frame {
+            if prev.elapsed() < min {
+                std::thread::sleep(min - prev.elapsed().min(min));
+            }
+        }
+        self.last_frame = Some(std::time::Instant::now());
         self.poll();
         self.updater.auto_check();
         if matches!(self.updater.get(), updater::UpdState::Installing) && !self.quitting {
