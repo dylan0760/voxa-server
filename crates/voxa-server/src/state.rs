@@ -146,7 +146,8 @@ fn default_groups() -> Vec<GroupInfo> {
                 | FILE_UPLOAD
                 | FILE_DOWNLOAD
                 | FILE_DELETE
-                | CHAT_DELETE,
+                | CHAT_DELETE
+                | CHAT_PIN,
             50,
             10,
             true,
@@ -970,6 +971,7 @@ impl Server {
                 };
                 let by = s.info.nickname.clone();
                 let n = db(self.store.clear_chat(ch))?;
+                let _ = self.store.clear_pins(ch);
                 let imgs = self.store.delete_images_where(|m| m.ch == Some(ch)).unwrap_or(0);
                 info!("{by} cleared the chat history of {target:?} ({n} messages, {imgs} images)");
                 let ids: Vec<ClientId> = st
@@ -1015,6 +1017,8 @@ impl Server {
                 Ok(())
             }
             C2S::CloneChannel { source, name, with_children } => self.clone_channel(st, me, source, name, with_children),
+            C2S::PinMessage { target, id, pin } => self.pin_message(st, me, target, id, pin),
+            C2S::GetPins(target) => self.get_pins(st, me, target),
             C2S::GetFileLimits => {
                 st.send(me, S2C::FileLimits(st.file_limits));
                 Ok(())
@@ -1525,6 +1529,7 @@ impl Server {
             self.need(p, perm::CHAT_DELETE)?;
         }
         db(self.store.delete_chat(ch, id))?;
+        let _ = self.store.set_pin(ch, id, None);
         // An image message takes its image with it (only the image really posted with
         // this message, not one a typed tag merely points to).
         if let Some(img) = ImageRef::parse(&m.text) {
@@ -1539,6 +1544,74 @@ impl Server {
             TextTarget::Channel(c) => st.broadcast_channel(c, S2C::MessageDeleted { target, id }),
             _ => st.broadcast(S2C::MessageDeleted { target, id }),
         }
+        Ok(())
+    }
+
+    /// Pins / unpins a stored message ("Pin messages" permission, at most 50 per chat).
+    fn pin_message(&self, st: &mut State, me: ClientId, target: TextTarget, id: MessageId, pin: bool) -> Res {
+        let s = st.session(me)?;
+        let ch = self.history_channel(st, s, target)?;
+        let p = if ch == SERVER_CHAT_CHANNEL { st.server_perms(s) } else { self.perms_in(st, s, ch) };
+        self.need(p, perm::CHAT_PIN)?;
+        let by = s.info.nickname.clone();
+        let pins = db(self.store.pins(ch))?;
+        let is_pinned = pins.iter().any(|(x, _)| *x == id);
+        if pin == is_pinned {
+            return Ok(());
+        }
+        if pin {
+            db(self.store.get_chat(ch, id))?.ok_or("Message not found")?;
+            if pins.len() >= 50 {
+                return Err("This chat already has 50 pinned messages - unpin one first".into());
+            }
+            db(self.store.set_pin(ch, id, Some(&PinMeta { by: by.clone(), at: now_unix() })))?;
+        } else {
+            db(self.store.set_pin(ch, id, None))?;
+        }
+        info!("{by} {} message {id} in {target:?}", if pin { "pinned" } else { "unpinned" });
+        let ids: Vec<ClientId> = st
+            .sessions
+            .values()
+            .filter(|x| matches!(target, TextTarget::Server) || x.info.channel == ch)
+            .map(|x| x.info.id)
+            .collect();
+        for c in ids {
+            st.send_if_supported(c, "1.10.0", S2C::PinChanged { target, id, pinned: pin, by: by.clone() });
+        }
+        Ok(())
+    }
+
+    /// Sends the pinned messages of a chat, most recently pinned first. Pins of messages
+    /// that no longer exist (e.g. removed by chat retention) are dropped.
+    fn get_pins(&self, st: &mut State, me: ClientId, target: TextTarget) -> Res {
+        let s = st.session(me)?;
+        let ch = self.history_channel(st, s, target)?;
+        let mut pins = Vec::new();
+        {
+            let online: HashMap<&str, ClientId> = st.sessions.values().map(|s| (s.info.uid.as_str(), s.info.id)).collect();
+            for (id, meta) in db(self.store.pins(ch))? {
+                match db(self.store.get_chat(ch, id))? {
+                    Some(m) => pins.push(PinnedMessage {
+                        message: ChatMessage {
+                            id,
+                            target,
+                            from: online.get(m.from_uid.as_str()).copied(),
+                            from_uid: m.from_uid,
+                            from_name: m.from_name,
+                            ts: m.ts,
+                            text: m.text,
+                        },
+                        pinned_by: meta.by,
+                        pinned_at: meta.at,
+                    }),
+                    None => {
+                        let _ = self.store.set_pin(ch, id, None);
+                    }
+                }
+            }
+        }
+        pins.sort_by(|a, b| b.pinned_at.cmp(&a.pinned_at).then(b.message.id.cmp(&a.message.id)));
+        st.send(me, S2C::Pins { target, pins });
         Ok(())
     }
 

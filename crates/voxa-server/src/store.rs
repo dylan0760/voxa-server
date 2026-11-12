@@ -24,6 +24,8 @@ const CLIENT_PERMS: TableDefinition<&str, u64> = TableDefinition::new("client_pe
 /// so clean-ups never have to decrypt whole images.
 const IMAGE_META: TableDefinition<u64, &[u8]> = TableDefinition::new("image_meta");
 const IMAGE_DATA: TableDefinition<u64, &[u8]> = TableDefinition::new("image_data");
+/// Pinned messages (1.8.0+): (chat, message) -> sealed PinMeta.
+const PINS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("pins");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StoredSettings {
@@ -73,6 +75,13 @@ pub struct StoredMessage {
     pub text: String,
 }
 
+/// Who pinned a message and when.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PinMeta {
+    pub by: String,
+    pub at: u64,
+}
+
 /// Where a chat image was posted and who may see it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ImageMeta {
@@ -118,6 +127,7 @@ impl Store {
             w.open_table(CLIENT_PERMS)?;
             w.open_table(IMAGE_META)?;
             w.open_table(IMAGE_DATA)?;
+            w.open_table(PINS)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -127,9 +137,10 @@ impl Store {
     }
 
     /// Upgrades records written by older versions. Schema 1 (Voxa 1.0/1.1) had no
-    /// join power on groups/channels and no "join channels" permission.
+    /// join power on groups/channels and no "join channels" permission; schema 2
+    /// (before 1.8.0) had no "pin messages" permission.
     fn migrate(&self) -> R<()> {
-        const SCHEMA: u64 = 2;
+        const SCHEMA: u64 = 3;
         let current = {
             let r = self.db.begin_read()?;
             let t = r.open_table(META)?;
@@ -231,6 +242,19 @@ impl Store {
             let w = self.db.begin_write()?;
             w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
             w.commit()?;
+        }
+        if current < 3 {
+            // 1.8.0: the built-in Channel Admin group may pin messages.
+            for mut g in self.load_groups()? {
+                if g.id == 4 && g.builtin && g.kind == GroupKind::Channel && g.perms & perm::CHAT_PIN == 0 {
+                    g.perms |= perm::CHAT_PIN;
+                    self.save_group(&g)?;
+                }
+            }
+            let w = self.db.begin_write()?;
+            w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
+            w.commit()?;
+            tracing::info!("database migrated to schema {SCHEMA}");
         }
         Ok(())
     }
@@ -349,6 +373,7 @@ impl Store {
         }
         w.commit()?;
         self.delete_images_where(|m| m.ch == Some(id))?;
+        self.clear_pins(id)?;
         Ok(())
     }
 
@@ -513,6 +538,56 @@ impl Store {
 
     fn image_aad(kind: &[u8], id: u64) -> Vec<u8> {
         [b"voxa-image-".as_slice(), kind, &id.to_be_bytes()].concat()
+    }
+
+    fn pin_aad(ch: u64, id: u64) -> Vec<u8> {
+        [b"voxa-pin".as_slice(), &ch.to_be_bytes(), &id.to_be_bytes()].concat()
+    }
+
+    pub fn set_pin(&self, ch: ChannelId, id: MessageId, meta: Option<&PinMeta>) -> R<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(PINS)?;
+            match meta {
+                Some(m) => {
+                    let blob = self.seal_raw(&Self::pin_aad(ch, id), &enc(m));
+                    t.insert((ch, id), blob.as_slice())?;
+                }
+                None => {
+                    t.remove((ch, id))?;
+                }
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Pins of a chat: (message id, meta).
+    pub fn pins(&self, ch: ChannelId) -> R<Vec<(MessageId, PinMeta)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(PINS)?;
+        let mut out = Vec::new();
+        for row in t.range((ch, 0)..=(ch, u64::MAX))? {
+            let (k, v) = row?;
+            let (_, id) = k.value();
+            if let Some(m) = self.unseal_raw(&Self::pin_aad(ch, id), v.value()).and_then(|p| dec::<PinMeta>(&p)) {
+                out.push((id, m));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn clear_pins(&self, ch: ChannelId) -> R<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(PINS)?;
+            let keys: Vec<(u64, u64)> = t.range((ch, 0)..=(ch, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, _)| k.value()).collect();
+            for k in keys {
+                t.remove(k)?;
+            }
+        }
+        w.commit()?;
+        Ok(())
     }
 
     pub fn new_image_id(&self) -> R<u64> {

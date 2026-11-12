@@ -49,8 +49,10 @@ pub mod perm {
     pub const CHANNEL_JOIN_IGNORE_POWER: u64 = 1 << 33;
     /// Wipe an entire channel / server chat, live and from the stored history.
     pub const CHAT_CLEAR: u64 = 1 << 34;
+    /// Pin / unpin messages at the top of a channel or the server chat.
+    pub const CHAT_PIN: u64 = 1 << 35;
 
-    pub const ALL: u64 = (1 << 35) - 1;
+    pub const ALL: u64 = (1 << 36) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -75,6 +77,7 @@ pub mod perm {
         (CHAT_HISTORY, "Read chat history"),
         (CHAT_DELETE, "Delete anyone's chat messages (incl. history)"),
         (CHAT_CLEAR, "Clear entire chat history"),
+        (CHAT_PIN, "Pin messages"),
         (GROUP_MANAGE, "Create, edit and delete groups"),
         (GROUP_ASSIGN_SERVER, "Assign server groups"),
         (GROUP_ASSIGN_CHANNEL, "Assign channel groups"),
@@ -344,6 +347,14 @@ pub fn image_kind(data: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// A pinned chat message (1.8.0+).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PinnedMessage {
+    pub message: ChatMessage,
+    pub pinned_by: String,
+    pub pinned_at: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

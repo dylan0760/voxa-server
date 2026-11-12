@@ -83,6 +83,12 @@ pub enum C2S {
     /// Copies a channel under a new name: all settings, the password and everyone's
     /// channel group (e.g. channel admins). With `with_children` the sub-channels too.
     CloneChannel { source: ChannelId, name: String, with_children: bool },
+
+    // --- added in 1.8.0; only sent to servers that are 1.8.0 or newer ---
+    /// Pins or unpins a stored message (requires "Pin messages").
+    PinMessage { target: TextTarget, id: MessageId, pin: bool },
+    /// Asks for the pinned messages of a chat (answered with `S2C::Pins`).
+    GetPins(TextTarget),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -153,6 +159,12 @@ pub enum S2C {
     ClientPerms { uid: String, perms: u64 },
     /// Your own per-user permissions (in addition to your groups).
     YourPerms(u64),
+
+    // --- added in 1.8.0; only sent to clients that are 1.10.0 or newer ---
+    /// Pinned messages of a chat, most recently pinned first.
+    Pins { target: TextTarget, pins: Vec<PinnedMessage> },
+    /// Someone pinned / unpinned a message (fetch the pins again to update).
+    PinChanged { target: TextTarget, id: MessageId, pinned: bool, by: String },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
