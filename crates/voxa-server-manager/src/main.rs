@@ -443,7 +443,7 @@ impl eframe::App for ManagerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if let Some(wn) = &self.whats_new {
-            if !updater::whats_new_window(ui.ctx(), wn, "Voxa Server") {
+            if !updater::whats_new_window(ui.ctx(), wn, "Voxa Server", updater::render_notes) {
                 self.whats_new = None;
             }
         }

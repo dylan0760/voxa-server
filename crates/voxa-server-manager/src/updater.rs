@@ -187,7 +187,8 @@ pub fn render_notes(ui: &mut egui::Ui, text: &str) {
 }
 
 /// The "What's new" window. Returns false once the user closed it.
-pub fn whats_new_window(ctx: &egui::Context, wn: &WhatsNew, product: &str) -> bool {
+/// The `render` function draws the release notes (Markdown).
+pub fn whats_new_window(ctx: &egui::Context, wn: &WhatsNew, product: &str, render: fn(&mut egui::Ui, &str)) -> bool {
     use egui::RichText;
     let mut open = true;
     let mut close = false;
@@ -215,7 +216,7 @@ pub fn whats_new_window(ctx: &egui::Context, wn: &WhatsNew, product: &str) -> bo
                     ui.label(RichText::new(title).heading());
                     ui.separator();
                     egui::ScrollArea::vertical().max_height(340.0).auto_shrink([false, true]).show(ui, |ui| {
-                        render_notes(ui, &notes);
+                        render(ui, &notes);
                     });
                     ui.separator();
                     if !url.is_empty() && ui.link("View this release on GitHub").clicked() {

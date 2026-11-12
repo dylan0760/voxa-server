@@ -115,6 +115,17 @@ async fn main() {
     let dir = std::env::args().nth(2).unwrap_or_default();
     // `--post <file>`: "Liam" posts a real image to the default channel and stays online
     // for a while (to look at it in a client).
+    // `--say <msg>...`: "Liam" sends text messages to the default channel and stays online.
+    if std::env::args().nth(3).as_deref() == Some("--say") {
+        let mut liam = login(&addr, "Liam").await;
+        let chan = TextTarget::Channel(liam.channel);
+        for text in std::env::args().skip(4) {
+            liam.w.send(&C2S::SendText { target: chan, text: text.replace("\\n", "\n") }).await.unwrap();
+        }
+        println!("said {} messages", std::env::args().count().saturating_sub(4));
+        tokio::time::sleep(Duration::from_secs(90)).await;
+        return;
+    }
     if std::env::args().nth(3).as_deref() == Some("--post") {
         let file = std::env::args().nth(4).expect("image file");
         let data = std::fs::read(&file).unwrap();
