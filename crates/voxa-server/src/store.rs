@@ -417,6 +417,21 @@ impl Store {
         Ok(())
     }
 
+    /// Everyone with a channel group in channel `ch`: (uid, group).
+    pub fn channel_group_assignments(&self, ch: ChannelId) -> R<Vec<(String, GroupId)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(CHANNEL_GROUPS)?;
+        let mut out = Vec::new();
+        for row in t.iter()? {
+            let (k, v) = row?;
+            let (u, c) = k.value();
+            if c == ch {
+                out.push((u.to_string(), v.value()));
+            }
+        }
+        Ok(out)
+    }
+
     pub fn channel_group_members(&self, g: GroupId) -> R<Vec<(String, ChannelId)>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(CHANNEL_GROUPS)?;

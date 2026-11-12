@@ -1014,6 +1014,7 @@ impl Server {
                 st.send(me, S2C::ClientPerms { uid, perms });
                 Ok(())
             }
+            C2S::CloneChannel { source, name, with_children } => self.clone_channel(st, me, source, name, with_children),
             C2S::GetFileLimits => {
                 st.send(me, S2C::FileLimits(st.file_limits));
                 Ok(())
@@ -1264,6 +1265,77 @@ impl Server {
         db(self.store.set_channel_group(&uid, id, Some(admin)))?;
         self.move_client(st, me, id, None);
         Ok(())
+    }
+
+    /// Copies a channel under a new name, right below the original: all settings, the
+    /// password and everyone's channel group (channel admins etc.). Optionally with all
+    /// sub-channels (which keep their names). Chat history and files are not copied.
+    fn clone_channel(&self, st: &mut State, me: ClientId, source: ChannelId, name: String, with_children: bool) -> Res {
+        let src = st.channels.get(&source).ok_or("Channel not found")?;
+        let s = st.session(me)?;
+        let p = st.server_perms(s);
+        let ids = if with_children { st.subtree(source) } else { vec![source] };
+        for id in &ids {
+            if let Some(c) = st.channels.get(id) {
+                self.need(p, Self::create_perm_for(c.info.kind))?;
+            }
+        }
+        let by = s.info.nickname.clone();
+        let (parent, src_sort, kind, src_name) = (src.info.parent, src.info.sort, src.info.kind, src.info.name.clone());
+        let mut e = ChannelEdit::from_info(&src.info);
+        e.name = name;
+        e.is_default = false;
+        e.password = PasswordChange::Keep;
+        self.validate_channel_edit(st, None, &mut e)?;
+        // Make room directly below the original.
+        let later: Vec<ChannelId> = st.channels.values().filter(|c| c.info.parent == parent && c.info.sort > src_sort).map(|c| c.info.id).collect();
+        for id in later {
+            let c = st.channels.get_mut(&id).unwrap();
+            c.info.sort += 1;
+            let rec = ChannelRec { info: c.info.clone(), password_hash: c.password_hash.clone() };
+            self.persist_channel(&rec)?;
+            st.broadcast(S2C::ChannelEdited(rec.info));
+        }
+        let new_id = self.copy_channel(st, source, parent, e.name.clone(), src_sort + 1)?;
+        let mut count = 1;
+        if with_children {
+            count += self.copy_children(st, source, new_id)?;
+        }
+        info!("{by} cloned channel \"{src_name}\" as \"{}\" ({count} channel(s))", e.name);
+        // A temporary channel only lives while someone is in it.
+        if kind == ChannelKind::Temporary {
+            self.move_client(st, me, new_id, None);
+        }
+        Ok(())
+    }
+
+    fn copy_channel(&self, st: &mut State, source: ChannelId, parent: Option<ChannelId>, name: String, sort: i64) -> Res<ChannelId> {
+        let src = st.channels.get(&source).ok_or("Channel not found")?;
+        let id = db(self.store.next_id("next_channel"))?;
+        let info = ChannelInfo { id, parent, sort, name, is_default: false, ..src.info.clone() };
+        let rec = ChannelRec { info: info.clone(), password_hash: src.password_hash.clone() };
+        if info.kind == ChannelKind::Permanent {
+            self.persist_channel(&rec)?;
+        }
+        st.channels.insert(id, rec);
+        st.broadcast(S2C::ChannelCreated(info));
+        for (uid, g) in db(self.store.channel_group_assignments(source))? {
+            db(self.store.set_channel_group(&uid, id, Some(g)))?;
+        }
+        Ok(id)
+    }
+
+    /// Copies the sub-channels of `from` below `to`, recursively. Returns how many.
+    fn copy_children(&self, st: &mut State, from: ChannelId, to: ChannelId) -> Res<usize> {
+        let mut kids: Vec<(i64, ChannelId, String)> =
+            st.channels.values().filter(|c| c.info.parent == Some(from)).map(|c| (c.info.sort, c.info.id, c.info.name.clone())).collect();
+        kids.sort();
+        let mut n = 0;
+        for (sort, kid, name) in kids {
+            let copy = self.copy_channel(st, kid, Some(to), name, sort)?;
+            n += 1 + self.copy_children(st, kid, copy)?;
+        }
+        Ok(n)
     }
 
     fn clear_default(&self, st: &mut State) -> Res {

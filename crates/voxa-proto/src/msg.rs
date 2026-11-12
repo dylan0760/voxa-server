@@ -78,6 +78,11 @@ pub enum C2S {
     /// Per-user permissions granted on top of the user's groups (requires "Manage groups").
     GetClientPerms(String),
     SetClientPerms { uid: String, perms: u64 },
+
+    // --- added in 1.7.0; only sent to servers that are 1.7.0 or newer ---
+    /// Copies a channel under a new name: all settings, the password and everyone's
+    /// channel group (e.g. channel admins). With `with_children` the sub-channels too.
+    CloneChannel { source: ChannelId, name: String, with_children: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
