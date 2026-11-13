@@ -5,6 +5,7 @@
 //! encrypted UDP voice packet format.
 
 pub mod identity;
+pub mod lossless;
 pub mod model;
 pub mod msg;
 pub mod traffic;
@@ -42,36 +43,42 @@ pub fn quality_to_bitrate(q: u8) -> i32 {
 /// The codec a channel uses.
 ///
 /// Stored in `ChannelInfo::codec_quality` / `ChannelEdit::codec_quality`: the low bits
-/// are the quality (0..=10), the top bit selects Opus Music. That keeps the wire format
-/// unchanged; only servers 1.10.0+ keep the bit (older ones clamp the value to 10).
+/// are the quality (0..=10), the top bits select the codec (0x80 Opus Music, servers
+/// 1.10.0+; 0x40 Lossless, servers 1.11.0+). That keeps the wire format unchanged.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VoiceCodec {
     /// Mono, tuned for speech (low bitrates, packet loss protection).
     OpusVoice,
     /// Stereo, full band, high bitrate: for music.
     OpusMusic,
+    /// 16-bit stereo PCM, bit exact (compressed like FLAC, ~0.8-1.5 Mbit/s).
+    Lossless,
 }
 
 pub const CODEC_MUSIC_BIT: u8 = 0x80;
+pub const CODEC_LOSSLESS_BIT: u8 = 0x40;
 
 impl VoiceCodec {
-    pub const ALL: [VoiceCodec; 2] = [VoiceCodec::OpusVoice, VoiceCodec::OpusMusic];
+    pub const ALL: [VoiceCodec; 3] = [VoiceCodec::OpusVoice, VoiceCodec::OpusMusic, VoiceCodec::Lossless];
 
     pub fn name(self) -> &'static str {
         match self {
             VoiceCodec::OpusVoice => "Opus Voice",
             VoiceCodec::OpusMusic => "Opus Music",
+            VoiceCodec::Lossless => "Lossless",
         }
     }
 
     pub fn stereo(self) -> bool {
-        self == VoiceCodec::OpusMusic
+        self != VoiceCodec::OpusVoice
     }
 }
 
 /// The codec stored in a channel's `codec_quality`.
 pub fn codec_of(codec_quality: u8) -> VoiceCodec {
-    if codec_quality & CODEC_MUSIC_BIT != 0 {
+    if codec_quality & CODEC_LOSSLESS_BIT != 0 {
+        VoiceCodec::Lossless
+    } else if codec_quality & CODEC_MUSIC_BIT != 0 {
         VoiceCodec::OpusMusic
     } else {
         VoiceCodec::OpusVoice
@@ -80,12 +87,17 @@ pub fn codec_of(codec_quality: u8) -> VoiceCodec {
 
 /// The quality (0..=10) stored in a channel's `codec_quality`.
 pub fn quality_of(codec_quality: u8) -> u8 {
-    (codec_quality & !CODEC_MUSIC_BIT).min(10)
+    (codec_quality & !(CODEC_MUSIC_BIT | CODEC_LOSSLESS_BIT)).min(10)
 }
 
 /// Combines a codec and a quality into a channel's `codec_quality`.
 pub fn pack_codec(codec: VoiceCodec, quality: u8) -> u8 {
-    quality.min(10) | if codec == VoiceCodec::OpusMusic { CODEC_MUSIC_BIT } else { 0 }
+    quality.min(10)
+        | match codec {
+            VoiceCodec::OpusVoice => 0,
+            VoiceCodec::OpusMusic => CODEC_MUSIC_BIT,
+            VoiceCodec::Lossless => CODEC_LOSSLESS_BIT,
+        }
 }
 
 /// Opus bitrate for a channel's `codec_quality` (codec and quality).
@@ -94,6 +106,8 @@ pub fn channel_bitrate(codec_quality: u8) -> i32 {
         VoiceCodec::OpusVoice => quality_to_bitrate(codec_quality),
         // Stereo music: 32 kbit/s .. 192 kbit/s (Opus is transparent from ~128 kbit/s).
         VoiceCodec::OpusMusic => 32_000 + quality_of(codec_quality) as i32 * 16_000,
+        // Uncompressed size; the lossless compression usually saves 30-50% on music.
+        VoiceCodec::Lossless => SAMPLE_RATE as i32 * 2 * 16,
     }
 }
 
@@ -118,5 +132,6 @@ mod codec_tests {
         assert_eq!(channel_bitrate(6), quality_to_bitrate(6));
         assert_eq!(channel_bitrate(pack_codec(VoiceCodec::OpusMusic, 10)), 192_000);
         assert_eq!(channel_bitrate(pack_codec(VoiceCodec::OpusMusic, 6)), 128_000);
+        assert_eq!(codec_of(pack_codec(VoiceCodec::Lossless, 3)), VoiceCodec::Lossless);
     }
 }

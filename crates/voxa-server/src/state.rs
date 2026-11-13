@@ -206,7 +206,7 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.15.0";
+pub const MIN_CLIENT_VERSION: &str = "1.16.0";
 
 /// Most channels a server holds, and how deeply they can be nested.
 pub const MAX_CHANNELS: usize = 2000;
@@ -1508,7 +1508,7 @@ impl Server {
         }
         e.topic = clean_line(&e.topic, 255);
         e.description = clean_text(&e.description, 8192);
-        // Quality 0..=10, plus the Opus Music bit.
+        // Quality 0..=10, plus the codec bits (Opus Music, Lossless).
         e.codec_quality = voxa_proto::pack_codec(voxa_proto::codec_of(e.codec_quality), voxa_proto::quality_of(e.codec_quality));
         if let Some(p) = e.parent {
             if !st.channels.contains_key(&p) {

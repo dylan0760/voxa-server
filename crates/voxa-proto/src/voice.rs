@@ -144,6 +144,11 @@ impl ReplayWindow {
 pub const FLAG_END: u8 = 1;
 /// The Opus data is stereo (Opus Music). Mono decoders can still decode it.
 pub const FLAG_STEREO: u8 = 2;
+/// The data is a `lossless` packet (5 ms of 16-bit stereo), not Opus. Servers 1.11.0+
+/// only forward it to clients 1.16.0+ (older ones would play it as noise).
+pub const FLAG_LOSSLESS: u8 = 4;
+/// Frames (stereo sample pairs) in one lossless packet: 5 ms.
+pub const LOSSLESS_FRAMES: usize = 240;
 
 pub fn encode_voice(frame_seq: u16, flags: u8, opus: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(3 + opus.len());

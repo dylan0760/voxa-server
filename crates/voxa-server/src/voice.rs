@@ -68,9 +68,14 @@ fn route(server: &Server, buf: &[u8], src: SocketAddr) -> Vec<(SocketAddr, Vec<u
             if !st.can_talk(s) {
                 return Vec::new();
             }
+            // Lossless packets are not Opus: clients before 1.16.0 would play them as noise.
+            let lossless = voice::decode_voice(&pkt.payload).map(|(_, flags, _)| flags & voice::FLAG_LOSSLESS != 0).unwrap_or(false);
             let mut out = Vec::new();
             for r in st.sessions.values_mut() {
                 if r.info.id == id || r.info.channel != channel || r.info.output_muted {
+                    continue;
+                }
+                if lossless && !r.client_at_least("1.16.0") {
                     continue;
                 }
                 let Some(addr) = r.voice_addr else { continue };

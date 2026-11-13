@@ -1,6 +1,8 @@
-//! Client version requirement and the Opus Music codec against a running server
+//! Client version requirement, Opus Music and Lossless against a running server
 //! (with `require_latest_client = true`):
 //! `cargo run -p voxa-proto --example feature_test -- 127.0.0.1:9988`
+//! With `--compat` (server with `require_latest_client = false`): an old client in the
+//! channel gets Opus but never Lossless packets.
 //! Must be built from the client repository (it reports the client version).
 
 use std::net::UdpSocket;
@@ -70,11 +72,18 @@ fn udp(addr: &str, u: &User) -> (UdpSocket, VoiceCipher) {
 #[tokio::main]
 async fn main() {
     let addr = std::env::args().nth(1).unwrap_or("127.0.0.1:9988".into());
+    let compat = std::env::args().any(|a| a == "--compat");
 
     // 1. Version requirement.
-    let err = hello(&addr, "Old", "1.14.0").await.err().expect("an old client was let in");
-    assert!(err.starts_with(UPDATE_REQUIRED), "{err}");
-    println!("1. Voxa 1.14.0 refused: \"{}\"", err.trim_start_matches(UPDATE_REQUIRED));
+    let mut old = None;
+    if compat {
+        old = Some(hello(&addr, "Old", "1.15.0").await.expect("compat mode: the server must allow old clients"));
+        println!("1. compat mode: Voxa 1.15.0 allowed (require_latest_client = false)");
+    } else {
+        let err = hello(&addr, "Old", "1.15.0").await.err().expect("an old client was let in");
+        assert!(err.starts_with(UPDATE_REQUIRED), "{err}");
+        println!("1. Voxa 1.15.0 refused: \"{}\"", err.trim_start_matches(UPDATE_REQUIRED));
+    }
     let mut a = hello(&addr, "Alice", APP_VERSION).await.expect("the current client was refused");
     let mut b = hello(&addr, "Bob", APP_VERSION).await.expect("the current client was refused");
     println!("1. Voxa {APP_VERSION} accepted");
@@ -120,5 +129,52 @@ async fn main() {
     let (_, flags, opus) = voice::decode_voice(&pkt.payload).unwrap();
     assert_eq!((pkt.kind, pkt.client, flags, opus.len()), (Kind::Voice, a.id, voice::FLAG_STEREO, 480));
     println!("3. a 480 byte stereo music packet from Alice reached Bob with the stereo flag");
+
+    // 4. Lossless: the channel keeps the codec and a packet arrives bit exact.
+    let mut lossless_edit = ChannelEdit::from_info(&ch);
+    lossless_edit.codec_quality = pack_codec(VoiceCodec::Lossless, 0);
+    a.w.send(&C2S::EditChannel { id: ch.id, edit: lossless_edit }).await.unwrap();
+    let q = until(&mut a, |m| match m {
+        S2C::ChannelEdited(c) if c.id == ch.id => Some(c.codec_quality),
+        _ => None,
+    })
+    .await;
+    assert_eq!(codec_of(q), VoiceCodec::Lossless);
+    let pcm: Vec<i16> = (0..voice::LOSSLESS_FRAMES).flat_map(|i| [((i * 97) % 30000) as i16 - 15000, ((i * 53) % 20000) as i16 - 10000]).collect();
+    let data = lossless::encode(&pcm);
+    let mut old_udp = None;
+    if let Some(o) = &mut old {
+        let oid = o.id;
+        o.w.send(&C2S::SwitchChannel { channel: ch.id, password: None }).await.unwrap();
+        until(o, |m| matches!(m, S2C::ClientMoved { id, channel, .. } if id == oid && channel == ch.id).then_some(())).await;
+        let (so, co) = udp(&addr, o);
+        so.send(&co.seal(Direction::ToServer, Kind::Ping, oid, 1, &0u64.to_be_bytes())).unwrap();
+        let mut buf = [0u8; 2048];
+        so.recv(&mut buf).expect("pong");
+        old_udp = Some((so, co));
+    }
+    sa.send(&ca.seal(Direction::ToServer, Kind::Voice, a.id, 3, &voice::encode_voice(2, voice::FLAG_STEREO | voice::FLAG_LOSSLESS, &data))).unwrap();
+    sa.send(&ca.seal(Direction::ToServer, Kind::Voice, a.id, 4, &voice::encode_voice(3, voice::FLAG_STEREO, &fake_opus))).unwrap();
+    let mut got = Vec::new();
+    while let Ok(n) = sb.recv(&mut buf) {
+        let pkt = cb.open(Direction::ToClient, &buf[..n]).unwrap();
+        let (_, flags, body) = voice::decode_voice(&pkt.payload).unwrap();
+        got.push((flags, body.to_vec()));
+        if got.len() == 2 {
+            break;
+        }
+    }
+    let l = got.iter().find(|(f, _)| f & voice::FLAG_LOSSLESS != 0).expect("no lossless packet arrived");
+    assert_eq!(lossless::decode(&l.1).unwrap(), pcm);
+    println!("4. Lossless channel: a {} byte packet (5 ms, raw 960) reached Bob bit exact", data.len());
+    if let Some((so, co)) = old_udp {
+        let mut flags_seen = Vec::new();
+        while let Ok(n) = so.recv(&mut buf) {
+            let pkt = co.open(Direction::ToClient, &buf[..n]).unwrap();
+            flags_seen.push(voice::decode_voice(&pkt.payload).unwrap().1);
+        }
+        assert_eq!(flags_seen, vec![voice::FLAG_STEREO], "the old client got {flags_seen:?}");
+        println!("4. the old 1.15.0 client got the Opus packet but not the lossless one");
+    }
     println!("FEATURE TEST PASSED");
 }
