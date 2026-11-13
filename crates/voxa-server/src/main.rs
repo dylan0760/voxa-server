@@ -107,6 +107,36 @@ fn main() {
     }
 }
 
+/// GitHub repository of the Voxa client (override with VOXA_CLIENT_REPO at build time).
+const CLIENT_REPO: &str = match option_env!("VOXA_CLIENT_REPO") {
+    Some(r) => r,
+    None => "dylan0760/voxa-client",
+};
+
+/// Raises the required client version when a newer Voxa client is published (one
+/// whose installer is attached, so clients can actually update). Checks every 30 minutes;
+/// without internet the known version stays.
+async fn watch_client_releases(server: Arc<Server>) {
+    loop {
+        let r = tokio::task::spawn_blocking(|| {
+            voxa_proto::update::latest_version(CLIENT_REPO, |n| n.starts_with("Voxa-") && !n.starts_with("Voxa-Server") && n.ends_with("-x64.msi"))
+        })
+        .await;
+        match r {
+            Ok(Ok(latest)) => {
+                let mut min = server.min_client.lock();
+                if voxa_proto::update::is_newer(&latest, &min) {
+                    info!("Voxa {latest} was released: clients must now be Voxa {latest} or newer");
+                    *min = latest;
+                }
+            }
+            Ok(Err(e)) => tracing::debug!("client release check: {e}"),
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+    }
+}
+
 /// `--clear-bans`: removes every ban (for an administrator who locked themselves out).
 fn clear_bans(data_dir: &Path) -> anyhow::Result<usize> {
     let master = secrets::load_or_create(&data_dir.join("chat.key"), || secrets::random_bytes::<32>().to_vec())?;
@@ -226,6 +256,10 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
     info!("listening on TCP {bind} (control, chat, files, screen share) and UDP {bind} (voice)");
 
     tokio::spawn(net::run(server.clone(), tcp));
+    if cfg.require_latest_client {
+        info!("clients must be Voxa {} or newer (require_latest_client = true in server.toml)", server.min_client.lock());
+        tokio::spawn(watch_client_releases(server.clone()));
+    }
     tokio::spawn(voice::run(server.clone(), udp));
     let purge = server.clone();
     tokio::spawn(async move {

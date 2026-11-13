@@ -142,6 +142,8 @@ impl ReplayWindow {
 /// Voice payload: `[frame seq u16][flags u8][opus data]`. An empty opus payload with
 /// `FLAG_END` marks the end of a transmission.
 pub const FLAG_END: u8 = 1;
+/// The Opus data is stereo (Opus Music). Mono decoders can still decode it.
+pub const FLAG_STEREO: u8 = 2;
 
 pub fn encode_voice(frame_seq: u16, flags: u8, opus: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(3 + opus.len());

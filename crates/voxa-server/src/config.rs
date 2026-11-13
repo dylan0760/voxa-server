@@ -16,6 +16,9 @@ pub struct Config {
     pub channel_quota_mb: u64,
     /// Log level: error, warn, info, debug, trace.
     pub log_level: String,
+    /// Only let clients connect that are at least the newest Voxa version this server
+    /// knows: the one it was released with, or a newer one published on GitHub since.
+    pub require_latest_client: bool,
 }
 
 impl Default for Config {
@@ -26,6 +29,7 @@ impl Default for Config {
             max_upload_mb: 2048,
             channel_quota_mb: 0,
             log_level: "info".into(),
+            require_latest_client: true,
         }
     }
 }

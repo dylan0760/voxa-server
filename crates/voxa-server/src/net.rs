@@ -113,7 +113,12 @@ async fn handle(server: Arc<Server>, stream: TcpStream, addr: SocketAddr) -> any
             reader.set_max_message(transport::MAX_MESSAGE);
             bulk(server, reader, writer, uid, token).await
         }
-        C2S::Hello { ref server_password, ref default_channel, ref default_channel_password, .. } => {
+        C2S::Hello { ref version, ref server_password, ref default_channel, ref default_channel_password, .. } => {
+            if let Err(e) = server.check_client_version(version) {
+                info!("refused connection from {addr}: client {} is too old", state_trunc(version));
+                writer.send(&S2C::Refused(e)).await?;
+                return Ok(());
+            }
             // Password checks are slow on purpose; they run before the state is locked.
             let checked = server
                 .check_login_passwords(addr.ip(), server_password.as_deref(), default_channel.as_deref(), default_channel_password.as_deref())

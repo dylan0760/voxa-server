@@ -113,6 +113,8 @@ pub struct Server {
     pub pw: Mutex<PasswordWork>,
     /// Bytes promised to running uploads, per channel (see net.rs `Reservation`).
     pub reserved: Mutex<HashMap<ChannelId, u64>>,
+    /// Oldest client version allowed to connect (`require_latest_client`).
+    pub min_client: Mutex<String>,
     /// Argon2 runs at most this many at once, so password floods cannot use every core.
     argon_slots: tokio::sync::Semaphore,
 }
@@ -201,6 +203,10 @@ impl PasswordWork {
 /// Largest screen share frame relayed, and how many may wait for one viewer.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_QUEUED_FRAMES: usize = 8;
+
+/// The Voxa client released together with this server: the oldest one it accepts when
+/// `require_latest_client` is on (newer releases found on GitHub raise it).
+pub const MIN_CLIENT_VERSION: &str = "1.15.0";
 
 /// Most channels a server holds, and how deeply they can be nested.
 pub const MAX_CHANNELS: usize = 2000;
@@ -514,6 +520,7 @@ impl Server {
             started: now_unix(),
             pw: Mutex::new(PasswordWork::default()),
             reserved: Mutex::new(HashMap::new()),
+            min_client: Mutex::new(MIN_CLIENT_VERSION.to_string()),
             argon_slots: tokio::sync::Semaphore::new(2),
         };
         srv.ensure_admin_key()?;
@@ -592,6 +599,22 @@ impl Server {
     fn perms_in(&self, st: &State, s: &Session, ch: ChannelId) -> u64 {
         let cg = if s.info.channel == ch { s.info.channel_group } else { self.channel_group_for(st, &s.info.uid, ch) };
         st.server_perms(s) | st.group_perms(cg)
+    }
+
+    /// The client version a Hello must have, or an `UPDATE_REQUIRED` refusal.
+    pub fn check_client_version(&self, version: &str) -> Res {
+        if !self.cfg.require_latest_client {
+            return Ok(());
+        }
+        let min = self.min_client.lock().clone();
+        if voxa_proto::update::is_newer(&min, version) {
+            return Err(format!(
+                "{}This server needs Voxa {min} or newer (you have {}). Update Voxa, then connect again.",
+                voxa_proto::UPDATE_REQUIRED,
+                if version.trim().is_empty() { "an unknown version" } else { version }
+            ));
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------------ passwords
@@ -1485,7 +1508,8 @@ impl Server {
         }
         e.topic = clean_line(&e.topic, 255);
         e.description = clean_text(&e.description, 8192);
-        e.codec_quality = e.codec_quality.min(10);
+        // Quality 0..=10, plus the Opus Music bit.
+        e.codec_quality = voxa_proto::pack_codec(voxa_proto::codec_of(e.codec_quality), voxa_proto::quality_of(e.codec_quality));
         if let Some(p) = e.parent {
             if !st.channels.contains_key(&p) {
                 return Err("Parent channel not found".into());

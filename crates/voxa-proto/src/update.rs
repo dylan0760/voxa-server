@@ -91,6 +91,27 @@ pub fn check(repo: &str, current: &str, asset_matches: impl Fn(&str) -> bool) ->
     }))
 }
 
+/// Version of the newest published release that has an installer matching
+/// `asset_matches` with a checksum (so it can actually be installed by the updater).
+pub fn latest_version(repo: &str, asset_matches: impl Fn(&str) -> bool) -> Result<String, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let mut resp = agent()
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("Could not reach GitHub: {e}"))?;
+    let text = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let tag = json["tag_name"].as_str().ok_or("Unexpected answer from GitHub")?;
+    let installable = json["assets"].as_array().map(|a| {
+        a.iter().any(|x| x["name"].as_str().map(&asset_matches).unwrap_or(false) && x["digest"].as_str().map(|d| d.starts_with("sha256:")).unwrap_or(false))
+    });
+    if installable != Some(true) {
+        return Err(format!("Release {tag} has no installer yet"));
+    }
+    Ok(tag.trim_start_matches(['v', 'V']).to_string())
+}
+
 /// Release notes of one specific version (`/releases/tags/v<version>`), used to show
 /// "What's new" after an update. Returns `(title, notes, page url)`.
 pub fn release_notes(repo: &str, version: &str) -> Result<(String, String, String), String> {
