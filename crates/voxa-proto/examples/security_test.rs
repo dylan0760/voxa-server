@@ -62,7 +62,11 @@ async fn login(addr: &str, nick: &str) -> User {
 async fn until<T>(u: &mut User, mut f: impl FnMut(S2C) -> Option<T>) -> T {
     timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(t) = f(u.r.recv::<S2C>().await.unwrap()) {
+            let m = u.r.recv::<S2C>().await.unwrap();
+            if let S2C::Error(e) = &m {
+                eprintln!("  (server error for client {}: {e})", u.id);
+            }
+            if let Some(t) = f(m) {
                 return t;
             }
         }
@@ -161,6 +165,64 @@ async fn main() {
         .expect("privilege key");
     admin.w.send(&C2S::UsePrivilegeKey(key)).await.unwrap();
     until(&mut admin, |m| matches!(m, S2C::Notice(_)).then_some(())).await;
+
+    // 6. Chat rate limit: a burst of 10, then the server refuses.
+    for i in 0..14 {
+        mia.w.send(&C2S::SendText { target: TextTarget::Server, text: format!("spam {i}") }).await.unwrap();
+    }
+    let err = until(&mut mia, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
+    assert!(err.contains("too fast"), "{err}");
+    println!("6. 14 chat messages at once: \"{err}\"");
+
+    // 7. A moderator with "ban", "edit server" and "manage groups" cannot use them
+    //    against administrators or to make themselves one.
+    admin.w.send(&C2S::CreateGroup { kind: GroupKind::Server, name: "Moderator".into(), copy_from: None }).await.unwrap();
+    let groups = until(&mut admin, |m| match m {
+        S2C::GroupsUpdated(g) if g.iter().any(|g| g.name == "Moderator") => Some(g),
+        _ => None,
+    })
+    .await;
+    let mut modg = groups.iter().find(|g| g.name == "Moderator").unwrap().clone();
+    let admin_group = groups.iter().find(|g| g.perms == perm::ALL).unwrap().clone();
+    modg.perms |= perm::CLIENT_BAN | perm::SERVER_EDIT | perm::GROUP_MANAGE | perm::GROUP_ASSIGN_SERVER;
+    admin.w.send(&C2S::EditGroup(modg.clone())).await.unwrap();
+    let mut moder = login(&addr, "Moder").await;
+    let moder_uid = voxa_proto::identity::uid_from_public(&moder.kp.public);
+    admin.w.send(&C2S::SetServerGroup { uid: moder_uid, group: modg.id, add: true }).await.unwrap();
+    let mid = moder.id;
+    until(&mut moder, |m| matches!(m, S2C::ClientUpdated(ref c) if c.id == mid && c.server_groups.contains(&modg.id)).then_some(())).await;
+    let admin_uid = voxa_proto::identity::uid_from_public(&admin.kp.public);
+    moder.w.send(&C2S::Ban { target: BanTarget::Uid(admin_uid), duration_secs: None, reason: "coup".into() }).await.unwrap();
+    let e1 = until(&mut moder, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
+    moder.w.send(&C2S::Ban { target: BanTarget::Ip("127.0.0.1".into()), duration_secs: None, reason: "coup".into() }).await.unwrap();
+    let e2 = until(&mut moder, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
+    let s = moder.server.clone();
+    let edit = |default_server_group| ServerEdit {
+        name: s.name.clone(),
+        welcome_message: s.welcome_message.clone(),
+        host_message: s.host_message.clone(),
+        max_clients: s.max_clients,
+        password: PasswordChange::Keep,
+        default_server_group,
+        default_channel_group: s.default_channel_group,
+        channel_admin_group: s.channel_admin_group,
+        chat_retention_days: s.chat_retention_days,
+    };
+    moder.w.send(&C2S::EditServer(edit(admin_group.id))).await.unwrap();
+    let e3 = until(&mut moder, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
+    moder.w.send(&C2S::EditGroup(GroupInfo { talk_power: 0, ..admin_group.clone() })).await.unwrap();
+    let e4 = until(&mut moder, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
+    moder.w.send(&C2S::CreateGroup { kind: GroupKind::Server, name: "Copy".into(), copy_from: Some(admin_group.id) }).await.unwrap();
+    let e5 = until(&mut moder, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
+    for (what, e) in [("ban admin by id", &e1), ("ban admin's address", &e2), ("make Admin the default group", &e3), ("edit the Admin group", &e4), ("copy the Admin group", &e5)] {
+        assert!(e.contains("cannot"), "{what}: {e}");
+        println!("7. moderator: {what}: \"{e}\"");
+    }
+    // ...but within their rank it works: the server can still be edited.
+    moder.w.send(&C2S::EditServer(edit(s.default_server_group))).await.unwrap();
+    until(&mut moder, |m| matches!(m, S2C::ServerUpdated(_)).then_some(())).await;
+    println!("7. moderator can still edit the server within their rank");
+
     let s = admin.server.clone();
     admin
         .w

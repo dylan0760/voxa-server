@@ -65,8 +65,11 @@ const MAGIC_PLAIN: &[u8] = b"VXP1";
 
 fn wrap(secret: &[u8]) -> Vec<u8> {
     #[cfg(windows)]
-    if let Some(p) = dpapi::protect(secret) {
-        return [MAGIC_DPAPI, &p].concat();
+    {
+        if let Some(p) = dpapi::protect(secret) {
+            return [MAGIC_DPAPI, &p].concat();
+        }
+        tracing::warn!("Windows data protection is unavailable: a key file is stored unencrypted (protected by folder permissions only)");
     }
     [MAGIC_PLAIN, secret].concat()
 }

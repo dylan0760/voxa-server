@@ -101,7 +101,8 @@ pub fn dir_size(p: &Path) -> u64 {
         let Ok(rd) = std::fs::read_dir(&d) else { continue };
         for e in rd.flatten() {
             let path = e.path();
-            if is_link(&path) {
+            // Unfinished uploads are counted through their reservation instead.
+            if is_link(&path) || e.file_name().to_string_lossy().ends_with(".voxa-part") {
                 continue;
             }
             match e.metadata() {

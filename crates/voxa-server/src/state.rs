@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -22,9 +23,28 @@ pub enum Out {
     Close,
 }
 
+/// Messages waiting for one client at most. A client that stops reading its connection
+/// is disconnected instead of filling the server's memory.
+pub const OUTBOX_SIZE: usize = 4096;
+
+/// The sending side of a client's control connection.
+#[derive(Clone)]
+pub struct Outbox {
+    pub tx: mpsc::Sender<Out>,
+    pub close: Arc<Notify>,
+}
+
+impl Outbox {
+    pub fn send(&self, o: Out) {
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.tx.try_send(o) {
+            self.close.notify_one();
+        }
+    }
+}
+
 pub struct Session {
     pub info: ClientInfo,
-    pub tx: mpsc::UnboundedSender<Out>,
+    pub tx: Outbox,
     pub close: Arc<Notify>,
     pub ip: IpAddr,
     pub voice: Arc<VoiceCipher>,
@@ -33,14 +53,35 @@ pub struct Session {
     pub s2c_seq: u64,
     pub bulk_token: [u8; 32],
     pub bulk_tx: Option<mpsc::Sender<BulkS2C>>,
+    /// Screen share frames queued on the bulk connection (counted down when sent).
+    pub bulk_frames: Arc<AtomicUsize>,
     /// Clients currently watching this client's screen share.
     pub viewers: HashSet<ClientId>,
     pub last_keyframe_req: Option<Instant>,
     /// Per-user permissions granted on top of the user's groups.
     pub extra_perms: u64,
+    /// Chat rate limit: (tokens left, last refill).
+    pub chat_budget: (f32, Instant),
 }
 
+/// Chat messages, images and pokes: bursts of this many, then `CHAT_RATE` per second.
+const CHAT_BURST: f32 = 10.0;
+const CHAT_RATE: f32 = 2.0;
+
 impl Session {
+    /// Takes one token from the chat budget; false when the client sends too fast.
+    pub fn spend_chat(&mut self) -> bool {
+        let (tokens, last) = &mut self.chat_budget;
+        *tokens = (*tokens + last.elapsed().as_secs_f32() * CHAT_RATE).min(CHAT_BURST);
+        *last = Instant::now();
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Feature detection for messages added after 1.2 (old clients cannot decode them).
     pub fn client_at_least(&self, min: &str) -> bool {
         !voxa_proto::update::is_newer(min, &self.info.version)
@@ -70,6 +111,8 @@ pub struct Server {
     pub fingerprint: String,
     pub started: u64,
     pub pw: Mutex<PasswordWork>,
+    /// Bytes promised to running uploads, per channel (see net.rs `Reservation`).
+    pub reserved: Mutex<HashMap<ChannelId, u64>>,
     /// Argon2 runs at most this many at once, so password floods cannot use every core.
     argon_slots: tokio::sync::Semaphore,
 }
@@ -155,6 +198,10 @@ impl PasswordWork {
     }
 }
 
+/// Largest screen share frame relayed, and how many may wait for one viewer.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+const MAX_QUEUED_FRAMES: usize = 8;
+
 /// Most channels a server holds, and how deeply they can be nested.
 pub const MAX_CHANNELS: usize = 2000;
 pub const MAX_CHANNEL_DEPTH: usize = 16;
@@ -238,19 +285,19 @@ fn default_groups() -> Vec<GroupInfo> {
 impl State {
     pub fn send(&self, id: ClientId, msg: S2C) {
         if let Some(s) = self.sessions.get(&id) {
-            let _ = s.tx.send(Out::Msg(msg));
+            s.tx.send(Out::Msg(msg));
         }
     }
 
     pub fn broadcast(&self, msg: S2C) {
         for s in self.sessions.values() {
-            let _ = s.tx.send(Out::Msg(msg.clone()));
+            s.tx.send(Out::Msg(msg.clone()));
         }
     }
 
     pub fn broadcast_channel(&self, ch: ChannelId, msg: S2C) {
         for s in self.sessions.values().filter(|s| s.info.channel == ch) {
-            let _ = s.tx.send(Out::Msg(msg.clone()));
+            s.tx.send(Out::Msg(msg.clone()));
         }
     }
 
@@ -267,6 +314,15 @@ impl State {
             .or_else(|| self.channels.values().next())
             .map(|c| c.info.id)
             .unwrap_or(0)
+    }
+
+    fn spend_chat(&mut self, id: ClientId) -> Res {
+        let s = self.sessions.get_mut(&id).ok_or("Client not found")?;
+        if s.spend_chat() {
+            Ok(())
+        } else {
+            Err("You are sending messages too fast. Please wait a moment.".into())
+        }
     }
 
     fn session(&self, id: ClientId) -> Res<&Session> {
@@ -286,7 +342,7 @@ impl State {
     fn send_if_supported(&self, id: ClientId, min: &str, msg: S2C) {
         if let Some(s) = self.sessions.get(&id) {
             if s.client_at_least(min) {
-                let _ = s.tx.send(Out::Msg(msg));
+                s.tx.send(Out::Msg(msg));
             }
         }
     }
@@ -457,6 +513,7 @@ impl Server {
             fingerprint,
             started: now_unix(),
             pw: Mutex::new(PasswordWork::default()),
+            reserved: Mutex::new(HashMap::new()),
             argon_slots: tokio::sync::Semaphore::new(2),
         };
         srv.ensure_admin_key()?;
@@ -645,7 +702,7 @@ impl Server {
         uid: String,
         ip: IpAddr,
         hello: C2S,
-        tx: mpsc::UnboundedSender<Out>,
+        tx: Outbox,
         close: Arc<Notify>,
     ) -> Res<ClientId> {
         let C2S::Hello {
@@ -667,10 +724,7 @@ impl Server {
             ));
         }
         // The ban list is read before the state is locked (database work).
-        if let Some(ban) = self.find_ban(Some(&uid), Some(ip)) {
-            let until = ban.expires.map(|e| format!(" (expires in {} min)", (e.saturating_sub(now_unix())) / 60 + 1)).unwrap_or_default();
-            return Err(format!("You are banned from this server: {}{until}", ban.reason));
-        }
+        let ban = self.find_ban(Some(&uid), Some(ip));
         let mut st = self.state.lock();
         if let Some(h) = &st.settings.password_hash {
             if !server_password.as_deref().map(|p| self.pw_verified(p, h)).unwrap_or(false) {
@@ -692,6 +746,11 @@ impl Server {
             record.server_groups.push(st.settings.default_server_group);
         }
         let group_perms = record.server_groups.iter().fold(0, |a, g| a | st.group_perms(*g));
+        // Server administrators cannot be locked out by a ban (e.g. on a shared address).
+        if let Some(ban) = ban.filter(|_| group_perms & perm::SERVER_EDIT == 0) {
+            let until = ban.expires.map(|e| format!(" (expires in {} min)", (e.saturating_sub(now_unix())) / 60 + 1)).unwrap_or_default();
+            return Err(format!("You are banned from this server: {}{until}", ban.reason));
+        }
         if st.sessions.len() as u32 >= st.settings.max_clients && group_perms & perm::IGNORE_SERVER_MAXCLIENTS == 0 {
             return Err("The server is full".into());
         }
@@ -767,10 +826,10 @@ impl Server {
             voice: VoiceSetup { key: voice_key, udp_port: self.cfg.port },
             bulk_token,
         };
-        let _ = tx.send(Out::Msg(welcome));
+        tx.send(Out::Msg(welcome));
         let extra_perms = self.store.client_perms(&uid).unwrap_or(0);
         if !voxa_proto::update::is_newer("1.4.0", &info.version) {
-            let _ = tx.send(Out::Msg(S2C::YourPerms(extra_perms)));
+            tx.send(Out::Msg(S2C::YourPerms(extra_perms)));
         }
         st.broadcast(S2C::ClientJoined(info.clone()));
         info!("client {} ({}) connected from {ip} as id {id}", info.nickname, uid);
@@ -787,9 +846,11 @@ impl Server {
                 s2c_seq: 0,
                 bulk_token,
                 bulk_tx: None,
+                bulk_frames: Arc::new(AtomicUsize::new(0)),
                 viewers: HashSet::new(),
                 last_keyframe_req: None,
                 extra_perms,
+                chat_budget: (CHAT_BURST, Instant::now()),
             },
         );
         Ok(id)
@@ -825,7 +886,7 @@ impl Server {
     /// Attaches a bulk connection to the session that received `token`. The connection
     /// must come from the same identity (`uid` from its handshake) as the session, so a
     /// token that leaked is useless to anyone else.
-    pub fn attach_bulk(&self, token: &[u8; 32], uid: &str, tx: mpsc::Sender<BulkS2C>) -> Option<ClientId> {
+    pub fn attach_bulk(&self, token: &[u8; 32], uid: &str, tx: mpsc::Sender<BulkS2C>, frames: Arc<AtomicUsize>) -> Option<ClientId> {
         let mut st = self.state.lock();
         let mut found = None;
         // Compare every token in constant time (no early exit that leaks timing).
@@ -840,6 +901,7 @@ impl Server {
             return None;
         }
         s.bulk_tx = Some(tx);
+        s.bulk_frames = frames;
         Some(s.info.id)
     }
 
@@ -876,8 +938,8 @@ impl Server {
         {
             let st = self.state.lock();
             if let Some(s) = st.sessions.get(&id) {
-                let _ = s.tx.send(Out::Msg(S2C::Kicked(reason.clone())));
-                let _ = s.tx.send(Out::Close);
+                s.tx.send(Out::Msg(S2C::Kicked(reason.clone())));
+                s.tx.send(Out::Close);
                 s.close.notify_one();
             }
         }
@@ -938,11 +1000,12 @@ impl Server {
             C2S::FetchHistory { target, before, limit } => self.fetch_history(st, me, target, before, limit),
             C2S::DeleteMessage { target, id } => self.delete_message(st, me, target, id),
             C2S::Poke { target, message } => {
+                st.spend_chat(me)?;
                 let s = st.session(me)?;
                 self.need(st.server_perms(s), perm::CLIENT_POKE)?;
                 let name = s.info.nickname.clone();
                 st.session(target)?;
-                st.send(target, S2C::Poked { from: me, from_name: name, message: truncate(&message, 500) });
+                st.send(target, S2C::Poked { from: me, from_name: name, message: clean_text(&message, 500) });
                 Ok(())
             }
             C2S::Kick { target, from_server, reason } => {
@@ -950,7 +1013,7 @@ impl Server {
                 let t = st.session(target)?;
                 let by = s.info.nickname.clone();
                 self.check_outranks(st, s, t)?;
-                let reason = truncate(&reason, 200);
+                let reason = clean_line(&reason, 200);
                 if from_server {
                     self.need(st.server_perms(s), perm::CLIENT_KICK_SERVER)?;
                     kicks.push((target, LeaveReason::Kicked { by, reason }));
@@ -1005,7 +1068,7 @@ impl Server {
                     self.need(st.server_perms(s), perm::CLIENT_DESCRIPTION_EDIT)?;
                 }
                 let t = st.sessions.get_mut(&target).ok_or("Client not found")?;
-                t.info.description = truncate(&description, 200);
+                t.info.description = clean_text(&description, 200);
                 let uid = t.info.uid.clone();
                 let d = t.info.description.clone();
                 if let Ok(Some(mut r)) = self.store.get_client(&uid) {
@@ -1017,8 +1080,12 @@ impl Server {
             }
             C2S::EditServer(e) => self.edit_server(st, me, e),
             C2S::CreateGroup { kind, name, copy_from } => {
-                self.need(st.server_perms(st.session(me)?), perm::GROUP_MANAGE)?;
-                let name = truncate(name.trim(), 40);
+                let mine = st.server_perms(st.session(me)?);
+                self.need(mine, perm::GROUP_MANAGE)?;
+                if copy_from.and_then(|g| st.groups.get(&g)).map(|g| g.perms & !mine != 0).unwrap_or(false) {
+                    return Err("You cannot copy a group with permissions you do not have".into());
+                }
+                let name = clean_line(&name, 40);
                 if name.is_empty() {
                     return Err("Group name required".into());
                 }
@@ -1050,17 +1117,28 @@ impl Server {
                 let old = st.groups.get(&g.id).ok_or("Group not found")?.clone();
                 g.kind = old.kind;
                 g.builtin = old.builtin;
-                g.name = truncate(g.name.trim(), 40);
+                g.name = clean_line(&g.name, 40);
                 if g.name.is_empty() {
                     return Err("Group name required".into());
                 }
                 if old.id == GROUP_ADMIN {
                     g.perms = perm::ALL;
                 }
-                // Nobody can hand out permissions they do not have themselves.
-                let added = g.perms & !old.perms;
-                if added & !mine != 0 {
+                // Groups ranked above me (holding permissions I lack) are not mine to change,
+                // and nobody can hand out permissions they do not have themselves.
+                if old.perms & !mine != 0 {
+                    return Err("You cannot edit a group that has permissions you do not have".into());
+                }
+                if g.perms & !mine != 0 {
                     return Err("You cannot grant permissions you do not have".into());
+                }
+                // Talk / join power can be raised only up to my own.
+                if mine != perm::ALL {
+                    let my_talk = st.talk_power(s);
+                    let my_join = st.join_power(&s.info.server_groups, s.info.channel_group);
+                    if (g.talk_power > old.talk_power && g.talk_power > my_talk) || (g.join_power > old.join_power && g.join_power > my_join) {
+                        return Err("You cannot give a group more talk or join power than you have".into());
+                    }
                 }
                 db(self.store.save_group(&g))?;
                 st.groups.insert(g.id, g);
@@ -1114,7 +1192,7 @@ impl Server {
                     &PrivKey {
                         group,
                         channel: if g.kind == GroupKind::Channel { channel } else { None },
-                        description: truncate(&description, 100),
+                        description: clean_line(&description, 100),
                         created: now_unix(),
                     },
                 ))?;
@@ -1161,7 +1239,7 @@ impl Server {
             C2S::StartStream(mut info) => {
                 let s = st.session(me)?;
                 self.need(self.perms_in(st, s, s.info.channel), perm::SCREEN_SHARE)?;
-                info.title = truncate(&info.title, 80);
+                info.title = clean_line(&info.title, 80);
                 info.fps = info.fps.clamp(1, 60);
                 let s = st.sessions.get_mut(&me).unwrap();
                 s.info.streaming = Some(info);
@@ -1220,9 +1298,9 @@ impl Server {
                 self.need(mine, perm::GROUP_MANAGE)?;
                 let perms = perms & perm::ALL;
                 let old = db(self.store.client_perms(&uid))?;
-                // Nobody can hand out permissions they do not have themselves.
-                if (perms & !old) & !mine != 0 {
-                    return Err("You cannot grant permissions you do not have".into());
+                // Nobody can hand out (or take away) permissions they do not have themselves.
+                if (perms ^ old) & !mine != 0 {
+                    return Err("You cannot change permissions you do not have".into());
                 }
                 if db(self.store.get_client(&uid))?.is_none() {
                     return Err("Unknown client".into());
@@ -1277,11 +1355,16 @@ impl Server {
     }
 
     /// Prevents lower ranked clients from acting on server administrators.
+    /// Kicks, bans and moves only work on people who rank at most as high as the actor:
+    /// nobody with server-wide permissions the actor lacks (e.g. a moderator cannot ban
+    /// an administrator, even with "edit server" rights).
     fn check_outranks(&self, st: &State, actor: &Session, target: &Session) -> Res {
-        let a = st.server_perms(actor);
-        let t = st.server_perms(target);
-        if t & perm::SERVER_EDIT != 0 && a & perm::SERVER_EDIT == 0 {
-            return Err("You cannot do that to a server administrator".into());
+        Self::outranks(st.server_perms(actor), st.server_perms(target))
+    }
+
+    fn outranks(actor: u64, target: u64) -> Res {
+        if target & !actor != 0 {
+            return Err("You cannot do that to someone with permissions you do not have".into());
         }
         Ok(())
     }
@@ -1312,10 +1395,10 @@ impl Server {
             }
         }
         if let Some(d) = u.description {
-            s.info.description = truncate(&d, 200);
+            s.info.description = clean_text(&d, 200);
         }
         if let Some(a) = u.away {
-            s.info.away = a.map(|m| truncate(&m, 80));
+            s.info.away = a.map(|m| clean_line(&m, 80));
         }
         if let Some(m) = u.input_muted {
             s.info.input_muted = m;
@@ -1324,7 +1407,7 @@ impl Server {
             s.info.output_muted = m;
         }
         if let Some(r) = u.talk_request {
-            s.info.talk_request = r.map(|m| truncate(&m, 80));
+            s.info.talk_request = r.map(|m| clean_line(&m, 80));
         }
         if let Some(c) = u.commander {
             s.info.commander = c;
@@ -1393,15 +1476,15 @@ impl Server {
     }
 
     fn validate_channel_edit(&self, st: &State, id: Option<ChannelId>, e: &mut ChannelEdit) -> Res {
-        e.name = truncate(e.name.trim(), 40);
+        e.name = clean_line(&e.name, 40);
         if e.name.is_empty() {
             return Err("Channel name required".into());
         }
         if e.name.contains('/') {
             return Err("Channel names cannot contain '/'".into());
         }
-        e.topic = truncate(&e.topic, 255);
-        e.description = truncate(&e.description, 8192);
+        e.topic = clean_line(&e.topic, 255);
+        e.description = clean_text(&e.description, 8192);
         e.codec_quality = e.codec_quality.min(10);
         if let Some(p) = e.parent {
             if !st.channels.contains_key(&p) {
@@ -1656,6 +1739,9 @@ impl Server {
             return Err("The default channel cannot be deleted".into());
         }
         let tree = st.subtree(id);
+        if tree.iter().any(|c| st.channels.get(c).map(|c| c.info.is_default).unwrap_or(false)) {
+            return Err("This channel contains the default channel, which cannot be deleted".into());
+        }
         let occupants: Vec<ClientId> =
             st.sessions.values().filter(|s| tree.contains(&s.info.channel)).map(|s| s.info.id).collect();
         if !occupants.is_empty() && !force {
@@ -1690,6 +1776,7 @@ impl Server {
         if text.trim().is_empty() {
             return Ok(());
         }
+        st.spend_chat(me)?;
         let s = st.session(me)?;
         let from_uid = s.info.uid.clone();
         let from_name = s.info.nickname.clone();
@@ -1870,16 +1957,29 @@ impl Server {
         let s = st.session(me)?;
         self.need(st.server_perms(s), perm::CLIENT_BAN)?;
         let by = s.info.nickname.clone();
-        let reason = truncate(&reason, 200);
+        let reason = clean_line(&reason, 200);
         let (uid, ip, name) = match &target {
             BanTarget::Client(id) => {
                 let t = st.session(*id)?;
                 self.check_outranks(st, s, t)?;
                 (Some(t.info.uid.clone()), Some(t.ip.to_string()), Some(t.info.nickname.clone()))
             }
-            BanTarget::Uid(u) => (Some(u.clone()), None, None),
+            BanTarget::Uid(u) => {
+                // Same rule as banning someone who is online: administrators can only be
+                // banned by administrators.
+                if let Some(t) = st.sessions.values().find(|x| x.info.uid == *u) {
+                    self.check_outranks(st, s, t)?;
+                } else if let Some(rec) = db(self.store.get_client(u))? {
+                    let theirs = rec.server_groups.iter().fold(self.store.client_perms(u).unwrap_or(0), |a, g| a | st.group_perms(*g));
+                    Self::outranks(st.server_perms(s), theirs)?;
+                }
+                (Some(u.clone()), None, None)
+            }
             BanTarget::Ip(i) => {
                 let ip: IpAddr = i.trim().parse().map_err(|_| "Invalid IP address".to_string())?;
+                for t in st.sessions.values().filter(|x| x.ip.to_canonical() == ip.to_canonical()) {
+                    self.check_outranks(st, s, t)?;
+                }
                 (None, Some(ip.to_string()), None)
             }
         };
@@ -1916,13 +2016,26 @@ impl Server {
         {
             return Err("Invalid default group selection".into());
         }
+        // A default group is handed to everyone, so it must not hold more than the person
+        // choosing it (otherwise every new user, e.g. a second identity, gets it).
+        let mine = st.server_perms(st.session(me)?);
+        let cur = &st.settings;
+        for (new, old) in [
+            (e.default_server_group, cur.default_server_group),
+            (e.default_channel_group, cur.default_channel_group),
+            (e.channel_admin_group, cur.channel_admin_group),
+        ] {
+            if new != old && st.groups.get(&new).map(|g| g.perms & !mine != 0).unwrap_or(true) {
+                return Err("You cannot make a group with permissions you do not have the default".into());
+            }
+        }
         let s = &mut st.settings;
-        s.name = truncate(e.name.trim(), 64);
+        s.name = clean_line(&e.name, 64);
         if s.name.is_empty() {
             s.name = "Voxa Server".into();
         }
-        s.welcome_message = truncate(&e.welcome_message, 4000);
-        s.host_message = truncate(&e.host_message, 1000);
+        s.welcome_message = clean_text(&e.welcome_message, 4000);
+        s.host_message = clean_text(&e.host_message, 1000);
         s.max_clients = e.max_clients.clamp(1, 1024);
         s.default_server_group = e.default_server_group;
         s.default_channel_group = e.default_channel_group;
@@ -2088,6 +2201,7 @@ impl Server {
         }
         let mut guard = self.state.lock();
         let st = &mut *guard;
+        st.spend_chat(me)?;
         let s = st.session(me)?;
         let from_uid = s.info.uid.clone();
         let from_name = s.info.nickname.clone();
@@ -2173,11 +2287,20 @@ impl Server {
         if s.info.streaming.is_none() {
             return;
         }
+        // Frames are copied for every viewer: refuse oversized ones, and keep only a few
+        // queued per viewer (a slow viewer skips frames and gets a fresh keyframe).
+        if frame.tiles.iter().map(|t| t.jpeg.len()).sum::<usize>() > MAX_FRAME_BYTES {
+            return;
+        }
         let viewers: Vec<ClientId> = s.viewers.iter().copied().collect();
         let mut dropped = false;
         for v in viewers {
-            if let Some(b) = st.sessions.get(&v).and_then(|v| v.bulk_tx.as_ref()) {
-                if b.try_send(BulkS2C::Frame { from, frame: frame.clone() }).is_err() {
+            let Some(viewer) = st.sessions.get(&v) else { continue };
+            if let Some(b) = &viewer.bulk_tx {
+                let queued = &viewer.bulk_frames;
+                // Counted before sending, so the writer can never count below zero.
+                if queued.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_FRAMES || b.try_send(BulkS2C::Frame { from, frame: frame.clone() }).is_err() {
+                    queued.fetch_sub(1, Ordering::Relaxed);
                     dropped = true;
                 }
             }
@@ -2261,9 +2384,28 @@ pub fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Characters that are invisible or change the direction of text: they let names look
+/// like other names (or hide parts of them).
+fn is_invisible(c: char) -> bool {
+    matches!(c, '\u{200B}' | '\u{200C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}' | '\u{00AD}')
+}
+
+/// One line of user text (names, topics, reasons): no control or invisible characters,
+/// trimmed, at most `max` characters.
+pub fn clean_line(s: &str, max: usize) -> String {
+    let s: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).filter(|c| !c.is_control() && !is_invisible(*c)).collect();
+    truncate(s.trim(), max)
+}
+
+/// Multi-line user text (descriptions, welcome messages): like `clean_line`, but keeps
+/// line breaks and tabs.
+pub fn clean_text(s: &str, max: usize) -> String {
+    let s: String = s.replace("\r\n", "\n").chars().filter(|c| (*c == '\n' || *c == '\t' || !c.is_control()) && !is_invisible(*c)).collect();
+    truncate(&s, max)
+}
+
 fn sanitize_nick(n: &str) -> String {
-    let n: String = n.chars().filter(|c| !c.is_control()).collect();
-    let n = truncate(n.trim(), 30);
+    let n = clean_line(n, 30);
     if n.chars().count() < 1 {
         "Voxa User".into()
     } else {

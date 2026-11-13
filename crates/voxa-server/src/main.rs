@@ -33,6 +33,7 @@ OPTIONS:
     --service        Run as a Windows service (used by the service manager)
     --check-update   Check GitHub for a newer Voxa Server release
     --update         Download and install the newest release (run as administrator)
+    --clear-bans     Remove every ban (stop the server first; run as administrator)
     --version        Print version
     --help           Print this help
 
@@ -61,6 +62,19 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
         .unwrap_or_else(config::default_data_dir);
+
+    if args.iter().any(|a| a == "--clear-bans") {
+        std::process::exit(match clear_bans(&data_dir) {
+            Ok(n) => {
+                println!("Removed {n} ban(s).");
+                0
+            }
+            Err(e) => {
+                eprintln!("Could not clear the bans: {e:#}\nStop Voxa Server first and run this as administrator.");
+                1
+            }
+        });
+    }
 
     if args.iter().any(|a| a == "--service") {
         #[cfg(windows)]
@@ -91,6 +105,17 @@ fn main() {
         error!("fatal: {e:#}");
         std::process::exit(1);
     }
+}
+
+/// `--clear-bans`: removes every ban (for an administrator who locked themselves out).
+fn clear_bans(data_dir: &Path) -> anyhow::Result<usize> {
+    let master = secrets::load_or_create(&data_dir.join("chat.key"), || secrets::random_bytes::<32>().to_vec())?;
+    let store = store::Store::open(&data_dir.join("voxa.db"), &master)?;
+    let bans = store.bans()?;
+    for b in &bans {
+        store.remove_ban(b.id)?;
+    }
+    Ok(bans.len())
 }
 
 /// GitHub repository the server updates from (override with VOXA_UPDATE_REPO at build time).

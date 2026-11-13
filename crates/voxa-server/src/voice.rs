@@ -37,14 +37,22 @@ pub async fn run(server: Arc<Server>, sock: UdpSocket) {
 
 fn route(server: &Server, buf: &[u8], src: SocketAddr) -> Vec<(SocketAddr, Vec<u8>)> {
     let Some(id) = voice::peek_client(buf) else { return Vec::new() };
+    // Decrypt without holding the lock: junk packets cost the attacker, not everyone.
+    let Some(cipher) = server.state.lock().sessions.get(&id).map(|s| s.voice.clone()) else { return Vec::new() };
+    let Some(pkt) = cipher.open(Direction::ToServer, buf) else { return Vec::new() };
     let mut st = server.state.lock();
     let Some(s) = st.sessions.get_mut(&id) else { return Vec::new() };
-    let Some(pkt) = s.voice.open(Direction::ToServer, buf) else { return Vec::new() };
-    if !s.replay.accept(pkt.seq) {
+    // The id may have been given to a new session in the meantime.
+    if !Arc::ptr_eq(&s.voice, &cipher) || !s.replay.accept(pkt.seq) {
         return Vec::new();
     }
-    // Only authenticated packets may (re)bind the client's UDP address (NAT rebinding).
+    // Only authenticated packets may (re)bind the client's UDP address (NAT rebinding),
+    // and only to the address the client is connected from: otherwise one spoofed
+    // packet could send the channel's voice to someone else.
     if s.voice_addr != Some(src) {
+        if src.ip().to_canonical() != s.ip.to_canonical() {
+            return Vec::new();
+        }
         s.voice_addr = Some(src);
     }
     match pkt.kind {

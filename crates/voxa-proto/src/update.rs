@@ -2,8 +2,9 @@
 //!
 //! 1. `check` asks the GitHub API for the latest release of a repository and picks the
 //!    MSI asset whose name matches the given prefix.
-//! 2. `download` fetches it over HTTPS (Windows' native TLS) into the temp folder and,
-//!    when GitHub publishes an asset digest, verifies its SHA-256.
+//! 2. `download` fetches it from github.com over HTTPS (Windows' native TLS) into a new
+//!    private folder and verifies the SHA-256 digest GitHub publishes for the asset
+//!    (an installer without a digest is refused).
 //! 3. `install` launches `msiexec` with a progress-only UI; the installer stops the
 //!    running app/service, upgrades it and relaunches it (`AUTOLAUNCH=1`).
 
@@ -161,11 +162,16 @@ pub fn release_history(repo: &str, limit: usize) -> Result<Vec<ReleaseNote>, Str
 
 /// Downloads the release installer, reporting `(downloaded, total)` bytes.
 pub fn download(rel: &Release, progress: impl Fn(u64, u64)) -> Result<PathBuf, String> {
-    if !rel.asset_url.starts_with("https://") {
-        return Err("Refusing to download an update over an insecure connection".into());
+    if !rel.asset_url.starts_with("https://github.com/") {
+        return Err("Refusing to download an update from outside github.com".into());
     }
-    let dir = std::env::temp_dir().join("voxa-update");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let Some(expected) = rel.sha256.as_deref().filter(|d| d.len() == 64 && d.chars().all(|c| c.is_ascii_hexdigit())) else {
+        return Err("This release has no checksum, so it cannot be verified. Download it from the release page instead.".into());
+    };
+    // A new folder with a random name: nothing can be planted there beforehand.
+    let tag = format!("{:016x}", rand::random::<u64>());
+    let dir = std::env::temp_dir().join(format!("voxa-update-{tag}"));
+    std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
     let safe_name: String = rel.asset_name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).collect();
     let path = dir.join(if safe_name.ends_with(".msi") { safe_name } else { "voxa-update.msi".into() });
     let resp = agent().get(&rel.asset_url).call().map_err(|e| format!("Download failed: {e}"))?;
@@ -190,19 +196,19 @@ pub fn download(rel: &Release, progress: impl Fn(u64, u64)) -> Result<PathBuf, S
         let _ = std::fs::remove_file(&path);
         return Err("Download incomplete".into());
     }
-    if let Some(expected) = &rel.sha256 {
-        let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        if &got != expected {
-            let _ = std::fs::remove_file(&path);
-            return Err("The downloaded installer failed its integrity check".into());
-        }
+    let got: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if !got.eq_ignore_ascii_case(expected) {
+        let _ = std::fs::remove_file(&path);
+        return Err("The downloaded installer failed its integrity check".into());
     }
     Ok(path)
 }
 
 /// Starts the installer. The caller should exit afterwards so files can be replaced.
 pub fn install(msi: &Path) -> Result<(), String> {
-    std::process::Command::new("msiexec.exe")
+    // The system's own msiexec, not whatever a search of the current folder / PATH finds.
+    let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| "C:\\Windows".into());
+    std::process::Command::new(system.join("System32").join("msiexec.exe"))
         .arg("/i")
         .arg(msi)
         .arg("/passive")
