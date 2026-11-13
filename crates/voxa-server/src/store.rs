@@ -26,6 +26,8 @@ const IMAGE_META: TableDefinition<u64, &[u8]> = TableDefinition::new("image_meta
 const IMAGE_DATA: TableDefinition<u64, &[u8]> = TableDefinition::new("image_data");
 /// Pinned messages (1.8.0+): (chat, message) -> sealed PinMeta.
 const PINS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("pins");
+/// Direct messages waiting for an offline recipient: (recipient uid, id) -> sealed message.
+const OFFLINE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("offline_messages");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StoredSettings {
@@ -128,6 +130,7 @@ impl Store {
             w.open_table(IMAGE_META)?;
             w.open_table(IMAGE_DATA)?;
             w.open_table(PINS)?;
+            w.open_table(OFFLINE)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -588,6 +591,73 @@ impl Store {
         }
         w.commit()?;
         Ok(())
+    }
+
+    // ---------- offline direct messages (encrypted at rest) ----------
+
+    fn offline_aad(uid: &str, id: u64) -> Vec<u8> {
+        [b"voxa-offline".as_slice(), uid.as_bytes(), &id.to_be_bytes()].concat()
+    }
+
+    /// Number of messages waiting for `uid`.
+    pub fn offline_count(&self, uid: &str) -> R<usize> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(OFFLINE)?;
+        Ok(t.range((uid, 0)..=(uid, u64::MAX))?.count())
+    }
+
+    pub fn add_offline(&self, to_uid: &str, m: &OfflineMessage) -> R<()> {
+        let id = self.next_id("next_offline")?;
+        let blob = self.seal_raw(&Self::offline_aad(to_uid, id), &enc(m));
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(OFFLINE)?;
+            t.insert((to_uid, id), blob.as_slice())?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Removes and returns the messages waiting for `uid` (oldest first).
+    pub fn take_offline(&self, uid: &str) -> R<Vec<OfflineMessage>> {
+        let w = self.db.begin_write()?;
+        let mut out = Vec::new();
+        {
+            let mut t = w.open_table(OFFLINE)?;
+            let rows: Vec<(u64, Vec<u8>)> = t
+                .range((uid, 0)..=(uid, u64::MAX))?
+                .filter_map(|r| r.ok())
+                .map(|(k, v)| (k.value().1, v.value().to_vec()))
+                .collect();
+            for (id, blob) in rows {
+                if let Some(m) = self.unseal_raw(&Self::offline_aad(uid, id), &blob).and_then(|p| dec::<OfflineMessage>(&p)) {
+                    out.push(m);
+                }
+                t.remove((uid, id))?;
+            }
+        }
+        w.commit()?;
+        Ok(out)
+    }
+
+    /// Deletes undelivered messages older than `cutoff` (unix time).
+    pub fn purge_offline_before(&self, cutoff: u64) -> R<usize> {
+        let w = self.db.begin_write()?;
+        let mut n = 0;
+        {
+            let mut t = w.open_table(OFFLINE)?;
+            let rows: Vec<(String, u64, Vec<u8>)> =
+                t.iter()?.filter_map(|r| r.ok()).map(|(k, v)| (k.value().0.to_string(), k.value().1, v.value().to_vec())).collect();
+            for (uid, id, blob) in rows {
+                let old = self.unseal_raw(&Self::offline_aad(&uid, id), &blob).and_then(|p| dec::<OfflineMessage>(&p)).map(|m| m.ts < cutoff).unwrap_or(true);
+                if old {
+                    t.remove((uid.as_str(), id))?;
+                    n += 1;
+                }
+            }
+        }
+        w.commit()?;
+        Ok(n)
     }
 
     pub fn new_image_id(&self) -> R<u64> {

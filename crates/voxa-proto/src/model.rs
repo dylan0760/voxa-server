@@ -438,3 +438,21 @@ mod image_tests {
         assert_eq!(ImageRef::parse("📷 x\n[voxa-image:abc:1x1]"), None);
     }
 }
+
+/// Someone who has been on the server (the People list).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Person {
+    pub uid: String,
+    pub nickname: String,
+    /// Unix time of the last disconnect (0 = never).
+    pub last_seen: u64,
+}
+
+/// A direct message delivered after the recipient came online.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct OfflineMessage {
+    pub from_uid: String,
+    pub from_name: String,
+    pub ts: u64,
+    pub text: String,
+}

@@ -89,6 +89,13 @@ pub enum C2S {
     PinMessage { target: TextTarget, id: MessageId, pin: bool },
     /// Asks for the pinned messages of a chat (answered with `S2C::Pins`).
     GetPins(TextTarget),
+
+    // --- added in 1.13.0; only sent to servers that are 1.13.0 or newer ---
+    /// Everyone who has been on the server (answered with `S2C::People`).
+    GetPeople,
+    /// A direct message to someone who is offline: the server keeps it (encrypted) and
+    /// delivers it when they come online.
+    SendOffline { to_uid: String, text: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -165,6 +172,14 @@ pub enum S2C {
     Pins { target: TextTarget, pins: Vec<PinnedMessage> },
     /// Someone pinned / unpinned a message (fetch the pins again to update).
     PinChanged { target: TextTarget, id: MessageId, pinned: bool, by: String },
+
+    // --- added in 1.13.0; only sent to clients that are 1.18.0 or newer ---
+    /// Everyone who has been on the server (answer to `GetPeople`).
+    People(Vec<Person>),
+    /// Direct messages that arrived while you were offline (sent once after Welcome).
+    OfflineMessages(Vec<OfflineMessage>),
+    /// An offline message was accepted for delivery.
+    OfflineQueued { to_uid: String, ts: u64 },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file

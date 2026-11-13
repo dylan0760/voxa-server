@@ -206,7 +206,11 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.17.0";
+pub const MIN_CLIENT_VERSION: &str = "1.18.0";
+
+/// Offline direct messages: how many may wait per person, and for how many days.
+pub const MAX_OFFLINE_WAITING: usize = 100;
+pub const OFFLINE_DAYS: u64 = 30;
 
 /// Most channels a server holds, and how deeply they can be nested.
 pub const MAX_CHANNELS: usize = 2000;
@@ -854,6 +858,17 @@ impl Server {
         if !voxa_proto::update::is_newer("1.4.0", &info.version) {
             tx.send(Out::Msg(S2C::YourPerms(extra_perms)));
         }
+        // Direct messages that arrived while this person was offline.
+        if !voxa_proto::update::is_newer("1.18.0", &info.version) {
+            match self.store.take_offline(&uid) {
+                Ok(msgs) if !msgs.is_empty() => {
+                    info!("delivering {} offline message(s) to {uid}", msgs.len());
+                    tx.send(Out::Msg(S2C::OfflineMessages(msgs)));
+                }
+                Err(e) => warn!("could not read offline messages: {e:#}"),
+                _ => {}
+            }
+        }
         st.broadcast(S2C::ClientJoined(info.clone()));
         info!("client {} ({}) connected from {ip} as id {id}", info.nickname, uid);
         st.sessions.insert(
@@ -1344,6 +1359,18 @@ impl Server {
             C2S::CloneChannel { source, name, with_children } => self.clone_channel(st, me, source, name, with_children),
             C2S::PinMessage { target, id, pin } => self.pin_message(st, me, target, id, pin),
             C2S::GetPins(target) => self.get_pins(st, me, target),
+            C2S::GetPeople => {
+                let s = st.session(me)?;
+                if s.client_at_least("1.18.0") {
+                    let people = db(self.store.all_clients())?
+                        .into_iter()
+                        .map(|c| Person { uid: c.uid, nickname: c.nickname, last_seen: c.last_seen })
+                        .collect();
+                    st.send(me, S2C::People(people));
+                }
+                Ok(())
+            }
+            C2S::SendOffline { to_uid, text } => self.send_offline(st, me, to_uid, text),
             C2S::GetFileLimits => {
                 st.send(me, S2C::FileLimits(st.file_limits));
                 Ok(())
@@ -2210,6 +2237,45 @@ impl Server {
             st.broadcast_client(id);
         }
         Ok(())
+    }
+
+    // ------------------------------------------------------------------ offline messages
+
+    /// Keeps a direct message for someone who is offline until they come back.
+    fn send_offline(&self, st: &mut State, me: ClientId, to_uid: String, text: String) -> Res {
+        let text = clean_text(text.trim_end(), 8000);
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let s = st.session(me)?;
+        self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
+        if s.info.uid == to_uid {
+            return Err("You cannot message yourself".into());
+        }
+        if st.sessions.values().any(|x| x.info.uid == to_uid) {
+            return Err("This person is online now: send the message again".into());
+        }
+        let (from_uid, from_name) = (s.info.uid.clone(), s.info.nickname.clone());
+        let to = db(self.store.get_client(&to_uid))?.ok_or("Unknown user")?;
+        if db(self.store.offline_count(&to_uid))? >= MAX_OFFLINE_WAITING {
+            return Err(format!("{} already has {MAX_OFFLINE_WAITING} messages waiting", to.nickname));
+        }
+        st.spend_chat(me)?;
+        let ts = now_unix();
+        db(self.store.add_offline(&to_uid, &OfflineMessage { from_uid, from_name: from_name.clone(), ts, text }))?;
+        info!("{from_name} left an offline message for {} ({to_uid})", to.nickname);
+        st.send_if_supported(me, "1.18.0", S2C::OfflineQueued { to_uid, ts });
+        Ok(())
+    }
+
+    /// Undelivered offline messages are kept for `OFFLINE_DAYS`.
+    pub fn purge_offline(&self) {
+        let cutoff = now_unix().saturating_sub(OFFLINE_DAYS * 86_400);
+        match self.store.purge_offline_before(cutoff) {
+            Ok(n) if n > 0 => info!("removed {n} undelivered offline message(s) older than {OFFLINE_DAYS} days"),
+            Err(e) => warn!("offline message cleanup failed: {e:#}"),
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------------------ periodic

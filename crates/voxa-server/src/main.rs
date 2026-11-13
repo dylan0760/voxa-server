@@ -267,7 +267,11 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
         loop {
             t.tick().await;
             let s = purge.clone();
-            let _ = tokio::task::spawn_blocking(move || s.purge_chat()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                s.purge_chat();
+                s.purge_offline();
+            })
+            .await;
         }
     });
 
