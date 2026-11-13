@@ -149,7 +149,7 @@ async fn control(
     let (tx, mut rx) = mpsc::channel::<Out>(crate::state::OUTBOX_SIZE);
     let close = Arc::new(Notify::new());
     let outbox = crate::state::Outbox { tx, close: close.clone() };
-    let id = match server.login(uid, addr.ip(), hello, outbox, close.clone()) {
+    let id = match server.login(uid, addr.ip(), hello, outbox, close.clone(), false) {
         Ok(id) => id,
         Err(e) => {
             info!("refused connection from {addr}: {e}");

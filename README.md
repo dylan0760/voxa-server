@@ -21,7 +21,8 @@ The MSI is not code-signed. If Windows SmartScreen warns you, choose
 
 The installer:
 * installs the **VoxaServer** service (automatic start, restarts on failure);
-* opens **TCP 9987** and **UDP 9987** in Windows Firewall;
+* opens **TCP 9987** and **UDP 9987** in Windows Firewall, and **TCP 9980** (the
+  [web admin page](#web-admin-page)) for the local network only;
 * installs **Voxa Server Manager**, which starts in the system tray at sign-in.
 
 **When updating, update the Voxa clients first.** By default the server only accepts the
@@ -32,9 +33,11 @@ newest Voxa client (see [Client version](#client-version)).
 |------|----------|----------|
 | **9987** | **TCP** | Control connection, encrypted chat and history, file transfers, screen sharing |
 | **9987** | **UDP** | Encrypted voice |
+| 9980 | TCP | [Web admin page](#web-admin-page) (plain HTTP; put an HTTPS proxy in front of it) |
 
 If people connect from the internet, forward **TCP and UDP 9987** on your router to the
-server PC. To use another port, change `port` in `server.toml`.
+server PC. To use another port, change `port` in `server.toml`. Don't forward 9980
+directly: publish the web admin page through an HTTPS reverse proxy instead.
 
 **Upload bandwidth:** the server sends each listener their own copy.
 * Voice: up to about 0.1 Mbit/s per listener.
@@ -49,6 +52,7 @@ Open it from the Start menu (**Voxa Server Manager**) or from its tray icon. It 
 * the **Server Admin privilege key**. In the client, click the server name ▸
   **Use Privilege Key** and paste it to become admin;
 * buttons for the data folder, `server.toml` and the log, plus a live log view;
+* **🌐 Open Web Admin**, which opens the [web admin page](#web-admin-page);
 * **Updates**: checks GitHub and installs new versions;
 * **What's new**, with the change log of every version.
 
@@ -64,6 +68,48 @@ runs as a service, even when the manager is closed.
     manager.
 * **Without a desktop:** run `voxa-server.exe --check-update` to check, or
   `voxa-server.exe --update` as administrator to download and install.
+
+## Web admin page
+Manage the server from a browser: the channel tree, chat, people and every admin dialog,
+with the same layout and the same seven themes as the Voxa client (🎨 at the bottom
+left).
+
+* **Open it:** `http://<server>:9980/`, or **🌐 Open Web Admin** in Voxa Server Manager.
+* **Sign in** with a Voxa identity. In Voxa, click your name at the bottom left ▸
+  **Identities**, export the identity you use on this server, and paste the key.
+  * You get exactly the rights that identity has: an admin identity can do everything,
+    a normal one only what normal users can.
+  * The key never leaves the browser. The page proves it owns the key (X25519 key
+    agreement with a one-time server key, then HMAC-SHA256); only that proof is sent.
+  * **Remember the key in this browser** is off by default; a sign-in lasts 12 hours.
+* **What you can do:**
+  * create, edit, clone, reorder and delete channels and separators; join channels;
+  * drag people onto channels to move them; poke, kick, ban, talk power, server and
+    channel groups, personal permissions, descriptions;
+  * edit the virtual server and the file limits, groups and permissions, the ban list,
+    and privilege keys;
+  * read and write server and channel chat (with history, pins and images), and send
+    direct messages, including to people who are offline.
+* **How it appears:** a signed-in page is an ordinary session of that identity, shown
+  with a **WEB** badge and no voice. It can run alongside the same identity's desktop
+  client without replacing it.
+
+### HTTPS with a reverse proxy (e.g. Nginx Proxy Manager)
+The server only speaks plain HTTP. For access over the internet, put an HTTPS reverse
+proxy in front of it:
+1. In Nginx Proxy Manager, add a **Proxy Host** for your domain (e.g. `voxa-admin.example.com`).
+2. Scheme `http`, forward hostname/IP = the Voxa server PC, forward port `9980`.
+3. On the **SSL** tab, request a Let's Encrypt certificate and enable **Force SSL**.
+4. Leave **Block common exploits** on. No custom configuration is needed: the live
+   updates use Server-Sent Events, which the server marks as unbuffered.
+
+Behind a proxy on the same PC or local network, the visitor's address comes from
+`X-Real-IP` / `X-Forwarded-For` (bans, logs and sign-in rate limits use it), and the
+sign-in cookie is marked `Secure` when the proxy reports HTTPS. Other proxies (Caddy,
+Traefik, IIS…) work the same way.
+
+To change the port or address, set `web_port` / `web_bind` in `server.toml`. To turn
+the page off, set `web_enabled = false`. Restart the server after editing.
 
 ## Client version
 With `require_latest_client = true` (the default in `server.toml`), the server only
@@ -114,6 +160,14 @@ their update window by themselves. To allow older clients, set
     messages*.
   * *Clear entire chat history* wipes a whole channel or server chat.
   * **Pinned messages**.
+* **People list:** everyone who has been on the server, with when they were last seen.
+  Everyone can see it.
+* **Offline messages:** people can message someone who is offline.
+  * The server keeps the message encrypted, delivers it when the person comes online,
+    and then deletes it.
+  * Undelivered messages are removed after 30 days; at most 100 wait per person.
+  * Direct messages themselves are never stored on the server: Voxa keeps them
+    encrypted on each user's PC.
 * **Images in chat:**
   * They are stored encrypted next to the chat history, with the same permissions as
     sending text there.
@@ -150,6 +204,15 @@ their update window by themselves. To allow older clients, set
   * bounded queues;
   * the upload quota cannot be bypassed by uploading in parallel.
 * **Voice addresses:** voice is only sent to the address a client is connected from.
+* **Web admin page:**
+  * Sign-in by proof of identity (the key stays in the browser); one-time challenges
+    expire after 2 minutes; 10 failed sign-ins from one address lock it out for 10
+    minutes.
+  * The session cookie is `HttpOnly` and `SameSite=Strict`; every action also needs a
+    header other sites can't send (no cross-site requests).
+  * A strict Content Security Policy (no inline or third-party scripts), no framing, and
+    all user text is shown as text, never as HTML.
+  * Every action goes through the same permission checks as the desktop client.
 * **Text:** names, topics and messages are cleaned of control characters and invisible
   direction-changing characters.
 
@@ -169,6 +232,9 @@ Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
 | `channel_quota_mb` | `0` | Initial storage per channel (0 = unlimited) |
 | `log_level` | `info` | `error`, `warn`, `info`, `debug` or `trace` |
 | `require_latest_client` | `true` | Only accept the newest Voxa client |
+| `web_enabled` | `true` | Serve the [web admin page](#web-admin-page) |
+| `web_bind` | `0.0.0.0` | Address the web admin page listens on |
+| `web_port` | `9980` | TCP port of the web admin page |
 
 Restart the server after editing.
 

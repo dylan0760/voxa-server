@@ -19,6 +19,12 @@ pub struct Config {
     /// Only let clients connect that are at least the newest Voxa version this server
     /// knows: the one it was released with, or a newer one published on GitHub since.
     pub require_latest_client: bool,
+    /// The web admin page: manage the server from a browser, signed in with an identity
+    /// exported from Voxa. Plain HTTP; put a reverse proxy (e.g. Nginx Proxy Manager) in
+    /// front of it for HTTPS.
+    pub web_enabled: bool,
+    pub web_bind: String,
+    pub web_port: u16,
 }
 
 impl Default for Config {
@@ -30,6 +36,9 @@ impl Default for Config {
             channel_quota_mb: 0,
             log_level: "info".into(),
             require_latest_client: true,
+            web_enabled: true,
+            web_bind: "0.0.0.0".into(),
+            web_port: 9980,
         }
     }
 }

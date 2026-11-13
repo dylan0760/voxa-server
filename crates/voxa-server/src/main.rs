@@ -9,6 +9,7 @@ mod secrets;
 mod state;
 mod store;
 mod voice;
+mod web;
 #[cfg(windows)]
 mod service;
 
@@ -40,6 +41,7 @@ OPTIONS:
 Network ports (default):
     TCP 9987  control connection, encrypted chat, file transfer and screen sharing
     UDP 9987  encrypted voice
+    TCP 9980  web admin page (plain HTTP; web_port in server.toml)
 
 Configuration is read from server.toml in the data directory.";
 
@@ -261,6 +263,7 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
         tokio::spawn(watch_client_releases(server.clone()));
     }
     tokio::spawn(voice::run(server.clone(), udp));
+    tokio::spawn(web::start(server.clone()));
     let purge = server.clone();
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(3600));
@@ -279,6 +282,13 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
     let status_srv = server.clone();
     let status_path = data_dir.join("status.json");
     let port = cfg.port;
+    // Where the Manager opens the web admin page (empty when it is off).
+    let web_url = if cfg.web_enabled && cfg.web_port != 0 {
+        let host = if cfg.web_bind == "0.0.0.0" || cfg.web_bind == "::" { "localhost".to_string() } else { cfg.web_bind.clone() };
+        format!("http://{host}:{}/", cfg.web_port)
+    } else {
+        String::new()
+    };
     tokio::spawn(async move {
         // Written only when something changed, plus a heartbeat once a minute. Rewriting
         // the file every few seconds makes antivirus software rescan it each time.
@@ -300,9 +310,10 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
             last = Some((online, channels, tr));
             last_write = std::time::Instant::now();
             let json = format!(
-                "{{\"running\":true,\"version\":\"{}\",\"port\":{},\"online\":{},\"channels\":{},\"started\":{},\"updated\":{},\"fingerprint\":\"{}\",\"traffic\":{{\"voice_in\":{},\"voice_out\":{},\"files_in\":{},\"files_out\":{},\"screen_in\":{},\"screen_out\":{},\"chat_in\":{},\"chat_out\":{}}}}}",
+                "{{\"running\":true,\"version\":\"{}\",\"port\":{},\"web_url\":\"{}\",\"online\":{},\"channels\":{},\"started\":{},\"updated\":{},\"fingerprint\":\"{}\",\"traffic\":{{\"voice_in\":{},\"voice_out\":{},\"files_in\":{},\"files_out\":{},\"screen_in\":{},\"screen_out\":{},\"chat_in\":{},\"chat_out\":{}}}}}",
                 voxa_proto::APP_VERSION,
                 port,
+                web_url.replace(['\\', '"'], ""),
                 online,
                 channels,
                 status_srv.started,

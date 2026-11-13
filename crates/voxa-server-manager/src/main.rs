@@ -44,6 +44,8 @@ const DIM: Color32 = Color32::from_rgb(0x9A, 0xA0, 0xA8);
 struct Status {
     version: String,
     port: u16,
+    /// The web admin page (empty when it is off or the server is older).
+    web_url: String,
     online: usize,
     channels: usize,
     started: u64,
@@ -519,6 +521,9 @@ impl eframe::App for ManagerApp {
                             row(ui, "Channels", s.channels.to_string());
                             row(ui, "Uptime", fmt_duration(now_unix().saturating_sub(s.started)));
                             row(ui, "Ports", format!("TCP {0} and UDP {0}", s.port));
+                            if !s.web_url.is_empty() {
+                                row(ui, "Web admin", s.web_url.clone());
+                            }
                             row(ui, "Version", s.version.clone());
                             ui.label(RichText::new("Fingerprint").color(DIM));
                             ui.label(RichText::new(&s.fingerprint).monospace().small());
@@ -588,6 +593,12 @@ impl eframe::App for ManagerApp {
                 }
                 if ui.button("📄 Open Log File").clicked() {
                     Self::open_path(self.dir.join("logs").join("server.log"), true);
+                }
+                let web = self.status.as_ref().map(|s| s.web_url.clone()).filter(|u| u.starts_with("http://"));
+                if let Some(url) = web {
+                    if ui.button("🌐 Open Web Admin").on_hover_text("Manage the server in your browser, signed in with an identity exported from Voxa").clicked() {
+                        let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
+                    }
                 }
             });
             ui.add_space(8.0);

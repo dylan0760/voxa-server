@@ -62,6 +62,9 @@ pub struct Session {
     pub extra_perms: u64,
     /// Chat rate limit: (tokens left, last refill).
     pub chat_budget: (f32, Instant),
+    /// Signed in through the web admin page (no voice; may run next to the same
+    /// identity's desktop client).
+    pub web: bool,
 }
 
 /// Chat messages, images and pokes: bursts of this many, then `CHAT_RATE` per second.
@@ -206,7 +209,7 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.18.0";
+pub const MIN_CLIENT_VERSION: &str = "1.19.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -731,6 +734,7 @@ impl Server {
         hello: C2S,
         tx: Outbox,
         close: Arc<Notify>,
+        web: bool,
     ) -> Res<ClientId> {
         let C2S::Hello {
             protocol,
@@ -781,9 +785,10 @@ impl Server {
         if st.sessions.len() as u32 >= st.settings.max_clients && group_perms & perm::IGNORE_SERVER_MAXCLIENTS == 0 {
             return Err("The server is full".into());
         }
-        if st.sessions.values().any(|s| s.info.uid == uid) {
-            // Same identity connected twice: drop the stale session (TeamSpeak-like reconnect).
-            if let Some(old) = st.sessions.values().find(|s| s.info.uid == uid).map(|s| s.info.id) {
+        // Same identity connected twice: drop the stale session (TeamSpeak-like reconnect).
+        // The web page and the desktop client are separate sessions and do not replace each other.
+        if st.sessions.values().any(|s| s.info.uid == uid && s.web == web) {
+            if let Some(old) = st.sessions.values().find(|s| s.info.uid == uid && s.web == web).map(|s| s.info.id) {
                 drop(st);
                 self.kick_session(old, LeaveReason::Disconnected("Reconnected".into()));
                 st = self.state.lock();
@@ -889,6 +894,7 @@ impl Server {
                 last_keyframe_req: None,
                 extra_perms,
                 chat_budget: (CHAT_BURST, Instant::now()),
+                web,
             },
         );
         Ok(id)

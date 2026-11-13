@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- Voxa server installer (WiX Toolset v3). Built by build.ps1.
      Installs voxa-server.exe as the auto-start Windows service "VoxaServer" and opens
-     TCP 9987 + UDP 9987 in Windows Firewall. Server data lives in
+     TCP 9987 + UDP 9987 in Windows Firewall (and TCP 9980, the web admin page, for the
+     local network only). Server data lives in
      %ProgramData%\Voxa Server and is kept on uninstall. -->
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
      xmlns:util="http://schemas.microsoft.com/wix/UtilExtension"
@@ -19,7 +20,7 @@
     <Property Id="ARPCOMMENTS" Value="Free and open source voice chat server. No license keys required." />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
-              Value="Voxa Server now runs in the background as a Windows service on port 9987 (TCP and UDP). Use Voxa Server Manager (Start menu and system tray) to see its status, start/stop it and get the Server Admin privilege key." />
+              Value="Voxa Server now runs in the background as a Windows service on port 9987 (TCP and UDP). Use Voxa Server Manager (Start menu and system tray) to see its status, start/stop it and get the Server Admin privilege key. The web admin page is on port 9980." />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Open Voxa Server Manager" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#ManagerExe]" />
@@ -60,6 +61,8 @@
         <ServiceControl Id="VoxaServiceControl" Name="VoxaServer" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
         <fire:FirewallException Id="FwTcp" Name="Voxa Server (TCP 9987)" Port="9987" Protocol="tcp" Scope="any" Profile="all" IgnoreFailure="yes" />
         <fire:FirewallException Id="FwUdp" Name="Voxa Server (UDP 9987)" Port="9987" Protocol="udp" Scope="any" Profile="all" IgnoreFailure="yes" />
+        <!-- The web admin page (plain HTTP): only the local network, e.g. a reverse proxy that adds HTTPS. -->
+        <fire:FirewallException Id="FwWeb" Name="Voxa Server web admin (TCP 9980, local network)" Port="9980" Protocol="tcp" Scope="localSubnet" Profile="all" IgnoreFailure="yes" />
       </Component>
       <Component Id="ManagerExe" Guid="*" Win64="yes">
         <File Id="ManagerExe" Source="$(var.Bin)\voxa-server-manager.exe" KeyPath="yes" Checksum="yes" />
