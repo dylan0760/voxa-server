@@ -206,7 +206,7 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.16.0";
+pub const MIN_CLIENT_VERSION: &str = "1.17.0";
 
 /// Most channels a server holds, and how deeply they can be nested.
 pub const MAX_CHANNELS: usize = 2000;
@@ -805,7 +805,7 @@ impl Server {
                 let may_join = perms_there & perm::CHANNEL_JOIN != 0
                     && (perms_there & perm::CHANNEL_JOIN_IGNORE_POWER != 0
                         || st.join_power(&record.server_groups, cg) >= c.info.needed_join_power);
-                if pw_ok && !full && may_join {
+                if pw_ok && !full && may_join && !voxa_proto::is_spacer(&c.info.name) {
                     channel = ch;
                 }
             }
@@ -1056,8 +1056,9 @@ impl Server {
                 self.need(st.server_perms(s), perm::CLIENT_MOVE)?;
                 let t = st.session(target)?;
                 self.check_outranks(st, s, t)?;
-                if !st.channels.contains_key(&channel) {
-                    return Err("Channel not found".into());
+                let c = st.channels.get(&channel).ok_or("Channel not found")?;
+                if voxa_proto::is_spacer(&c.info.name) {
+                    return Err("Nobody can be moved into a separator".into());
                 }
                 let by = s.info.nickname.clone();
                 self.move_client(st, target, channel, Some(by));
@@ -1447,6 +1448,9 @@ impl Server {
         if s.info.channel == ch {
             return Ok(());
         }
+        if voxa_proto::is_spacer(&c.info.name) {
+            return Err("This is a separator, not a channel: nobody can join it".into());
+        }
         let p = self.perms_in(st, s, ch);
         if p & perm::CHANNEL_JOIN == 0 {
             return Err("Your group is not allowed to join channels".into());
@@ -1531,6 +1535,22 @@ impl Server {
         if dup {
             return Err("A channel with this name already exists".into());
         }
+        if voxa_proto::is_spacer(&e.name) {
+            // Separators are only decoration: never default, never temporary (a temporary
+            // channel only lives while someone is inside), no password.
+            if e.is_default {
+                return Err("A separator cannot be the default channel".into());
+            }
+            if e.kind == ChannelKind::Temporary {
+                return Err("Separators must be permanent or semi-permanent".into());
+            }
+            e.password = PasswordChange::Clear;
+            if let Some(id) = id {
+                if st.clients_in(id) > 0 {
+                    return Err("Move everyone out of the channel before turning it into a separator".into());
+                }
+            }
+        }
         if e.is_default && e.kind != ChannelKind::Permanent {
             return Err("The default channel must be permanent".into());
         }
@@ -1601,10 +1621,13 @@ impl Server {
         }
         st.channels.insert(id, rec);
         st.broadcast(S2C::ChannelCreated(info));
-        // The creator becomes channel admin and is moved into the new channel.
+        // The creator becomes channel admin and is moved into the new channel (not into a
+        // separator, which nobody can join).
         let admin = st.settings.channel_admin_group;
         db(self.store.set_channel_group(&uid, id, Some(admin)))?;
-        self.move_client(st, me, id, None);
+        if !st.channels.get(&id).map(|c| voxa_proto::is_spacer(&c.info.name)).unwrap_or(false) {
+            self.move_client(st, me, id, None);
+        }
         Ok(())
     }
 

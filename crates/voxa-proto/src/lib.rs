@@ -111,6 +111,89 @@ pub fn channel_bitrate(codec_quality: u8) -> i32 {
     }
 }
 
+/// How a separator's text is laid out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpacerAlign {
+    Left,
+    Center,
+    Right,
+    /// The text repeated across the whole width (lines like `───` or `- - -`).
+    Repeat,
+}
+
+/// A channel separator ("spacer", like TeamSpeak): a channel whose name starts with
+/// `[spacer]`, `[lspacer]`, `[cspacer]`, `[rspacer]` or `[*spacer]`, optionally with a
+/// number (`[cspacer2]`) so several can share a parent. Nobody can join one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spacer {
+    pub align: SpacerAlign,
+    pub number: Option<u32>,
+    pub text: String,
+}
+
+impl Spacer {
+    /// The channel name for this separator.
+    pub fn name(&self) -> String {
+        let tag = match self.align {
+            SpacerAlign::Left => "",
+            SpacerAlign::Center => "c",
+            SpacerAlign::Right => "r",
+            SpacerAlign::Repeat => "*",
+        };
+        let n = self.number.map(|n| n.to_string()).unwrap_or_default();
+        format!("[{tag}spacer{n}]{}", self.text)
+    }
+}
+
+/// The separator described by a channel name, or None for a normal channel.
+pub fn spacer(name: &str) -> Option<Spacer> {
+    let rest = name.strip_prefix('[')?;
+    let close = rest.find(']')?;
+    let (tag, text) = (&rest[..close], &rest[close + 1..]);
+    let (align, tag) = match tag.as_bytes().first()? {
+        b'c' => (SpacerAlign::Center, &tag[1..]),
+        b'l' => (SpacerAlign::Left, &tag[1..]),
+        b'r' => (SpacerAlign::Right, &tag[1..]),
+        b'*' => (SpacerAlign::Repeat, &tag[1..]),
+        _ => (SpacerAlign::Left, tag),
+    };
+    let digits = tag.strip_prefix("spacer")?;
+    if digits.len() > 6 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number = if digits.is_empty() { None } else { Some(digits.parse().ok()?) };
+    Some(Spacer { align, number, text: text.to_string() })
+}
+
+/// True if nobody can join this channel (it is a separator).
+pub fn is_spacer(name: &str) -> bool {
+    spacer(name).is_some()
+}
+
+#[cfg(test)]
+mod spacer_tests {
+    use super::*;
+
+    #[test]
+    fn teamspeak_style_spacers() {
+        let s = spacer("[cspacer]Games").unwrap();
+        assert_eq!((s.align, s.number, s.text.as_str()), (SpacerAlign::Center, None, "Games"));
+        assert_eq!(spacer("[*spacer3]-").unwrap().align, SpacerAlign::Repeat);
+        assert_eq!(spacer("[*spacer3]-").unwrap().number, Some(3));
+        assert_eq!(spacer("[spacer]").unwrap().align, SpacerAlign::Left);
+        assert_eq!(spacer("[lspacer]x").unwrap().align, SpacerAlign::Left);
+        assert_eq!(spacer("[rspacer12]Right").unwrap().align, SpacerAlign::Right);
+        for normal in ["Games", "[Games]", "[cspacerx]a", "[xspacer]a", "spacer", "[cspacer", "[cspacer1234567]a", "[]", "["] {
+            assert!(spacer(normal).is_none(), "{normal}");
+        }
+        for n in ["[cspacer]Games", "[*spacer3]═", "[spacer]", "[rspacer7]Right"] {
+            assert_eq!(spacer(n).unwrap().name(), n);
+        }
+        // Multi-byte text right after the tag.
+        assert_eq!(spacer("[cspacer]ゲーム").unwrap().text, "ゲーム");
+    }
+}
+
 /// Start of the refusal message for clients that are older than the server requires;
 /// newer clients offer to update when they see it.
 pub const UPDATE_REQUIRED: &str = "Update required: ";
