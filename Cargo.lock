@@ -4253,7 +4253,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voxa-proto"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "base64 0.22.1",
  "bincode",
@@ -4270,7 +4270,7 @@ dependencies = [
 
 [[package]]
 name = "voxa-server"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4281,6 +4281,7 @@ dependencies = [
  "rand",
  "redb",
  "serde",
+ "sha2",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
  "tracing",
@@ -4293,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "voxa-server-manager"
-version = "1.8.1"
+version = "1.8.2"
 dependencies = [
  "chrono",
  "eframe",

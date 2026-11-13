@@ -63,6 +63,20 @@ pub struct SecureReader<R> {
     frame_have: usize,
     /// Bytes on the wire (length prefixes, encryption) of the last received message.
     pub last_size: usize,
+    /// Largest accepted message (see `set_max_message`).
+    max_message: usize,
+}
+
+/// Decodes a message with the same encoding as `bincode::serialize`, but refuses to
+/// read (or allocate for) more than the message itself holds.
+fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(body.len() as u64)
+        .deserialize(body)
+        .map_err(|e| TransportError::Codec(e.to_string()))
 }
 
 pub struct SecureWriter<W> {
@@ -107,6 +121,7 @@ fn split<R, W>(r: R, w: W, state: StatelessTransportState) -> Result<Secured<R, 
             body_len: None,
             frame_have: 0,
             last_size: 0,
+            max_message: MAX_MESSAGE,
         },
         writer: SecureWriter { inner: w, state, nonce: 0, scratch: vec![0u8; NOISE_MAX], last_size: 0 },
         remote_static,
@@ -158,6 +173,12 @@ where
 }
 
 impl<R: AsyncRead + Unpin> SecureReader<R> {
+    /// Limits the size of the messages this reader accepts (at most `MAX_MESSAGE`).
+    /// A larger message ends the connection with `TooLarge` before it is buffered.
+    pub fn set_max_message(&mut self, max: usize) {
+        self.max_message = max.min(MAX_MESSAGE);
+    }
+
     /// Reads one complete `[u16 len][ciphertext]` frame into `self.frame`.
     ///
     /// Cancel-safe: the only await point is a single `read`, which either completes
@@ -199,12 +220,11 @@ impl<R: AsyncRead + Unpin> SecureReader<R> {
         loop {
             if self.plain.len() >= 4 {
                 let len = u32::from_be_bytes(self.plain[..4].try_into().unwrap()) as usize;
-                if len > MAX_MESSAGE {
+                if len > self.max_message {
                     return Err(TransportError::TooLarge);
                 }
                 if self.plain.len() >= 4 + len {
-                    let msg = bincode::deserialize(&self.plain[4..4 + len])
-                        .map_err(|e| TransportError::Codec(e.to_string()));
+                    let msg = decode(&self.plain[4..4 + len]);
                     self.plain.drain(..4 + len);
                     self.last_size = wire_size(len);
                     return msg;
@@ -279,6 +299,31 @@ mod tests {
         }
         assert_eq!(got, expected);
         assert!(cancellations > 10, "test did not exercise cancellation ({cancellations})");
+    }
+
+    /// Size limits: an oversized message is refused, and a length field that claims
+    /// more elements than the message holds fails without allocating for them.
+    #[tokio::test]
+    async fn limits() {
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let (ar, aw) = tokio::io::split(a);
+        let (br, bw) = tokio::io::split(b);
+        let (ck, sk) = (KeyPair::generate(), KeyPair::generate());
+        let client = tokio::spawn(async move { connect(ar, aw, &ck.private).await.unwrap() });
+        let mut server = accept(br, bw, &sk.private).await.unwrap();
+        let mut client = client.await.unwrap();
+        server.reader.set_max_message(1000);
+        client.writer.send(&vec![1u8; 900]).await.unwrap();
+        assert_eq!(server.reader.recv::<Vec<u8>>().await.unwrap().len(), 900);
+        // A Vec<String> claiming 2^40 entries in a 12-byte message.
+        let mut evil = (1u64 << 40).to_le_bytes().to_vec();
+        evil.extend_from_slice(&[0, 0, 0, 0]);
+        assert!(matches!(decode::<Vec<String>>(&evil), Err(TransportError::Codec(_))));
+        // Same encoding as bincode::serialize.
+        let v = (7u32, "x".to_string(), vec![1u16, 2]);
+        assert_eq!(decode::<(u32, String, Vec<u16>)>(&bincode::serialize(&v).unwrap()).unwrap(), v);
+        client.writer.send(&vec![1u8; 2000]).await.unwrap();
+        assert!(matches!(server.reader.recv::<Vec<u8>>().await, Err(TransportError::TooLarge)));
     }
 
     /// Traffic statistics: the receiver's computed wire size equals what was written.

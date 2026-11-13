@@ -69,6 +69,9 @@ pub struct Server {
     pub identity: KeyPair,
     pub fingerprint: String,
     pub started: u64,
+    pub pw: Mutex<PasswordWork>,
+    /// Argon2 runs at most this many at once, so password floods cannot use every core.
+    argon_slots: tokio::sync::Semaphore,
 }
 
 pub type Res<T = ()> = Result<T, String>;
@@ -88,6 +91,73 @@ pub fn hash_password(pw: &str) -> String {
 pub fn verify_password(pw: &str, hash: &str) -> bool {
     PasswordHash::new(hash).map(|h| Argon2::default().verify_password(pw.as_bytes(), &h).is_ok()).unwrap_or(false)
 }
+
+/// Wrong passwords per address within `FAILURE_WINDOW` before further tries are refused.
+const MAX_FAILURES: u32 = 10;
+const FAILURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a verified password stays known (only its hash is kept).
+const VERIFIED_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn sha256(parts: &[&[u8]]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for p in parts {
+        h.update((p.len() as u64).to_le_bytes());
+        h.update(p);
+    }
+    h.finalize().into()
+}
+
+/// Argon2 is slow on purpose, so it never runs while the server state is locked:
+/// passwords are verified / hashed before a message is handled, and the handler only
+/// looks the result up here.
+#[derive(Default)]
+pub struct PasswordWork {
+    /// SHA-256 of (stored hash, password) pairs that were verified as correct.
+    verified: HashMap<[u8; 32], Instant>,
+    /// Hashes made ahead for passwords about to be set, by SHA-256 of the password.
+    hashed: HashMap<[u8; 32], (String, Instant)>,
+    /// Wrong passwords per address: (count, start of the window).
+    failures: HashMap<IpAddr, (u32, Instant)>,
+}
+
+impl PasswordWork {
+    fn is_verified(&self, hash: &str, pw: &str) -> bool {
+        self.verified.get(&sha256(&[hash.as_bytes(), pw.as_bytes()])).map(|t| t.elapsed() < VERIFIED_TTL).unwrap_or(false)
+    }
+
+    fn check_failures(&self, ip: IpAddr) -> Res {
+        match self.failures.get(&ip) {
+            Some((n, since)) if *n >= MAX_FAILURES && since.elapsed() < FAILURE_WINDOW => {
+                Err("Too many wrong passwords. Please wait a minute and try again.".into())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn record(&mut self, ip: IpAddr, hash: &str, pw: &str, ok: bool) {
+        let now = Instant::now();
+        if ok {
+            if self.verified.len() > 4096 {
+                self.verified.retain(|_, t| t.elapsed() < VERIFIED_TTL);
+            }
+            self.verified.insert(sha256(&[hash.as_bytes(), pw.as_bytes()]), now);
+        } else {
+            if self.failures.len() > 10_000 {
+                self.failures.retain(|_, (_, t)| t.elapsed() < FAILURE_WINDOW);
+            }
+            let e = self.failures.entry(ip).or_insert((0, now));
+            if e.1.elapsed() >= FAILURE_WINDOW {
+                *e = (0, now);
+            }
+            e.0 += 1;
+        }
+    }
+}
+
+/// Most channels a server holds, and how deeply they can be nested.
+pub const MAX_CHANNELS: usize = 2000;
+pub const MAX_CHANNEL_DEPTH: usize = 16;
 
 pub const GROUP_ADMIN: GroupId = 1;
 pub const GROUP_NORMAL: GroupId = 2;
@@ -255,14 +325,48 @@ impl State {
         self.channels.values().filter(|c| c.info.parent == Some(ch)).map(|c| c.info.id).collect()
     }
 
-    /// The channel and all of its descendants, deepest first.
+    /// The channel and all of its descendants, deepest first (every channel comes
+    /// before its parent). A loop, not recursion: trees can be deep.
     fn subtree(&self, ch: ChannelId) -> Vec<ChannelId> {
-        let mut out = Vec::new();
-        for c in self.children(ch) {
-            out.extend(self.subtree(c));
+        let mut kids: HashMap<ChannelId, Vec<ChannelId>> = HashMap::new();
+        for c in self.channels.values() {
+            if let Some(p) = c.info.parent {
+                kids.entry(p).or_default().push(c.info.id);
+            }
         }
-        out.push(ch);
-        out
+        let mut order = vec![ch];
+        let mut seen = HashSet::from([ch]);
+        let mut i = 0;
+        while i < order.len() {
+            for &k in kids.get(&order[i]).map(Vec::as_slice).unwrap_or_default() {
+                if seen.insert(k) {
+                    order.push(k);
+                }
+            }
+            i += 1;
+        }
+        order.reverse();
+        order
+    }
+
+    /// Nesting level of a channel: 1 for a top level channel.
+    fn depth(&self, ch: ChannelId) -> usize {
+        let mut d = 0;
+        let mut cur = Some(ch);
+        while let Some(c) = cur {
+            d += 1;
+            if d > MAX_CHANNEL_DEPTH * 4 {
+                break;
+            }
+            cur = self.channels.get(&c).and_then(|c| c.info.parent);
+        }
+        d
+    }
+
+    /// Levels in the tree below and including `ch` (1 = no sub-channels).
+    fn height(&self, ch: ChannelId) -> usize {
+        let base = self.depth(ch);
+        self.subtree(ch).iter().map(|c| self.depth(*c) + 1 - base).max().unwrap_or(1)
     }
 
     fn clients_in(&self, ch: ChannelId) -> usize {
@@ -352,6 +456,8 @@ impl Server {
             identity,
             fingerprint,
             started: now_unix(),
+            pw: Mutex::new(PasswordWork::default()),
+            argon_slots: tokio::sync::Semaphore::new(2),
         };
         srv.ensure_admin_key()?;
         Ok(srv)
@@ -404,10 +510,8 @@ impl Server {
             "Voxa Server - Server Admin privilege key\r\n\r\n{key}\r\n\r\nConnect with the Voxa client and use Permissions > Use Privilege Key.\r\nThis file is removed once an administrator exists.\r\n"
         );
         std::fs::write(&path, text)?;
-        info!("------------------------------------------------------------------");
-        info!(" Server Admin privilege key: {key}");
-        info!(" (also saved to {})", path.display());
-        info!("------------------------------------------------------------------");
+        // The key itself is not logged: logs are kept (and shared) long after it is used.
+        info!("no Server Admin yet: the admin privilege key is in {}", path.display());
         Ok(())
     }
 
@@ -431,6 +535,106 @@ impl Server {
     fn perms_in(&self, st: &State, s: &Session, ch: ChannelId) -> u64 {
         let cg = if s.info.channel == ch { s.info.channel_group } else { self.channel_group_for(st, &s.info.uid, ch) };
         st.server_perms(s) | st.group_perms(cg)
+    }
+
+    // ------------------------------------------------------------------ passwords
+
+    /// Runs Argon2 on a blocking thread, a few at a time.
+    async fn argon<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> Res<T> {
+        let _slot = self.argon_slots.acquire().await.map_err(|_| "Server is shutting down".to_string())?;
+        tokio::task::spawn_blocking(f).await.map_err(|e| e.to_string())
+    }
+
+    /// Verifies a password before the state is locked; the handler then finds the
+    /// result with `pw_verified`. Wrong passwords count against the address.
+    async fn verify_ahead(&self, ip: IpAddr, pw: &str, hash: &str) -> Res {
+        {
+            let w = self.pw.lock();
+            if w.is_verified(hash, pw) {
+                return Ok(());
+            }
+            w.check_failures(ip)?;
+        }
+        let (p, h) = (pw.to_string(), hash.to_string());
+        let ok = self.argon(move || verify_password(&p, &h)).await?;
+        self.pw.lock().record(ip, hash, pw, ok);
+        if !ok {
+            warn!("wrong password from {ip}");
+        }
+        Ok(())
+    }
+
+    /// Hashes a password that is about to be set, before the state is locked.
+    async fn hash_ahead(&self, change: &PasswordChange) -> Res {
+        if let PasswordChange::Set(pw) = change {
+            if !pw.is_empty() {
+                let p = pw.clone();
+                let hash = self.argon(move || hash_password(&p)).await?;
+                let mut w = self.pw.lock();
+                if w.hashed.len() > 256 {
+                    w.hashed.retain(|_, (_, t)| t.elapsed() < VERIFIED_TTL);
+                }
+                w.hashed.insert(sha256(&[pw.as_bytes()]), (hash, Instant::now()));
+            }
+        }
+        Ok(())
+    }
+
+    /// True if `pw` matches `hash`. Only looks up `verify_ahead`'s result (cheap).
+    fn pw_verified(&self, pw: &str, hash: &str) -> bool {
+        self.pw.lock().is_verified(hash, pw)
+    }
+
+    /// The hash of a new password, made ahead by `hash_ahead` (computed here only if
+    /// that did not happen).
+    fn pw_hash(&self, pw: &str) -> String {
+        let ready = self.pw.lock().hashed.remove(&sha256(&[pw.as_bytes()]));
+        ready.map(|(h, _)| h).unwrap_or_else(|| hash_password(pw))
+    }
+
+    /// Checks the passwords of a Hello before the login takes the state lock.
+    pub async fn check_login_passwords(
+        &self,
+        ip: IpAddr,
+        server_password: Option<&str>,
+        default_channel: Option<&str>,
+        channel_password: Option<&str>,
+    ) -> Res {
+        let (server_hash, channel_hash) = {
+            let st = self.state.lock();
+            let ch = default_channel.and_then(|p| find_channel_by_path(&st, p));
+            (st.settings.password_hash.clone(), ch.and_then(|c| st.channels.get(&c)).and_then(|c| c.password_hash.clone()))
+        };
+        if let Some(h) = &server_hash {
+            self.pw.lock().check_failures(ip)?;
+            if let Some(p) = server_password {
+                self.verify_ahead(ip, p, h).await?;
+            }
+        }
+        if let (Some(h), Some(p)) = (&channel_hash, channel_password) {
+            self.verify_ahead(ip, p, h).await?;
+        }
+        Ok(())
+    }
+
+    /// Does the slow password work of a message before it is handled under the lock.
+    pub async fn prepare(&self, me: ClientId, msg: &C2S) -> Res {
+        match msg {
+            C2S::SwitchChannel { channel, password: Some(pw) } => {
+                let (ip, hash) = {
+                    let st = self.state.lock();
+                    let Some(s) = st.sessions.get(&me) else { return Ok(()) };
+                    (s.ip, st.channels.get(channel).and_then(|c| c.password_hash.clone()))
+                };
+                if let Some(h) = hash {
+                    self.verify_ahead(ip, pw, &h).await?;
+                }
+                Ok(())
+            }
+            C2S::CreateChannel(e) | C2S::EditChannel { edit: e, .. } => self.hash_ahead(&e.password).await,
+            C2S::EditServer(e) => self.hash_ahead(&e.password).await,
+            _ => Ok(()),
+        }
     }
 
     // ------------------------------------------------------------------ login
@@ -462,13 +666,14 @@ impl Server {
                 PROTOCOL_VERSION
             ));
         }
-        let mut st = self.state.lock();
+        // The ban list is read before the state is locked (database work).
         if let Some(ban) = self.find_ban(Some(&uid), Some(ip)) {
             let until = ban.expires.map(|e| format!(" (expires in {} min)", (e.saturating_sub(now_unix())) / 60 + 1)).unwrap_or_default();
             return Err(format!("You are banned from this server: {}{until}", ban.reason));
         }
+        let mut st = self.state.lock();
         if let Some(h) = &st.settings.password_hash {
-            if !server_password.as_deref().map(|p| verify_password(p, h)).unwrap_or(false) {
+            if !server_password.as_deref().map(|p| self.pw_verified(p, h)).unwrap_or(false) {
                 return Err("Invalid server password".into());
             }
         }
@@ -508,7 +713,7 @@ impl Server {
                 let c = &st.channels[&ch];
                 let pw_ok = match &c.password_hash {
                     None => true,
-                    Some(h) => default_channel_password.as_deref().map(|p| verify_password(p, h)).unwrap_or(false)
+                    Some(h) => default_channel_password.as_deref().map(|p| self.pw_verified(p, h)).unwrap_or(false)
                         || group_perms & perm::CHANNEL_JOIN_IGNORE_PASSWORD != 0,
                 };
                 let full = c.info.max_clients.map(|m| st.clients_in(ch) as u32 >= m).unwrap_or(false)
@@ -617,17 +822,34 @@ impl Server {
         None
     }
 
-    pub fn attach_bulk(&self, token: &[u8; 32], tx: mpsc::Sender<BulkS2C>) -> Option<ClientId> {
+    /// Attaches a bulk connection to the session that received `token`. The connection
+    /// must come from the same identity (`uid` from its handshake) as the session, so a
+    /// token that leaked is useless to anyone else.
+    pub fn attach_bulk(&self, token: &[u8; 32], uid: &str, tx: mpsc::Sender<BulkS2C>) -> Option<ClientId> {
         let mut st = self.state.lock();
-        let s = st.sessions.values_mut().find(|s| &s.bulk_token == token)?;
+        let mut found = None;
+        // Compare every token in constant time (no early exit that leaks timing).
+        for s in st.sessions.values() {
+            if ct_eq(&s.bulk_token, token) {
+                found = Some(s.info.id);
+            }
+        }
+        let s = st.sessions.get_mut(&found?)?;
+        if s.info.uid != uid {
+            warn!("bulk connection for client {} came from another identity ({uid}); refused", s.info.id);
+            return None;
+        }
         s.bulk_tx = Some(tx);
         Some(s.info.id)
     }
 
-    pub fn detach_bulk(&self, id: ClientId) {
+    /// Detaches a bulk connection, unless the session already has a newer one.
+    pub fn detach_bulk(&self, id: ClientId, tx: &mpsc::Sender<BulkS2C>) {
         let mut st = self.state.lock();
         if let Some(s) = st.sessions.get_mut(&id) {
-            s.bulk_tx = None;
+            if s.bulk_tx.as_ref().map(|b| b.same_channel(tx)).unwrap_or(false) {
+                s.bulk_tx = None;
+            }
         }
     }
 
@@ -662,18 +884,19 @@ impl Server {
         self.remove_session(id, reason);
     }
 
+    /// Removes an empty temporary channel, then its parent if that became empty too.
     fn cleanup_temporary(&self, st: &mut State, ch: ChannelId) {
-        let Some(c) = st.channels.get(&ch) else { return };
-        if c.info.kind != ChannelKind::Temporary || st.clients_in(ch) > 0 || !st.children(ch).is_empty() {
-            return;
-        }
-        let parent = c.info.parent;
-        st.channels.remove(&ch);
-        let _ = self.store.delete_channel(ch);
-        crate::files::delete_channel_files(&self.data_dir, ch);
-        st.broadcast(S2C::ChannelDeleted(ch));
-        if let Some(p) = parent {
-            self.cleanup_temporary(st, p);
+        let mut next = Some(ch);
+        while let Some(ch) = next.take() {
+            let Some(c) = st.channels.get(&ch) else { return };
+            if c.info.kind != ChannelKind::Temporary || st.clients_in(ch) > 0 || !st.children(ch).is_empty() {
+                return;
+            }
+            next = c.info.parent;
+            st.channels.remove(&ch);
+            let _ = self.store.delete_channel(ch);
+            crate::files::delete_channel_files(&self.data_dir, ch);
+            st.broadcast(S2C::ChannelDeleted(ch));
         }
     }
 
@@ -1133,7 +1356,7 @@ impl Server {
             }
         }
         if let Some(h) = &c.password_hash {
-            if p & perm::CHANNEL_JOIN_IGNORE_PASSWORD == 0 && !password.map(|pw| verify_password(pw, h)).unwrap_or(false) {
+            if p & perm::CHANNEL_JOIN_IGNORE_PASSWORD == 0 && !password.map(|pw| self.pw_verified(pw, h)).unwrap_or(false) {
                 return Err("Invalid channel password".into());
             }
         }
@@ -1189,6 +1412,10 @@ impl Server {
                     return Err("A channel cannot be moved below itself".into());
                 }
             }
+            let height = id.map(|id| st.height(id)).unwrap_or(1);
+            if st.depth(p) + height > MAX_CHANNEL_DEPTH {
+                return Err(format!("Channels can be nested at most {MAX_CHANNEL_DEPTH} levels deep"));
+            }
         }
         let dup = st
             .channels
@@ -1229,6 +1456,9 @@ impl Server {
         if e.is_default {
             self.need(p, perm::SERVER_EDIT)?;
         }
+        if st.channels.len() >= MAX_CHANNELS {
+            return Err(format!("This server has the maximum of {MAX_CHANNELS} channels"));
+        }
         self.validate_channel_edit(st, None, &mut e)?;
         let uid = s.info.uid.clone();
         let id = db(self.store.next_id("next_channel"))?;
@@ -1236,7 +1466,7 @@ impl Server {
             e.sort = st.channels.values().filter(|c| c.info.parent == e.parent).map(|c| c.info.sort).max().unwrap_or(0) + 1;
         }
         let password_hash = match &e.password {
-            PasswordChange::Set(pw) if !pw.is_empty() => Some(hash_password(pw)),
+            PasswordChange::Set(pw) if !pw.is_empty() => Some(self.pw_hash(pw)),
             _ => None,
         };
         if e.is_default {
@@ -1290,6 +1520,13 @@ impl Server {
         e.name = name;
         e.is_default = false;
         e.password = PasswordChange::Keep;
+        if st.channels.len() + ids.len() > MAX_CHANNELS {
+            return Err(format!("This server has the maximum of {MAX_CHANNELS} channels"));
+        }
+        let height = if with_children { st.height(source) } else { 1 };
+        if parent.map(|p| st.depth(p)).unwrap_or(0) + height > MAX_CHANNEL_DEPTH {
+            return Err(format!("Channels can be nested at most {MAX_CHANNEL_DEPTH} levels deep"));
+        }
         self.validate_channel_edit(st, None, &mut e)?;
         // Make room directly below the original.
         let later: Vec<ChannelId> = st.channels.values().filter(|c| c.info.parent == parent && c.info.sort > src_sort).map(|c| c.info.id).collect();
@@ -1309,6 +1546,10 @@ impl Server {
         // A temporary channel only lives while someone is in it.
         if kind == ChannelKind::Temporary {
             self.move_client(st, me, new_id, None);
+        }
+        // Copied temporary sub-channels are empty, so they go away again at once.
+        for ch in st.subtree(new_id) {
+            self.cleanup_temporary(st, ch);
         }
         Ok(())
     }
@@ -1382,7 +1623,7 @@ impl Server {
             PasswordChange::Keep => {}
             PasswordChange::Clear => c.password_hash = None,
             PasswordChange::Set(pw) if pw.is_empty() => c.password_hash = None,
-            PasswordChange::Set(pw) => c.password_hash = Some(hash_password(pw)),
+            PasswordChange::Set(pw) => c.password_hash = Some(self.pw_hash(pw)),
         }
         c.info = ChannelInfo {
             id,
@@ -1691,7 +1932,7 @@ impl Server {
             PasswordChange::Keep => {}
             PasswordChange::Clear => s.password_hash = None,
             PasswordChange::Set(p) if p.is_empty() => s.password_hash = None,
-            PasswordChange::Set(p) => s.password_hash = Some(hash_password(&p)),
+            PasswordChange::Set(p) => s.password_hash = Some(self.pw_hash(&p)),
         }
         db(self.store.save_settings(&st.settings))?;
         st.broadcast(S2C::ServerUpdated(st.server_info(self)));
@@ -2008,6 +2249,12 @@ fn find_channel_by_path(st: &State, path: &str) -> Option<ChannelId> {
 fn new_privilege_key() -> String {
     let b: [u8; 24] = crate::secrets::random_bytes();
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// Constant-time comparison of two secrets.
+fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 pub fn truncate(s: &str, max: usize) -> String {

@@ -17,12 +17,74 @@ use voxa_proto::*;
 
 use crate::state::{Out, Server};
 
+/// Open TCP connections at most (every client uses two).
+const MAX_CONNECTIONS: usize = 4096;
+/// Open TCP connections per remote address (the local machine is not limited). Every
+/// client uses two, and several people can share one address behind a router.
+const MAX_PER_IP: u32 = 64;
+/// Largest first message (Hello / AttachBulk) before a client is logged in.
+const MAX_FIRST_MESSAGE: usize = 64 * 1024;
+/// Largest message on a logged-in control connection (chat text is at most 8000
+/// characters; files and images go over the bulk connection).
+const MAX_CONTROL_MESSAGE: usize = 1024 * 1024;
+/// Undecodable messages in a row before a control connection is dropped.
+const MAX_BAD_MESSAGES: u32 = 20;
+
+/// Counts open connections per address; a slot is freed when its guard is dropped.
+#[derive(Default)]
+struct PerIp(parking_lot::Mutex<HashMap<std::net::IpAddr, u32>>);
+
+struct IpSlot(Arc<PerIp>, std::net::IpAddr);
+
+impl PerIp {
+    fn take(self: &Arc<Self>, ip: std::net::IpAddr) -> Option<IpSlot> {
+        if ip.is_loopback() {
+            return Some(IpSlot(self.clone(), ip));
+        }
+        let mut m = self.0.lock();
+        let n = m.entry(ip).or_insert(0);
+        if *n >= MAX_PER_IP {
+            return None;
+        }
+        *n += 1;
+        Some(IpSlot(self.clone(), ip))
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        if self.1.is_loopback() {
+            return;
+        }
+        let mut m = (self.0).0.lock();
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
+}
+
 pub async fn run(server: Arc<Server>, listener: TcpListener) {
+    let total = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let per_ip = Arc::new(PerIp::default());
+    let mut last_warn: Option<std::time::Instant> = None;
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
+                let ip = addr.ip().to_canonical();
+                let (Ok(permit), Some(slot)) = (total.clone().try_acquire_owned(), per_ip.take(ip)) else {
+                    // Dropping the stream closes it at once.
+                    if last_warn.map(|t| t.elapsed() > Duration::from_secs(60)).unwrap_or(true) {
+                        tracing::warn!("too many connections (from {ip}); refusing new ones");
+                        last_warn = Some(std::time::Instant::now());
+                    }
+                    continue;
+                };
                 let server = server.clone();
                 tokio::spawn(async move {
+                    let _held = (permit, slot);
                     if let Err(e) = handle(server, stream, addr).await {
                         debug!("connection {addr} ended: {e:#}");
                     }
@@ -43,11 +105,27 @@ async fn handle(server: Arc<Server>, stream: TcpStream, addr: SocketAddr) -> any
     let uid = uid_from_public(&sec.remote_static);
     let mut reader = sec.reader;
     let mut writer = sec.writer;
-    let first: C2S = timeout(Duration::from_secs(15), reader.recv()).await??;
+    reader.set_max_message(MAX_FIRST_MESSAGE);
+    let first: C2S = timeout(Duration::from_secs(10), reader.recv()).await??;
     TRAFFIC.received(Cat::Chat, reader.last_size);
     match first {
-        C2S::AttachBulk(token) => bulk(server, reader, writer, token).await,
-        hello @ C2S::Hello { .. } => control(server, reader, writer, uid, addr, hello).await,
+        C2S::AttachBulk(token) => {
+            reader.set_max_message(transport::MAX_MESSAGE);
+            bulk(server, reader, writer, uid, token).await
+        }
+        C2S::Hello { ref server_password, ref default_channel, ref default_channel_password, .. } => {
+            // Password checks are slow on purpose; they run before the state is locked.
+            let checked = server
+                .check_login_passwords(addr.ip(), server_password.as_deref(), default_channel.as_deref(), default_channel_password.as_deref())
+                .await;
+            if let Err(e) = checked {
+                info!("refused connection from {addr}: {e}");
+                writer.send(&S2C::Refused(e)).await?;
+                return Ok(());
+            }
+            reader.set_max_message(MAX_CONTROL_MESSAGE);
+            control(server, reader, writer, uid, addr, first).await
+        }
         _ => {
             writer.send(&S2C::Refused("Expected hello".into())).await?;
             Ok(())
@@ -86,11 +164,25 @@ async fn control(
             }
         }
     });
+    let mut bad = 0u32;
     let reason = loop {
         tokio::select! {
             r = timeout(Duration::from_secs(45), reader.recv::<C2S>()) => match r.inspect(|m| if m.is_ok() { TRAFFIC.received(Cat::Chat, reader.last_size) }) {
                 Ok(Ok(C2S::Disconnect(msg))) => break LeaveReason::Disconnected(state_trunc(&msg)),
-                Ok(Ok(msg)) => server.handle(id, msg),
+                Ok(Ok(msg)) => {
+                    bad = 0;
+                    // Password checks are slow on purpose; they run before the state is locked.
+                    if let Err(e) = server.prepare(id, &msg).await {
+                        server.state.lock().send(id, S2C::Error(e));
+                        continue;
+                    }
+                    server.handle(id, msg)
+                }
+                // A message this server does not know (e.g. from a newer client) is skipped.
+                Ok(Err(transport::TransportError::Codec(e))) if bad < MAX_BAD_MESSAGES => {
+                    bad += 1;
+                    debug!("client {id}: skipped an unreadable message: {e}");
+                }
                 Ok(Err(_)) => break LeaveReason::Disconnected("Connection lost".into()),
                 Err(_) => break LeaveReason::TimedOut,
             },
@@ -116,10 +208,11 @@ async fn bulk(
     server: Arc<Server>,
     mut reader: SecureReader<OwnedReadHalf>,
     mut writer: SecureWriter<OwnedWriteHalf>,
+    uid: String,
     token: [u8; 32],
 ) -> anyhow::Result<()> {
     let (btx, mut brx) = mpsc::channel::<BulkS2C>(48);
-    let Some(id) = server.attach_bulk(&token, btx.clone()) else {
+    let Some(id) = server.attach_bulk(&token, &uid, btx.clone()) else {
         return Ok(());
     };
     writer.send(&BulkS2C::Attached).await?;
@@ -269,7 +362,7 @@ async fn bulk(
     for (_, h) in downloads {
         h.abort();
     }
-    server.detach_bulk(id);
+    server.detach_bulk(id, &btx);
     Ok(())
 }
 

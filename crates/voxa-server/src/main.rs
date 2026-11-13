@@ -1,5 +1,7 @@
 //! Voxa Server - free and open source voice, chat and screen sharing server.
 
+#[cfg(windows)]
+mod acl;
 mod config;
 mod files;
 mod net;
@@ -186,6 +188,12 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
     let store = store::Store::open(&data_dir.join("voxa.db"), &master)?;
     let server = Arc::new(Server::new(cfg.clone(), data_dir.clone(), store, identity)?);
     info!("server identity fingerprint: {}", server.fingerprint);
+    // As the Windows service (SYSTEM) the data folder must not be writable by users.
+    #[cfg(windows)]
+    if !console {
+        let dir = data_dir.clone();
+        let _ = tokio::task::spawn_blocking(move || acl::lock_down(&dir)).await;
+    }
 
     let bind = format!("{}:{}", cfg.bind, cfg.port);
     let tcp = tokio::net::TcpListener::bind(&bind).await?;
