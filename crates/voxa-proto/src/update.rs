@@ -112,6 +112,53 @@ pub fn release_notes(repo: &str, version: &str) -> Result<(String, String, Strin
     ))
 }
 
+/// One published release, for the change log history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReleaseNote {
+    /// Without the leading "v".
+    pub version: String,
+    pub title: String,
+    pub notes: String,
+    pub url: String,
+    /// "2026-11-13" (empty if unknown).
+    pub date: String,
+}
+
+/// The newest `limit` published releases (no drafts / pre-releases), newest first.
+pub fn release_history(repo: &str, limit: usize) -> Result<Vec<ReleaseNote>, String> {
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page={}", limit.clamp(1, 100));
+    let mut resp = agent()
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .call()
+        .map_err(|e| format!("Could not reach GitHub: {e}"))?;
+    let text = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut out: Vec<ReleaseNote> = json
+        .as_array()
+        .ok_or("Unexpected answer from GitHub")?
+        .iter()
+        .filter(|r| !r["draft"].as_bool().unwrap_or(false) && !r["prerelease"].as_bool().unwrap_or(false))
+        .filter_map(|r| {
+            let tag = r["tag_name"].as_str()?;
+            let version = tag.trim_start_matches(['v', 'V']).to_string();
+            Some(ReleaseNote {
+                title: r["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(tag).to_string(),
+                notes: r["body"].as_str().unwrap_or_default().to_string(),
+                url: r["html_url"].as_str().unwrap_or_default().to_string(),
+                date: r["published_at"].as_str().unwrap_or_default().chars().take(10).collect(),
+                version,
+            })
+        })
+        .collect();
+    // Newest version first (by number, not by publishing time).
+    out.sort_by(|a, b| {
+        let (x, y) = (parse_version(&a.version), parse_version(&b.version));
+        y.cmp(&x)
+    });
+    Ok(out)
+}
+
 /// Downloads the release installer, reporting `(downloaded, total)` bytes.
 pub fn download(rel: &Release, progress: impl Fn(u64, u64)) -> Result<PathBuf, String> {
     if !rel.asset_url.starts_with("https://") {
