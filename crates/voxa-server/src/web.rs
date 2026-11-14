@@ -175,6 +175,7 @@ async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: 
         ("GET", "/api/prefs") => prefs(&server, &web, &mut s, &req).await,
         ("POST", "/api/prefs") if req.sent_by_page() => save_prefs(&server, &web, &mut s, &req).await,
         ("GET", "/api/avatar") => avatar(&server, &web, &mut s, &req).await,
+        ("GET", "/api/stats") => stats(&server, &web, &mut s, &req).await,
         ("POST", "/api/logout") if req.sent_by_page() => logout(&server, &web, &mut s, &req, secure).await,
         ("GET", "/api/events") => events(&server, &web, &mut s, &req, ip).await,
         ("POST", "/api/send") if req.sent_by_page() => send(&server, &web, &mut s, &req).await,
@@ -586,6 +587,31 @@ async fn save_prefs(server: &Server, web: &Web, s: &mut TcpStream, req: &Request
     }
     let _ = server.store.save_web_prefs(&j.uid, &p);
     respond(s, "204 No Content", "text/plain", &[], b"").await
+}
+
+/// The server's statistics (traffic since it started), for administrators.
+async fn stats(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+    let allowed = live_client(web, req)
+        .map(|id| {
+            let st = server.state.lock();
+            st.sessions.get(&id).map(|x| st.server_perms(x) & perm::SERVER_EDIT != 0).unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if !allowed {
+        return json(s, "403 Forbidden", &[], &serde_json::json!({ "error": "Only administrators can see the server statistics" })).await;
+    }
+    let (online, channels) = {
+        let st = server.state.lock();
+        (st.sessions.len(), st.channels.len())
+    };
+    let body = serde_json::json!({
+        "traffic": voxa_proto::traffic::TRAFFIC.snapshot(),
+        "online": online,
+        "channels": channels,
+        "started": server.started,
+        "version": APP_VERSION,
+    });
+    json(s, "200 OK", &[], &body).await
 }
 
 /// Someone's avatar picture (signed-in pages only).

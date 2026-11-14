@@ -539,6 +539,38 @@ mod avatar_tests {
     }
 }
 
+/// Server-wide options (servers 1.16.0+).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerOptions {
+    /// Minutes without input before people are set away automatically (0 = never).
+    pub auto_away_minutes: u32,
+}
+
+/// Longest auto-away time an administrator can choose.
+pub const MAX_AUTO_AWAY_MINUTES: u32 = 30;
+pub const DEFAULT_AUTO_AWAY_MINUTES: u32 = 10;
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        ServerOptions { auto_away_minutes: DEFAULT_AUTO_AWAY_MINUTES }
+    }
+}
+
+/// A hardware token for hardware bans: a hash of one machine identifier (a network
+/// adapter's MAC address or the Windows machine id) and the server's fingerprint. The
+/// identifier itself is never sent, and tokens differ per server, so servers cannot
+/// follow a PC from one server to another.
+pub fn hardware_token(server_fingerprint: &str, id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::new().chain_update(b"voxa-hw-v1\0").chain_update(server_fingerprint.as_bytes()).chain_update([0]).chain_update(id.as_bytes()).finalize();
+    h[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A token as a server accepts it: 32 lowercase hex characters.
+pub fn valid_hardware_token(t: &str) -> bool {
+    t.len() == 32 && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// A direct message delivered after the recipient came online.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct OfflineMessage {

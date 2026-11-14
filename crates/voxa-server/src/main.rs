@@ -264,6 +264,14 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
     }
     tokio::spawn(voice::run(server.clone(), udp));
     tokio::spawn(web::start(server.clone()));
+    let hw = server.clone();
+    tokio::spawn(async move {
+        let mut t = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            t.tick().await;
+            hw.enforce_hardware();
+        }
+    });
     let purge = server.clone();
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(3600));

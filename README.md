@@ -99,7 +99,14 @@ left).
     and privilege keys;
   * read and write server and channel chat (with history, pins and images), edit your
     own messages, and send direct messages, including to people who are offline;
-  * see everyone's avatars, and remove an offensive avatar picture.
+  * see everyone's avatars, and remove an offensive avatar picture;
+  * ban by unique ID, IP address and / or hardware;
+  * **server statistics** for administrators: traffic since the server started (voice,
+    file transfers, screen sharing, chat), refreshed every few seconds. They use the
+    same live connection as the rest of the page, so no WebSocket setting is needed in
+    the reverse proxy.
+* **Auto away** after the server's idle time without input on the page, and join /
+  leave sounds (🔔 / 🔕 at the bottom left).
 * **How it appears:** a signed-in page is an ordinary session of that identity, shown
   with a **WEB** badge and no voice. It can run alongside the same identity's desktop
   client without replacing it.
@@ -180,6 +187,19 @@ their update window by themselves. To allow older clients, set
     Normal and Server Admin groups; existing servers get it added to Normal when they
     update). Nobody can edit someone else's message, and images can't be edited. Edited
     messages are marked "(edited)" for everyone.
+* **Auto away:** people are set *Away (idle)* after a number of minutes without input
+  (10 by default). Admins change it under **Edit Virtual Server ▸ Auto away after**:
+  0 turns it off, at most 30. Each person can also turn it off for themselves.
+* **Hardware bans:** ban someone by **unique ID**, **IP address** and / or **hardware**
+  (any combination). A hardware ban turns away any identity from that PC.
+  * Voxa 1.21.0 reports scrambled hardware tokens right after connecting: hashes of its
+    network adapters' MAC addresses and the Windows machine ID, mixed with this server's
+    fingerprint. The server never sees the addresses themselves, and the tokens mean
+    nothing on other servers. One matching token is enough, so a new network card does
+    not get around a ban.
+  * A client that doesn't report within 20 seconds is disconnected.
+  * Limits: the web admin page has no hardware to check, and a determined person can fake
+    hardware identifiers. Combine hardware with the unique ID / IP address for best effect.
 * **Avatars:** people can pick a colour for their initials or upload a picture (Voxa
   1.20.0). Pictures are checked: PNG or JPEG, at most 96 KB and 16–256 pixels per side.
   Moderators with *Edit client descriptions* can remove a picture, and the same picture
@@ -228,6 +248,10 @@ their update window by themselves. To allow older clients, set
   * bounded queues;
   * the upload quota cannot be bypassed by uploading in parallel.
 * **Voice addresses:** voice is only sent to the address a client is connected from.
+* **Hardware tokens:** only valid tokens count; a client that sends none (or junk) is
+  disconnected; tokens are bound to the server's verified fingerprint, so another server
+  posing as this one cannot obtain matching tokens. Administrators cannot be locked out by
+  a hardware ban (like address bans).
 * **Web admin page:**
   * Sign-in by proof of identity (the key stays in the browser or in Voxa), bound to the
     page's web address so phishing sites can't reuse it; optionally pinned to the
@@ -240,6 +264,7 @@ their update window by themselves. To allow older clients, set
   * A strict Content Security Policy (no inline or third-party scripts), no framing, and
     all user text is shown as text, never as HTML.
   * Every action goes through the same permission checks as the desktop client.
+  * Server statistics are only given to administrators (*Edit virtual server*).
 * **Text:** names, topics and messages are cleaned of control characters and invisible
   direction-changing characters.
 

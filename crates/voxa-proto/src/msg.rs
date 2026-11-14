@@ -107,6 +107,15 @@ pub enum C2S {
     GetAvatar(String),
     /// Removes someone's picture, e.g. an offensive one (requires "Edit client descriptions").
     ClearAvatar(String),
+
+    // --- added in 1.16.0; only sent to servers that are 1.16.0 or newer ---
+    /// Server-wide options such as auto-away (requires "Edit virtual server").
+    SetServerOptions(ServerOptions),
+    /// This PC's hardware tokens, sent right after Welcome (see `hardware_token`). Used
+    /// for hardware bans; the raw MAC addresses / machine id never leave the PC.
+    Hardware(Vec<String>),
+    /// Bans someone who is online by any combination of identity, address and hardware.
+    BanWith { target: ClientId, uid: bool, ip: bool, hardware: bool, duration_secs: Option<u64>, reason: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -202,6 +211,12 @@ pub enum S2C {
     AvatarInfo(Vec<AvatarMeta>),
     /// A picture asked for with `GetAvatar`.
     AvatarImage { uid: String, image: u64, data: Vec<u8> },
+
+    // --- added in 1.16.0; only sent to clients that are 1.21.0 or newer ---
+    /// Server-wide options (after Welcome and when they change).
+    ServerOptions(ServerOptions),
+    /// Which bans of the `BanList` just sent also ban hardware.
+    BannedHardware(Vec<u64>),
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file

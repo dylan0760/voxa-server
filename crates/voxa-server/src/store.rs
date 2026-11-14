@@ -35,6 +35,8 @@ const EDITS: TableDefinition<(u64, u64), u64> = TableDefinition::new("chat_edits
 const AVATARS: TableDefinition<&str, &[u8]> = TableDefinition::new("avatars");
 /// Web admin page settings per identity (1.15.0+): uid -> WebPrefs.
 const WEB_PREFS: TableDefinition<&str, &[u8]> = TableDefinition::new("web_prefs");
+/// Hardware tokens banned along with a ban (1.16.0+): ban id -> Vec<String>.
+const HW_BANS: TableDefinition<u64, &[u8]> = TableDefinition::new("hardware_bans");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StoredSettings {
@@ -161,6 +163,7 @@ impl Store {
             w.open_table(EDITS)?;
             w.open_table(AVATARS)?;
             w.open_table(WEB_PREFS)?;
+            w.open_table(HW_BANS)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -531,7 +534,40 @@ impl Store {
     }
 
     pub fn remove_ban(&self, id: u64) -> R<()> {
+        self.del_u64(HW_BANS, id)?;
         self.del_u64(BANS, id)
+    }
+
+    /// Bans these hardware tokens as part of ban `id`.
+    pub fn add_hardware_ban(&self, id: u64, tokens: &[String]) -> R<()> {
+        self.put_u64(HW_BANS, id, &tokens.to_vec())
+    }
+
+    /// Hardware tokens of every ban: (ban id, tokens).
+    pub fn hardware_bans(&self) -> R<Vec<(u64, Vec<String>)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(HW_BANS)?;
+        let mut out = Vec::new();
+        for row in t.iter()? {
+            let (k, v) = row?;
+            if let Some(tokens) = dec::<Vec<String>>(v.value()) {
+                out.push((k.value(), tokens));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn server_options(&self) -> R<Option<ServerOptions>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(META)?;
+        Ok(t.get("server_options")?.and_then(|v| dec(v.value())))
+    }
+
+    pub fn save_server_options(&self, o: &ServerOptions) -> R<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(META)?.insert("server_options", enc(o).as_slice())?;
+        w.commit()?;
+        Ok(())
     }
 
     // ---------- privilege keys ----------

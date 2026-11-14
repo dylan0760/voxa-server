@@ -44,6 +44,7 @@
     if (h > 0) return h + 'h ' + m + 'm';
     return m + 'm ' + (secs % 60) + 's';
   }
+  const awayText = (a) => (!a ? 'Away' : /^away\b/i.test(a) ? a : 'Away: ' + a);
   function initials(name) {
     const w = (name || '?').trim().split(/\s+/).filter(Boolean);
     return ((w[0] || '?')[0] + (w.length > 1 ? w[1][0] : (w[0] || '').slice(1, 2))).toUpperCase();
@@ -554,9 +555,17 @@
       case 'ClientJoined':
         S.clients.set(v.id, v);
         if (v.id !== S.me) pushEvent('server', v.nickname + ' connected' + (v.platform === 'Web' ? ' (web)' : ''), 'good');
+        if (v.id !== S.me && v.channel === myChannel()) tones(JOIN_TONES);
+        break;
+      case 'ServerOptions':
+        S.options = v;
+        break;
+      case 'BannedHardware':
+        S.hwBans = new Set(v);
         break;
       case 'ClientLeft': {
         const c = S.clients.get(v.id);
+        if (c && v.id !== S.me && c.channel === myChannel()) tones(LEAVE_TONES);
         if (c) pushEvent('server', c.nickname + ' ' + leaveText(v.reason), v.reason.Kicked || v.reason.Banned ? 'bad' : '');
         S.clients.delete(v.id);
         if (S.selected.kind === 'client' && S.selected.id === v.id) S.selected = { kind: 'server' };
@@ -572,6 +581,7 @@
             if (S.tab === 'channel') activateTab('channel');
             if (v.by) toast('You were moved by ' + v.by);
           } else if (was === myChannel() || v.channel === myChannel()) {
+            tones(v.channel === myChannel() ? JOIN_TONES : LEAVE_TONES);
             const ch = S.channels.get(v.channel);
             pushEvent('ch:' + myChannel(), c.nickname + (v.channel === myChannel() ? ' joined the channel' : ' went to ' + (ch ? ch.name : 'another channel')) + (v.by ? ' (moved by ' + v.by + ')' : ''));
           }
@@ -682,16 +692,71 @@
     schedule();
   }
 
+  // ---------------------------------------------------------------- sounds
+  // Like the client: a rising pair when someone joins your channel, falling when they leave.
+  const JOIN_TONES = [[523, 70], [784, 90]];
+  const LEAVE_TONES = [[784, 70], [523, 90]];
+  let audio = null;
+  function tones(list) {
+    if (localStorage.getItem('voxa-web-sounds') === 'off') return;
+    try {
+      audio = audio || new AudioContext();
+      let t = audio.currentTime + 0.01;
+      for (const [f, ms] of list) {
+        const o = audio.createOscillator(), g = audio.createGain();
+        o.type = 'sine';
+        o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.12, t + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + ms / 1000);
+        o.connect(g).connect(audio.destination);
+        o.start(t);
+        o.stop(t + ms / 1000 + 0.02);
+        t += ms / 1000;
+      }
+    } catch (_) { /* no audio */ }
+  }
+
+  // ---------------------------------------------------------------- auto away
+  // After the server's idle time without any input on the page you are set away, and
+  // back when you return (only if Voxa set it).
+  const AUTO_AWAY = 'Away (idle)';
+  let lastInput = Date.now();
+  for (const ev of ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart']) {
+    document.addEventListener(ev, () => {
+      lastInput = Date.now();
+      const me = S.clients.get(S.me);
+      if (S.autoAway && me && me.away === AUTO_AWAY) send({ UpdateSelf: { away: null } });
+      S.autoAway = false;
+    }, { passive: true, capture: true });
+  }
+  setInterval(() => {
+    const me = S.clients.get(S.me);
+    const minutes = S.options ? S.options.auto_away_minutes : 0;
+    if (!S.connected || !me || !minutes || me.away != null || S.autoAway) return;
+    if (Date.now() - lastInput >= minutes * 60000) {
+      S.autoAway = true;
+      send({ UpdateSelf: { away: AUTO_AWAY } });
+    }
+  }, 15000);
+
   // ---------------------------------------------------------------- rendering
   let pending = false;
   function schedule() {
     if (pending) return;
     pending = true;
-    requestAnimationFrame(() => {
+    // Normally on the next animation frame; hidden or covered windows get none, so a
+    // timer makes sure the page still keeps up (whichever comes first).
+    let done = false;
+    const run = () => {
+      if (done) return;
+      done = true;
       pending = false;
       if (!S.connected || !$('.app')) return;
       render();
-    });
+    };
+    requestAnimationFrame(run);
+    setTimeout(run, document.hidden ? 500 : 100);
   }
 
   let R = {}; // persistent elements of the layout
@@ -743,6 +808,7 @@
       el('div', { class: 'srv', title: name, onclick: () => { S.selected = { kind: 'server' }; S.right = 'info'; S.showRight = true; schedule(); } }, initials(name)),
       el('div', { class: 'sep' }),
       el('div', { class: 'grow' }),
+      el('button', { class: 'icon-btn', title: 'Join / leave sounds (click to turn ' + (localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off') + ')', onclick: () => { localStorage.setItem('voxa-web-sounds', localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off'); schedule(); } }, localStorage.getItem('voxa-web-sounds') === 'off' ? '🔕' : '🔔'),
       el('button', { class: 'icon-btn', title: 'Theme', onclick: (e) => themeMenu(e.clientX + 10, e.clientY - 250) }, '🎨'),
       el('button', { class: 'icon-btn', title: 'Sign out', onclick: () => confirmDialog('Sign out', 'Sign out of the web admin page?', 'Sign out').then((ok) => ok && signOut()) }, '⏻'));
   }
@@ -759,7 +825,7 @@
     const away = me.away != null;
     put(R.meCard, 
       avatar(me.nickname, me.uid, 36, away ? 'var(--yellow)' : 'var(--green)'),
-      el('div', { class: 'who' }, el('div', { class: 'n' }, me.nickname), el('div', { class: 'small', style: 'color:' + (away ? 'var(--yellow)' : 'var(--green)') }, away ? 'Away' + (me.away ? ': ' + me.away : '') : 'Online')),
+      el('div', { class: 'who' }, el('div', { class: 'n' }, me.nickname), el('div', { class: 'small', style: 'color:' + (away ? 'var(--yellow)' : 'var(--green)') }, away ? awayText(me.away) : 'Online')),
       el('button', { class: 'icon-btn' + (away ? ' on' : ''), title: away ? 'Set online' : 'Set away', onclick: toggleAway }, '🌙'),
       el('button', { class: 'icon-btn', title: 'Change nickname', onclick: changeNickname }, '✏️'));
   }
@@ -1137,8 +1203,36 @@
       kv([['Fingerprint', s.fingerprint, true], ['Password', s.has_password ? 'Yes' : 'No'], ['Chat history', s.chat_retention_days ? 'Encrypted on server, kept ' + s.chat_retention_days + ' days' : 'Encrypted on server'], ['Voice', 'Encrypted']]),
       s.welcome_message ? [el('div', { class: 'section' }, 'Welcome message'), el('div', { class: 'desc' }, s.welcome_message)] : null,
       s.host_message ? [el('div', { class: 'section' }, 'Host message'), el('div', { class: 'desc' }, s.host_message)] : null,
+      can(P.SERVER_EDIT) ? statsView() : null,
       can(P.SERVER_EDIT) ? el('div', { class: 'actions-row' }, el('button', { class: 'btn', onclick: editServer }, '⚙ Edit server')) : null,
     ].flat().filter(Boolean);
+  }
+
+  // Server statistics (administrators): traffic since the server started, refreshed every 5 s.
+  let stats = null, statsAt = 0;
+  function fmtSize(n) {
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i ? n.toFixed(1) : String(n)) + ' ' + u[i];
+  }
+  function statsView() {
+    if (Date.now() - statsAt > 5000) {
+      statsAt = Date.now();
+      fetch('/api/stats', { credentials: 'same-origin', cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).then((j) => { if (j) { stats = j; schedule(); } }).catch(() => {});
+    }
+    if (!stats) return null;
+    const t = stats.traffic;
+    const row = (k, a, b) => [el('div', { class: 'k' }, k), el('div', { class: 'v' }, fmtSize(a)), el('div', { class: 'v' }, fmtSize(b))];
+    const totalIn = t.voice_in + t.files_in + t.screen_in + t.chat_in, totalOut = t.voice_out + t.files_out + t.screen_out + t.chat_out;
+    return [
+      el('div', { class: 'section' }, 'Traffic since the server started'),
+      el('div', { class: 'stats' },
+        el('div'), el('div', { class: 'k' }, '⬇ Received'), el('div', { class: 'k' }, '⬆ Sent'),
+        row('Voice', t.voice_in, t.voice_out), row('File transfers', t.files_in, t.files_out), row('Screen sharing', t.screen_in, t.screen_out), row('Chat & other', t.chat_in, t.chat_out),
+        [el('div', { class: 'k strong' }, 'Total'), el('div', { class: 'v strong' }, fmtSize(totalIn)), el('div', { class: 'v strong' }, fmtSize(totalOut))]),
+      el('div', { class: 'dim small' }, 'All traffic combined: ' + fmtSize(totalIn + totalOut)),
+    ];
   }
 
   function channelInfo(ch) {
@@ -1173,7 +1267,7 @@
     const away = c.away != null;
     return [
       el('div', { class: 'info-hero' }, avatar(c.nickname, c.uid, 52, away ? 'var(--yellow)' : 'var(--green)'),
-        el('div', null, el('div', { class: 'n' }, c.nickname), el('div', { class: 'small', style: 'color:' + (away ? 'var(--yellow)' : 'var(--green)') }, away ? 'Away' + (c.away ? ': ' + c.away : '') : 'Online'))),
+        el('div', null, el('div', { class: 'n' }, c.nickname), el('div', { class: 'small', style: 'color:' + (away ? 'var(--yellow)' : 'var(--green)') }, away ? awayText(c.away) : 'Online'))),
       el('div', { class: 'section' }, 'Client'),
       kv([
         ['Channel', ch ? ch.name : ''],
@@ -1421,9 +1515,20 @@
   function banClient(c) {
     const dur = durationSelect();
     const reason = el('input', { type: 'text', maxlength: '80' });
-    dialog('Ban ' + c.nickname, el('div', { class: 'form' }, field('Duration', dur), field('Reason', reason), el('div', { class: 'note' }, 'Bans this identity and its current address.')), [
+    const check = (label, on, note, disabled) => { const i = el('input', { type: 'checkbox', checked: on && !disabled, disabled }); return [i, el('label', { style: 'display:flex;gap:6px;color:var(--text)' + (disabled ? ';opacity:.5' : ''), title: note }, i, label)]; };
+    const [byUid, uidRow] = check('Unique ID (this identity)', true, '');
+    const [byIp, ipRow] = check('IP address (' + 'their current address)', true, '');
+    const noHw = c.platform === 'Web';
+    const [byHw, hwRow] = check('Hardware (this PC: network adapters and Windows machine ID)', false, '', noHw);
+    dialog('Ban ' + c.nickname, el('div', { class: 'form' },
+      field('Ban by', el('div', { style: 'display:flex;flex-direction:column;gap:4px' }, uidRow, ipRow, hwRow)),
+      noHw ? el('div', { class: 'note' }, 'The web page has no hardware to ban.') : el('div', { class: 'note' }, 'Hardware bans stop new identities from the same PC.'),
+      field('Duration', dur), field('Reason', reason)), [
       { label: 'Cancel' },
-      { label: 'Ban', danger: true, onClick: () => send({ Ban: { target: { Client: c.id }, duration_secs: Number(dur.value) || null, reason: reason.value } }) },
+      { label: 'Ban', danger: true, onClick: () => {
+        if (!byUid.checked && !byIp.checked && !byHw.checked) { toast('Choose at least one thing to ban', 'warn'); return false; }
+        send({ BanWith: { target: c.id, uid: byUid.checked, ip: byIp.checked, hardware: byHw.checked, duration_secs: Number(dur.value) || null, reason: reason.value } });
+      } },
     ]);
   }
   function moveClientDialog(c) {
@@ -1552,6 +1657,7 @@
     const dcg = groupSelect('Channel', s.default_channel_group);
     const cag = groupSelect('Channel', s.channel_admin_group);
     const retention = el('input', { type: 'number', min: '0', value: String(s.chat_retention_days) });
+    const away = el('input', { type: 'number', min: '0', max: '30', value: String(S.options ? S.options.auto_away_minutes : 10) });
     const upload = el('input', { type: 'number', min: '0', placeholder: 'loading…' });
     const quota = el('input', { type: 'number', min: '0', placeholder: 'loading…' });
     let limits = null;
@@ -1567,6 +1673,7 @@
       field('Default channel group', dcg),
       field('Channel admin group', cag),
       field('Keep chat history', retention, 'Days; 0 keeps messages forever.'),
+      field('Auto away after', away, 'Minutes without input before people are set away (0 = never, at most 30).'),
       el('div', { class: 'section full' }, 'File browser'),
       field('Largest upload (MB)', upload, '0 = unlimited'),
       field('Storage per channel (MB)', quota, '0 = unlimited')), [
@@ -1579,6 +1686,8 @@
           default_server_group: Number(dsg.value), default_channel_group: Number(dcg.value), channel_admin_group: Number(cag.value),
           chat_retention_days: Math.max(0, Number(retention.value) || 0),
         } });
+        const mins = Math.min(30, Math.max(0, Math.round(Number(away.value) || 0)));
+        if (!S.options || mins !== S.options.auto_away_minutes) send({ SetServerOptions: { auto_away_minutes: mins } });
         if (limits && upload.value !== '' && quota.value !== '') {
           const nl = { max_upload_mb: Math.max(0, Number(upload.value) || 0), channel_quota_mb: Math.max(0, Number(quota.value) || 0) };
           if (nl.max_upload_mb !== limits.max_upload_mb || nl.channel_quota_mb !== limits.channel_quota_mb) send({ SetFileLimits: nl });
@@ -1645,11 +1754,14 @@
 
   function banListDialog() {
     const table = el('div', null, el('span', { class: 'dim' }, 'Loading…'));
+    let last = [];
+    S.wait.BannedHardware = () => S.wait.BanList(last);
     S.wait.BanList = (bans) => {
+      last = bans;
       put(table, bans.length ? el('table', { class: 'grid' },
         el('tr', null, ['Banned', 'Reason', 'By', 'Since', 'Expires', ''].map((h) => el('th', null, h))),
         bans.map((b) => el('tr', null,
-          el('td', null, b.name || '', b.uid ? el('div', { class: 'dim small', style: 'font-family:Consolas,monospace' }, b.uid) : null, b.ip ? el('div', { class: 'dim small' }, b.ip) : null),
+          el('td', null, b.name || '', b.uid ? el('div', { class: 'dim small', style: 'font-family:Consolas,monospace' }, b.uid) : null, b.ip ? el('div', { class: 'dim small' }, b.ip) : null, S.hwBans && S.hwBans.has(b.id) ? el('div', { class: 'dim small' }, '🖥 hardware') : null),
           el('td', null, b.reason), el('td', null, b.by), el('td', null, fmtDate(b.created)),
           el('td', null, b.expires ? fmtDate(b.expires) : 'never'),
           el('td', null, el('button', { class: 'btn small', onclick: () => { send({ Unban: b.id }); setTimeout(() => send('BanList'), 300); } }, 'Unban'))))) : el('span', { class: 'dim' }, 'Nobody is banned.'));
@@ -1666,7 +1778,7 @@
         value.value = ''; reason.value = '';
         setTimeout(() => send('BanList'), 300);
       } }, 'Add ban'));
-    dialog('Ban list', el('div', null, table, el('div', { class: 'section' }, 'Add a ban'), add), [{ label: 'Close' }], { wide: true, onClose: () => { delete S.wait.BanList; } });
+    dialog('Ban list', el('div', null, table, el('div', { class: 'section' }, 'Add a ban'), add), [{ label: 'Close' }], { wide: true, onClose: () => { delete S.wait.BanList; delete S.wait.BannedHardware; } });
   }
 
   function privilegeKeyDialog() {

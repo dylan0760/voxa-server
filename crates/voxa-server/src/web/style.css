@@ -229,6 +229,9 @@ input[type=range] { accent-color: var(--accent); }
 .kv { display: grid; grid-template-columns: 100px 1fr; gap: 4px 10px; }
 .kv .k { color: var(--dim); }
 .kv .v { word-break: break-word; }
+.stats { display: grid; grid-template-columns: 1fr auto auto; gap: 3px 12px; }
+.stats .k { color: var(--dim); }
+.stats .v { text-align: right; }
 .kv .v.mono { font-family: Consolas, monospace; font-size: 11px; }
 .desc { white-space: pre-wrap; word-wrap: break-word; }
 .person { display: flex; gap: 10px; align-items: center; padding: 5px 6px; border-radius: 6px; cursor: pointer; }

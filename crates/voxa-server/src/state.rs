@@ -65,6 +65,10 @@ pub struct Session {
     /// Signed in through the web admin page (no voice; may run next to the same
     /// identity's desktop client).
     pub web: bool,
+    /// Hardware tokens the client reported (for hardware bans).
+    pub hardware: Vec<String>,
+    /// Voxa 1.21.0+ must report its hardware by then.
+    pub hardware_due: Option<Instant>,
 }
 
 /// Chat messages, images and pokes: bursts of this many, then `CHAT_RATE` per second.
@@ -103,6 +107,8 @@ pub struct State {
     pub sessions: HashMap<ClientId, Session>,
     /// File browser limits (0 = unlimited); editable by admins from the client.
     pub file_limits: FileLimits,
+    /// Server-wide options (auto-away), editable by admins.
+    pub options: ServerOptions,
 }
 
 pub struct Server {
@@ -209,7 +215,7 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.20.0";
+pub const MIN_CLIENT_VERSION: &str = "1.21.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -515,7 +521,8 @@ impl Server {
                 groups,
                 sessions: HashMap::new(),
                 // Values saved from the client win; server.toml only provides the default.
-                file_limits: store.load_file_limits()?.unwrap_or(FileLimits {
+                options: store.server_options()?.unwrap_or_default(),
+            file_limits: store.load_file_limits()?.unwrap_or(FileLimits {
                     max_upload_mb: cfg.max_upload_mb,
                     channel_quota_mb: cfg.channel_quota_mb,
                 }),
@@ -876,6 +883,12 @@ impl Server {
             }
         }
         st.broadcast(S2C::ClientJoined(info.clone()));
+        // Server options and (for Voxa 1.21.0+) a deadline to report the hardware.
+        let new_client = !voxa_proto::update::is_newer("1.21.0", &info.version);
+        if new_client {
+            tx.send(Out::Msg(S2C::ServerOptions(st.options)));
+        }
+        let hardware_due = (new_client && !web).then(|| Instant::now() + std::time::Duration::from_secs(20));
         // Pictures: everyone online for the newcomer, the newcomer's for everyone else.
         if !voxa_proto::update::is_newer("1.20.0", &info.version) {
             let metas = st.sessions.values().map(|s| s.info.uid.as_str()).chain(std::iter::once(uid.as_str())).filter_map(|u| self.avatar_meta(u)).collect::<Vec<_>>();
@@ -907,6 +920,8 @@ impl Server {
                 extra_perms,
                 chat_budget: (CHAT_BURST, Instant::now()),
                 web,
+                hardware: Vec::new(),
+                hardware_due: hardware_due,
             },
         );
         Ok(id)
@@ -1100,14 +1115,12 @@ impl Server {
             C2S::Ban { target, duration_secs, reason } => self.ban(st, me, target, duration_secs, reason, kicks),
             C2S::BanList => {
                 self.need(st.server_perms(st.session(me)?), perm::BAN_LIST)?;
-                st.send(me, S2C::BanList(db(self.store.bans())?));
-                Ok(())
+                self.send_ban_list(st, me)
             }
             C2S::Unban(id) => {
                 self.need(st.server_perms(st.session(me)?), perm::BAN_LIST)?;
                 db(self.store.remove_ban(id))?;
-                st.send(me, S2C::BanList(db(self.store.bans())?));
-                Ok(())
+                self.send_ban_list(st, me)
             }
             C2S::SetTalker { target, talker } => {
                 let s = st.session(me)?;
@@ -1407,6 +1420,21 @@ impl Server {
                 Ok(())
             }
             C2S::ClearAvatar(uid) => self.clear_avatar(st, me, uid),
+            C2S::SetServerOptions(o) => {
+                let s = st.session(me)?;
+                self.need(st.server_perms(s), perm::SERVER_EDIT)?;
+                let o = ServerOptions { auto_away_minutes: o.auto_away_minutes.min(MAX_AUTO_AWAY_MINUTES) };
+                db(self.store.save_server_options(&o))?;
+                info!("{} set auto-away to {} min", s.info.nickname, o.auto_away_minutes);
+                st.options = o;
+                let ids: Vec<ClientId> = st.sessions.keys().copied().collect();
+                for c in ids {
+                    st.send_if_supported(c, "1.21.0", S2C::ServerOptions(o));
+                }
+                Ok(())
+            }
+            C2S::Hardware(tokens) => self.set_hardware(st, me, tokens, kicks),
+            C2S::BanWith { target, uid, ip, hardware, duration_secs, reason } => self.ban_with(st, me, target, [uid, ip, hardware], duration_secs, reason, kicks),
             C2S::GetFileLimits => {
                 st.send(me, S2C::FileLimits(st.file_limits));
                 Ok(())
@@ -2227,6 +2255,117 @@ impl Server {
             let hit = uid.as_deref() == Some(t.info.uid.as_str()) || ip.as_deref() == Some(t.ip.to_string().as_str());
             if hit && t.info.id != me {
                 kicks.push((t.info.id, LeaveReason::Banned { by: by.clone(), reason: reason.clone() }));
+            }
+        }
+        Ok(())
+    }
+
+    fn send_ban_list(&self, st: &State, me: ClientId) -> Res {
+        st.send(me, S2C::BanList(db(self.store.bans())?));
+        let hw: Vec<u64> = db(self.store.hardware_bans())?.into_iter().map(|(id, _)| id).collect();
+        st.send_if_supported(me, "1.21.0", S2C::BannedHardware(hw));
+        Ok(())
+    }
+
+    /// An active ban that includes one of these hardware tokens.
+    fn find_hardware_ban(&self, tokens: &[String]) -> Option<BanEntry> {
+        if tokens.is_empty() {
+            return None;
+        }
+        let now = now_unix();
+        let bans = self.store.bans().ok()?;
+        for (id, banned) in self.store.hardware_bans().ok()? {
+            match bans.iter().find(|b| b.id == id) {
+                Some(b) if b.expires.map(|e| e > now).unwrap_or(true) => {
+                    if banned.iter().any(|t| tokens.contains(t)) {
+                        return Some(b.clone());
+                    }
+                }
+                // The ban is gone or expired: so is its hardware part.
+                _ => {
+                    let _ = self.store.remove_ban(id);
+                }
+            }
+        }
+        None
+    }
+
+    /// The hardware tokens a client reports after connecting; banned hardware is turned away.
+    fn set_hardware(&self, st: &mut State, me: ClientId, tokens: Vec<String>, kicks: &mut Vec<(ClientId, LeaveReason)>) -> Res {
+        let mut tokens: Vec<String> = tokens.into_iter().filter(|t| valid_hardware_token(t)).take(8).collect();
+        tokens.sort();
+        tokens.dedup();
+        // Nothing usable does not count as reporting (the deadline stays).
+        if tokens.is_empty() {
+            return Err("Invalid hardware report".into());
+        }
+        let ban = self.find_hardware_ban(&tokens);
+        let s = st.sessions.get_mut(&me).ok_or("Client not found")?;
+        if !s.hardware.is_empty() {
+            return Ok(()); // reported once per connection
+        }
+        s.hardware = tokens;
+        s.hardware_due = None;
+        let s = st.session(me)?;
+        // Like address bans, administrators cannot be locked out this way.
+        if let Some(b) = ban.filter(|_| st.server_perms(s) & perm::SERVER_EDIT == 0) {
+            info!("turned away {} ({}): banned hardware", s.info.nickname, s.info.uid);
+            kicks.push((me, LeaveReason::Banned { by: b.by, reason: b.reason }));
+        }
+        Ok(())
+    }
+
+    /// Disconnects Voxa 1.21.0+ clients that never reported their hardware (a modified
+    /// client trying to dodge hardware bans).
+    pub fn enforce_hardware(&self) {
+        let late: Vec<ClientId> = {
+            let st = self.state.lock();
+            st.sessions.values().filter(|s| s.hardware_due.map(|d| Instant::now() > d).unwrap_or(false)).map(|s| s.info.id).collect()
+        };
+        for id in late {
+            info!("client {id} did not report its hardware; disconnecting");
+            self.kick_session(id, LeaveReason::Disconnected("Your Voxa did not identify itself. Please update or reinstall Voxa.".into()));
+        }
+    }
+
+    /// Bans someone who is online by their unique ID, IP address and / or hardware.
+    #[allow(clippy::too_many_arguments)]
+    fn ban_with(&self, st: &mut State, me: ClientId, target: ClientId, what: [bool; 3], duration: Option<u64>, reason: String, kicks: &mut Vec<(ClientId, LeaveReason)>) -> Res {
+        let [by_uid, by_ip, by_hw] = what;
+        if !(by_uid || by_ip || by_hw) {
+            return Err("Choose what to ban: the unique ID, the IP address and / or the hardware".into());
+        }
+        let s = st.session(me)?;
+        self.need(st.server_perms(s), perm::CLIENT_BAN)?;
+        let t = st.session(target)?;
+        self.check_outranks(st, s, t)?;
+        if t.info.uid == s.info.uid {
+            return Err("You cannot ban yourself".into());
+        }
+        if by_hw && t.hardware.is_empty() {
+            return Err("This person's hardware is not known (web page or an older Voxa): ban the unique ID or IP address instead".into());
+        }
+        let by = s.info.nickname.clone();
+        let reason = clean_line(&reason, 200);
+        let (uid, ip, hw) = (t.info.uid.clone(), t.ip.to_string(), t.hardware.clone());
+        let entry = db(self.store.add_ban(BanEntry {
+            id: 0,
+            uid: by_uid.then(|| uid.clone()),
+            ip: by_ip.then(|| ip.clone()),
+            name: Some(t.info.nickname.clone()),
+            reason: reason.clone(),
+            created: now_unix(),
+            expires: duration.filter(|d| *d > 0).map(|d| now_unix() + d),
+            by: by.clone(),
+        }))?;
+        if by_hw {
+            db(self.store.add_hardware_ban(entry.id, &hw))?;
+        }
+        info!("{by} banned {} (unique ID: {by_uid}, IP: {by_ip}, hardware: {by_hw})", t.info.nickname);
+        for x in st.sessions.values() {
+            let hit = (by_uid && x.info.uid == uid) || (by_ip && x.ip.to_string() == ip) || (by_hw && x.hardware.iter().any(|h| hw.contains(h)));
+            if hit && x.info.id != me {
+                kicks.push((x.info.id, LeaveReason::Banned { by: by.clone(), reason: reason.clone() }));
             }
         }
         Ok(())
