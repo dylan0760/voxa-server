@@ -4,9 +4,12 @@
 //! * Plain HTTP on `web_bind:web_port`; put a reverse proxy (e.g. Nginx Proxy Manager) in
 //!   front of it for HTTPS. Behind a proxy on the local network the visitor's address is
 //!   taken from `X-Real-IP` / `X-Forwarded-For`.
-//! * Sign-in proves ownership of a Voxa identity without sending it: the page computes an
-//!   X25519 key agreement with a one-time server key and returns an HMAC over the
-//!   challenge. The identity's private key never leaves the browser.
+//! * Sign-in proves ownership of a Voxa identity without sending it: an X25519 key
+//!   agreement with a one-time server key, then an HMAC over the challenge and the page's
+//!   origin. Either the page computes it (the key is pasted and never leaves the browser)
+//!   or the installed Voxa client does (`voxa://web-login` link, after the user agrees),
+//!   handing the proof back to that origin in the user's own browser. Binding the origin
+//!   means a proof obtained by a look-alike site is useless on the real one.
 //! * A signed-in page is an ordinary session of that identity (shown with platform "Web",
 //!   no voice): every action goes through the same handler and permission checks as the
 //!   desktop client. Updates are streamed to the page with Server-Sent Events, actions
@@ -20,7 +23,6 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use parking_lot::Mutex;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
@@ -60,6 +62,9 @@ struct Login {
     uid: String,
     nickname: String,
     server_password: Option<String>,
+    /// Channel path to join (empty = the default channel) and its password.
+    channel: String,
+    channel_password: Option<String>,
     created: Instant,
     /// The live session of the open page, if any: (client id, its close signal).
     client: Option<(ClientId, Arc<Notify>)>,
@@ -75,6 +80,7 @@ struct Web {
 struct Request {
     method: String,
     path: String,
+    query: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -92,6 +98,28 @@ impl Request {
             .filter_map(|p| p.trim().split_once('='))
             .find(|(k, _)| *k == name)
             .map(|(_, v)| v.to_string())
+    }
+
+    /// A query parameter (percent-decoded).
+    fn param(&self, name: &str) -> Option<String> {
+        self.query.split('&').filter_map(|p| p.split_once('=')).find(|(k, _)| *k == name).map(|(_, v)| percent_decode(v))
+    }
+
+    /// The page's origin as the browser sees it (`https://admin.example.com`). Behind a
+    /// reverse proxy on this PC / the local network the forwarded scheme and host count.
+    fn origins(&self, proxied: bool) -> Vec<String> {
+        let scheme = if proxied { self.header("x-forwarded-proto").unwrap_or("http") } else { "http" };
+        let scheme = if scheme.eq_ignore_ascii_case("https") { "https" } else { "http" };
+        let mut hosts = Vec::new();
+        if proxied {
+            if let Some(h) = self.header("x-forwarded-host") {
+                hosts.push(h.split(',').next().unwrap_or(h).trim());
+            }
+        }
+        if let Some(h) = self.header("host") {
+            hosts.push(h);
+        }
+        hosts.into_iter().filter(|h| !h.is_empty()).map(|h| format!("{scheme}://{}", h.to_ascii_lowercase())).collect()
     }
 
     /// Requests from the page itself carry this header; other sites cannot add it
@@ -129,6 +157,7 @@ async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: 
         return respond(&mut s, "400 Bad Request", "text/plain", &[], b"Bad request").await;
     };
     let ip = client_ip(peer, &req);
+    let proxied = from_local_proxy(peer);
     let secure = req.header("x-forwarded-proto").map(|p| p.eq_ignore_ascii_case("https")).unwrap_or(false);
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => static_file(&mut s, "text/html; charset=utf-8", INDEX).await,
@@ -138,10 +167,14 @@ async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: 
         ("GET", "/icon.svg") | ("GET", "/favicon.ico") => static_file(&mut s, "image/svg+xml", ICON).await,
         ("GET", "/api/challenge") => challenge(&server, &web, &mut s).await,
         ("GET", "/api/session") => match signed_in(&web, &req) {
-            Some((_, uid, nickname, _)) => json(&mut s, "200 OK", &[], &serde_json::json!({ "signed_in": true, "uid": uid, "nickname": nickname })).await,
+            Some(j) => json(&mut s, "200 OK", &[], &serde_json::json!({ "signed_in": true, "uid": j.uid, "nickname": j.nickname })).await,
             None => json(&mut s, "200 OK", &[], &serde_json::json!({ "signed_in": false })).await,
         },
-        ("POST", "/api/login") if req.sent_by_page() => login(&server, &web, &mut s, &req, ip, secure).await,
+        ("POST", "/api/login") if req.sent_by_page() => login(&server, &web, &mut s, &req, ip, secure, proxied).await,
+        ("GET", "/api/channels") => channels(&server, &mut s).await,
+        ("GET", "/api/prefs") => prefs(&server, &web, &mut s, &req).await,
+        ("POST", "/api/prefs") if req.sent_by_page() => save_prefs(&server, &web, &mut s, &req).await,
+        ("GET", "/api/avatar") => avatar(&server, &web, &mut s, &req).await,
         ("POST", "/api/logout") if req.sent_by_page() => logout(&server, &web, &mut s, &req, secure).await,
         ("GET", "/api/events") => events(&server, &web, &mut s, &req, ip).await,
         ("POST", "/api/send") if req.sent_by_page() => send(&server, &web, &mut s, &req).await,
@@ -196,14 +229,23 @@ struct LoginBody {
     nickname: String,
     #[serde(default)]
     password: Option<String>,
+    /// The page's origin the proof was made for (`location.origin`).
+    origin: String,
+    /// Channel to join: a path such as `Lobby/Games`, "" for the default channel, or
+    /// absent to use the one remembered for this identity.
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    channel_password: Option<String>,
 }
 
-/// The proof the page computes: HMAC-SHA256(X25519(identity, server key), context).
-fn expected_proof(shared: &[u8; 32], server_key: &[u8], nonce: &[u8], public: &[u8]) -> [u8; 32] {
-    hmac_sha256(shared, &[b"voxa-web-login-v1", server_key, nonce, public])
+/// The proof: HMAC-SHA256(X25519(identity, server key), context and the page's origin).
+fn expected_proof(shared: &[u8; 32], server_key: &[u8], nonce: &[u8], public: &[u8], origin: &str) -> [u8; 32] {
+    voxa_proto::identity::web_login_proof(shared, server_key, nonce, public, origin)
 }
 
-async fn login(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip: IpAddr, secure: bool) -> std::io::Result<()> {
+#[allow(clippy::too_many_arguments)]
+async fn login(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip: IpAddr, secure: bool, proxied: bool) -> std::io::Result<()> {
     let refuse = |msg: &str| serde_json::json!({ "error": msg });
     let blocked = {
         let mut f = web.failures.lock();
@@ -229,9 +271,18 @@ async fn login(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip:
     let b64 = base64::engine::general_purpose::STANDARD;
     let public = b64.decode(body.public.trim()).ok().filter(|p| p.len() == 32);
     let proof = b64.decode(body.proof.trim()).ok().filter(|p| p.len() == 32);
+    // The proof must be for this page's origin (a look-alike site gets a useless proof).
+    let origin = body.origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    let allowed = &server.cfg.web_allowed_origins;
+    let pinned_ok = allowed.is_empty() || allowed.iter().any(|a| a.trim().trim_end_matches('/').eq_ignore_ascii_case(&origin));
+    if !pinned_ok || !req.origins(proxied).contains(&origin) {
+        fail(web);
+        warn!("web: sign-in from {ip} for origin {origin:?}, but this page is {:?} (a reverse proxy must pass the original Host header)", req.origins(proxied));
+        return json(s, "403 Forbidden", &[], &refuse("This sign-in was made for a different web address")).await;
+    }
     let ok = match (&public, &proof) {
         (Some(public), Some(proof)) => match x25519(&ch.private, public) {
-            Some(shared) => ct_eq(&expected_proof(&shared, &ch.public, &ch.nonce, public), proof),
+            Some(shared) => ct_eq(&expected_proof(&shared, &ch.public, &ch.nonce, public, &origin), proof),
             None => false,
         },
         _ => false,
@@ -254,14 +305,31 @@ async fn login(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip:
             return json(s, "403 Forbidden", &[], &refuse(&e)).await;
         }
     }
+    // Nickname and channel: as given, else what this identity used last time.
+    let mut prefs = server.store.web_prefs(&uid).ok().flatten().unwrap_or_default();
     let nickname: String = body.nickname.trim().chars().take(30).collect();
+    if !nickname.is_empty() {
+        prefs.nickname = nickname;
+    }
+    if let Some(ch) = &body.channel {
+        prefs.channel = ch.trim().chars().take(400).collect();
+    }
+    let _ = server.store.save_web_prefs(&uid, &prefs);
     let token = hex(&crate::secrets::random_bytes::<32>());
     {
         let mut logins = web.logins.lock();
         logins.retain(|_, l| l.created.elapsed() < LOGIN_LIFETIME);
         logins.insert(
             token.clone(),
-            Login { uid: uid.clone(), nickname: if nickname.is_empty() { "Web admin".into() } else { nickname }, server_password: password, created: Instant::now(), client: None },
+            Login {
+                uid: uid.clone(),
+                nickname: if prefs.nickname.is_empty() { "Web admin".into() } else { prefs.nickname.clone() },
+                server_password: password,
+                channel: prefs.channel.clone(),
+                channel_password: body.channel_password.filter(|p| !p.is_empty()),
+                created: Instant::now(),
+                client: None,
+            },
         );
     }
     info!("web: {uid} signed in from {ip}");
@@ -284,12 +352,29 @@ async fn logout(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, se
     json(s, "200 OK", &[("Set-Cookie", cookie)], &serde_json::json!({})).await
 }
 
-/// The signed-in login of a request: (token, uid, nickname, server password).
-fn signed_in(web: &Web, req: &Request) -> Option<(String, String, String, Option<String>)> {
+/// What a sign-in joins with.
+struct Joining {
+    token: String,
+    uid: String,
+    nickname: String,
+    server_password: Option<String>,
+    channel: String,
+    channel_password: Option<String>,
+}
+
+/// The signed-in login of a request.
+fn signed_in(web: &Web, req: &Request) -> Option<Joining> {
     let token = req.cookie(COOKIE)?;
     let logins = web.logins.lock();
     let l = logins.get(&token).filter(|l| l.created.elapsed() < LOGIN_LIFETIME)?;
-    Some((token.clone(), l.uid.clone(), l.nickname.clone(), l.server_password.clone()))
+    Some(Joining {
+        token: token.clone(),
+        uid: l.uid.clone(),
+        nickname: l.nickname.clone(),
+        server_password: l.server_password.clone(),
+        channel: l.channel.clone(),
+        channel_password: l.channel_password.clone(),
+    })
 }
 
 /// Removes a page's session, unless its client id was already given to someone else.
@@ -305,7 +390,7 @@ fn end_session(server: &Server, id: ClientId, close: &Arc<Notify>, reason: &str)
 /// The page's live connection: joins the server as this identity and streams every
 /// message to the page until it is closed.
 async fn events(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip: IpAddr) -> std::io::Result<()> {
-    let Some((token, uid, nickname, password)) = signed_in(web, req) else {
+    let Some(Joining { token, uid, nickname, server_password: password, channel, channel_password }) = signed_in(web, req) else {
         return json(s, "401 Unauthorized", &[], &serde_json::json!({ "error": "Not signed in" })).await;
     };
     s.write_all(
@@ -318,9 +403,8 @@ async fn events(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip
         close.notify_one();
         end_session(server, id, &close, "Opened in another tab");
     }
-    if let Some(p) = &password {
-        let _ = server.check_login_passwords(ip, Some(p), None, None).await;
-    }
+    let channel = (!channel.is_empty()).then_some(channel);
+    let _ = server.check_login_passwords(ip, password.as_deref(), channel.as_deref(), channel_password.as_deref()).await;
     let (tx, mut rx) = mpsc::channel::<Out>(OUTBOX_SIZE);
     let close = Arc::new(Notify::new());
     let hello = C2S::Hello {
@@ -330,8 +414,8 @@ async fn events(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip
         platform: "Web".into(),
         nickname,
         server_password: password,
-        default_channel: None,
-        default_channel_password: None,
+        default_channel: channel,
+        default_channel_password: channel_password,
     };
     let id = match server.login(uid, ip, hello, Outbox { tx, close: close.clone() }, close.clone(), true) {
         Ok(id) => id,
@@ -383,6 +467,8 @@ fn event(m: &S2C) -> String {
             "your_id": your_id, "your_uid": your_uid, "server": server, "channels": channels, "clients": clients, "groups": groups,
         } })
         .to_string(),
+        // The page loads pictures from /api/avatar instead.
+        S2C::AvatarImage { uid, image, .. } => serde_json::json!({ "AvatarImage": { "uid": uid, "image": image } }).to_string(),
         other => serde_json::to_string(other).unwrap_or_else(|_| "{}".into()),
     };
     format!("data: {json}\n\n")
@@ -428,6 +514,93 @@ fn parse_c2s(body: &[u8]) -> Result<C2S, serde_json::Error> {
         }));
     }
     serde_json::from_value(v)
+}
+
+/// Channels to pick from on the sign-in page (paths like `Lobby/Games`). Only for servers
+/// without a password: there anyone can connect and see them anyway.
+async fn channels(server: &Server, s: &mut TcpStream) -> std::io::Result<()> {
+    let list: Vec<serde_json::Value> = {
+        let st = server.state.lock();
+        if st.settings.password_hash.is_some() {
+            Vec::new()
+        } else {
+            let path = |mut id: ChannelId| {
+                let mut parts = Vec::new();
+                while let Some(c) = st.channels.get(&id) {
+                    parts.push(c.info.name.clone());
+                    match c.info.parent {
+                        Some(p) if parts.len() < 32 => id = p,
+                        _ => break,
+                    }
+                }
+                parts.reverse();
+                parts.join("/")
+            };
+            let mut v: Vec<(i64, String, bool, bool)> = st
+                .channels
+                .values()
+                .filter(|c| !is_spacer(&c.info.name))
+                .map(|c| (c.info.sort, path(c.info.id), c.info.has_password, c.info.is_default))
+                .collect();
+            v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+            v.into_iter().map(|(_, p, pw, d)| serde_json::json!({ "path": p, "password": pw, "default": d })).collect()
+        }
+    };
+    json(s, "200 OK", &[], &serde_json::json!({ "channels": list })).await
+}
+
+const THEMES: [&str; 7] = ["dark", "light", "sakura", "layette", "crimson", "midnight", "celadon"];
+
+/// What this identity's web page remembers (theme, nickname, channel).
+async fn prefs(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+    let Some(j) = signed_in(web, req) else {
+        return json(s, "401 Unauthorized", &[], &serde_json::json!({ "error": "Not signed in" })).await;
+    };
+    let p = server.store.web_prefs(&j.uid).ok().flatten().unwrap_or_default();
+    json(s, "200 OK", &[], &serde_json::json!({ "theme": p.theme, "nickname": p.nickname, "channel": p.channel })).await
+}
+
+#[derive(Deserialize)]
+struct PrefsBody {
+    theme: Option<String>,
+    nickname: Option<String>,
+    channel: Option<String>,
+}
+
+async fn save_prefs(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+    let Some(j) = signed_in(web, req) else {
+        return json(s, "401 Unauthorized", &[], &serde_json::json!({ "error": "Not signed in" })).await;
+    };
+    let Ok(body) = serde_json::from_slice::<PrefsBody>(&req.body) else {
+        return json(s, "400 Bad Request", &[], &serde_json::json!({ "error": "Bad request" })).await;
+    };
+    let mut p = server.store.web_prefs(&j.uid).ok().flatten().unwrap_or_default();
+    if let Some(t) = body.theme.filter(|t| THEMES.contains(&t.as_str())) {
+        p.theme = t;
+    }
+    if let Some(n) = body.nickname {
+        p.nickname = n.trim().chars().take(30).collect();
+    }
+    if let Some(c) = body.channel {
+        p.channel = c.trim().chars().take(400).collect();
+    }
+    let _ = server.store.save_web_prefs(&j.uid, &p);
+    respond(s, "204 No Content", "text/plain", &[], b"").await
+}
+
+/// Someone's avatar picture (signed-in pages only).
+async fn avatar(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> std::io::Result<()> {
+    let uid = req.param("uid").unwrap_or_default();
+    if signed_in(web, req).is_none() || uid.len() > 64 {
+        return respond(s, "404 Not Found", "text/plain", &[], b"Not found").await;
+    }
+    match server.store.avatar(&uid).ok().flatten().filter(|a| !a.image.is_empty()) {
+        Some(a) => {
+            let ctype = if image_kind(&a.image) == Some("png") { "image/png" } else { "image/jpeg" };
+            respond(s, "200 OK", ctype, &[("Cache-Control", "private, max-age=86400".into())], &a.image).await
+        }
+        None => respond(s, "404 Not Found", "text/plain", &[], b"Not found").await,
+    }
 }
 
 fn live_client(web: &Web, req: &Request) -> Option<ClientId> {
@@ -479,7 +652,8 @@ async fn read_request(s: &mut TcpStream) -> Option<Request> {
     let mut first = lines.next()?.split(' ');
     let method = first.next()?.to_string();
     let target = first.next()?;
-    let path = target.split('?').next().unwrap_or("/").to_string();
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let (path, query) = (path.to_string(), query.to_string());
     let headers: Vec<(String, String)> =
         lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
     if headers.iter().any(|(k, _)| k == "transfer-encoding") {
@@ -498,22 +672,49 @@ async fn read_request(s: &mut TcpStream) -> Option<Request> {
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(len);
-    Some(Request { method, path, headers, body })
+    Some(Request { method, path, query, headers, body })
 }
 
 /// The visitor's address. Behind a reverse proxy on this PC or the local network the
 /// proxy's `X-Real-IP` / `X-Forwarded-For` is used (bans and logs need the real address).
 fn client_ip(peer: SocketAddr, req: &Request) -> IpAddr {
     let p = peer.ip();
-    let local = match p {
-        IpAddr::V4(a) => a.is_loopback() || a.is_private() || a.is_link_local(),
-        IpAddr::V6(a) => a.is_loopback() || (a.segments()[0] & 0xfe00) == 0xfc00 || a.to_ipv4_mapped().map(|v| v.is_private() || v.is_loopback()).unwrap_or(false),
-    };
-    if !local {
+    if !from_local_proxy(peer) {
         return p;
     }
     let forwarded = req.header("x-real-ip").or_else(|| req.header("x-forwarded-for").and_then(|v| v.split(',').next()));
     forwarded.and_then(|v| v.trim().parse().ok()).unwrap_or(p)
+}
+
+/// Connections from this PC or the local network may be a reverse proxy, whose
+/// forwarded headers (visitor address, scheme, host) are then believed.
+fn from_local_proxy(peer: SocketAddr) -> bool {
+    match peer.ip() {
+        IpAddr::V4(a) => a.is_loopback() || a.is_private() || a.is_link_local(),
+        IpAddr::V6(a) => a.is_loopback() || (a.segments()[0] & 0xfe00) == 0xfc00 || a.to_ipv4_mapped().map(|v| v.is_private() || v.is_loopback()).unwrap_or(false),
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
+                Ok(v) => {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+                Err(_) => out.push(b'%'),
+            },
+            b'+' => out.push(b' '),
+            x => out.push(x),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\
@@ -544,42 +745,17 @@ async fn json(s: &mut TcpStream, status: &str, extra: &[(&str, String)], v: &ser
 
 // ------------------------------------------------------------------ crypto
 
-fn dh() -> Option<Box<dyn snow::types::Dh>> {
-    use snow::resolvers::{CryptoResolver, DefaultResolver};
-    DefaultResolver.resolve_dh(&snow::params::DHChoice::Curve25519)
-}
-
 fn x25519_public(private: &[u8; 32]) -> Option<Vec<u8>> {
-    let mut d = dh()?;
-    d.set(private);
-    Some(d.pubkey().to_vec())
+    voxa_proto::identity::public_key(private)
 }
 
-/// X25519 key agreement; None for keys that give an all-zero (contributory-less) result.
 fn x25519(private: &[u8; 32], public: &[u8]) -> Option<[u8; 32]> {
-    let mut d = dh()?;
-    d.set(private);
-    let mut out = [0u8; 32];
-    d.dh(public, &mut out).ok()?;
-    (out != [0u8; 32]).then_some(out)
+    voxa_proto::identity::agree(private, public)
 }
 
+#[cfg(test)]
 fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        k[..32].copy_from_slice(&Sha256::digest(key));
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut inner = Sha256::new();
-    inner.update(k.map(|b| b ^ 0x36));
-    for p in parts {
-        inner.update(p);
-    }
-    let mut outer = Sha256::new();
-    outer.update(k.map(|b| b ^ 0x5c));
-    outer.update(inner.finalize());
-    outer.finalize().into()
+    voxa_proto::identity::hmac_sha256(key, parts)
 }
 
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -632,9 +808,31 @@ mod tests {
         let other = voxa_proto::identity::KeyPair::generate();
         let other_priv: [u8; 32] = other.private.clone().try_into().unwrap();
         let wrong = x25519(&other_priv, &server_pub).unwrap();
-        assert_ne!(expected_proof(&a, &server_pub, &nonce, &id.public), expected_proof(&wrong, &server_pub, &nonce, &id.public));
+        let origin = "https://admin.example.com";
+        assert_ne!(expected_proof(&a, &server_pub, &nonce, &id.public, origin), expected_proof(&wrong, &server_pub, &nonce, &id.public, origin));
+        // The same key on another origin gives another proof.
+        assert_ne!(expected_proof(&a, &server_pub, &nonce, &id.public, origin), expected_proof(&a, &server_pub, &nonce, &id.public, "https://evil.example"));
         // A low-order public key is refused.
         assert!(x25519(&server, &[0u8; 32]).is_none());
+    }
+
+    #[test]
+    fn query_decoding_and_origins() {
+        assert_eq!(percent_decode("a%2Bb%3D%3D+c"), "a+b== c");
+        assert_eq!(percent_decode("bad%zz%"), "bad%zz%");
+        assert_eq!(percent_decode("%"), "%");
+        let req = |h: &[(&str, &str)]| Request {
+            method: "POST".into(),
+            path: "/".into(),
+            query: String::new(),
+            headers: h.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body: Vec::new(),
+        };
+        let direct = req(&[("host", "192.168.1.35:9980"), ("x-forwarded-proto", "https"), ("x-forwarded-host", "evil.example")]);
+        // Directly (not from a local proxy) forwarded headers are ignored.
+        assert_eq!(direct.origins(false), vec!["http://192.168.1.35:9980"]);
+        let proxied = req(&[("host", "Voxa.Example.org"), ("x-forwarded-proto", "https")]);
+        assert_eq!(proxied.origins(true), vec!["https://voxa.example.org"]);
     }
 
     /// RFC 7748 section 6.1 test vector (the JavaScript side is checked against the same).

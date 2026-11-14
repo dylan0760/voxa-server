@@ -96,6 +96,17 @@ pub enum C2S {
     /// A direct message to someone who is offline: the server keeps it (encrypted) and
     /// delivers it when they come online.
     SendOffline { to_uid: String, text: String },
+
+    // --- added in 1.15.0; only sent to servers that are 1.15.0 or newer ---
+    /// Changes the text of one of your own stored messages ("Edit own chat messages").
+    EditMessage { target: TextTarget, id: MessageId, text: String },
+    /// Your picture and colour. `image` is a square PNG or JPEG of at most
+    /// `MAX_AVATAR_BYTES` (None: no picture, the initials are shown).
+    SetAvatar { color: Option<u32>, image: Option<Vec<u8>> },
+    /// Asks for someone's picture (answered with `AvatarInfo` and `AvatarImage`).
+    GetAvatar(String),
+    /// Removes someone's picture, e.g. an offensive one (requires "Edit client descriptions").
+    ClearAvatar(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -180,6 +191,17 @@ pub enum S2C {
     OfflineMessages(Vec<OfflineMessage>),
     /// An offline message was accepted for delivery.
     OfflineQueued { to_uid: String, ts: u64 },
+
+    // --- added in 1.15.0; only sent to clients that are 1.20.0 or newer ---
+    /// A stored message was edited by its author.
+    MessageEdited { target: TextTarget, id: MessageId, text: String, edited_at: u64 },
+    /// Which messages of the `History` just sent were edited, and when.
+    EditedMessages { target: TextTarget, edits: Vec<(MessageId, u64)> },
+    /// Pictures / colours of people: after Welcome (everyone online), when someone joins
+    /// or changes theirs, with the People list, and in answer to `GetAvatar`.
+    AvatarInfo(Vec<AvatarMeta>),
+    /// A picture asked for with `GetAvatar`.
+    AvatarImage { uid: String, image: u64, data: Vec<u8> },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file

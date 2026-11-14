@@ -28,6 +28,13 @@ const IMAGE_DATA: TableDefinition<u64, &[u8]> = TableDefinition::new("image_data
 const PINS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("pins");
 /// Direct messages waiting for an offline recipient: (recipient uid, id) -> sealed message.
 const OFFLINE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("offline_messages");
+/// Edited chat messages (1.15.0+): (chat, message) -> when it was last edited.
+const EDITS: TableDefinition<(u64, u64), u64> = TableDefinition::new("chat_edits");
+/// People's pictures and colours (1.15.0+): uid -> AvatarRecord. Shown to everyone, so
+/// not encrypted.
+const AVATARS: TableDefinition<&str, &[u8]> = TableDefinition::new("avatars");
+/// Web admin page settings per identity (1.15.0+): uid -> WebPrefs.
+const WEB_PREFS: TableDefinition<&str, &[u8]> = TableDefinition::new("web_prefs");
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StoredSettings {
@@ -75,6 +82,26 @@ pub struct StoredMessage {
     pub from_name: String,
     pub ts: u64,
     pub text: String,
+}
+
+/// Someone's picture (PNG / JPEG, checked when set) and colour.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AvatarRecord {
+    pub color: Option<u32>,
+    pub image: Vec<u8>,
+    /// `avatar_hash` of the image (0 = none).
+    pub hash: u64,
+    /// A picture a moderator removed (its hash): it cannot be set again.
+    pub removed: u64,
+}
+
+/// What the web admin page remembers for an identity.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct WebPrefs {
+    pub theme: String,
+    pub nickname: String,
+    /// Channel path joined on sign-in (empty = the default channel).
+    pub channel: String,
 }
 
 /// Who pinned a message and when.
@@ -131,6 +158,9 @@ impl Store {
             w.open_table(IMAGE_DATA)?;
             w.open_table(PINS)?;
             w.open_table(OFFLINE)?;
+            w.open_table(EDITS)?;
+            w.open_table(AVATARS)?;
+            w.open_table(WEB_PREFS)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -141,9 +171,10 @@ impl Store {
 
     /// Upgrades records written by older versions. Schema 1 (Voxa 1.0/1.1) had no
     /// join power on groups/channels and no "join channels" permission; schema 2
-    /// (before 1.8.0) had no "pin messages" permission.
+    /// (before 1.8.0) had no "pin messages" permission; schema 3 (before 1.15.0) had no
+    /// "edit own chat messages" permission.
     fn migrate(&self) -> R<()> {
-        const SCHEMA: u64 = 3;
+        const SCHEMA: u64 = 4;
         let current = {
             let r = self.db.begin_read()?;
             let t = r.open_table(META)?;
@@ -251,6 +282,19 @@ impl Store {
             for mut g in self.load_groups()? {
                 if g.id == 4 && g.builtin && g.kind == GroupKind::Channel && g.perms & perm::CHAT_PIN == 0 {
                     g.perms |= perm::CHAT_PIN;
+                    self.save_group(&g)?;
+                }
+            }
+            let w = self.db.begin_write()?;
+            w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
+            w.commit()?;
+            tracing::info!("database migrated to schema {SCHEMA}");
+        }
+        if current < 4 {
+            // 1.15.0: the built-in Normal group may edit its own chat messages.
+            for mut g in self.load_groups()? {
+                if g.id == 2 && g.builtin && g.kind == GroupKind::Server && g.perms & perm::CHAT_EDIT_OWN == 0 {
+                    g.perms |= perm::CHAT_EDIT_OWN;
                     self.save_group(&g)?;
                 }
             }
@@ -775,6 +819,69 @@ impl Store {
         Ok(out)
     }
 
+    /// Replaces the text of a stored message and remembers when it was edited.
+    pub fn edit_chat(&self, ch: ChannelId, id: MessageId, m: &StoredMessage, at: u64) -> R<()> {
+        let blob = self.seal(ch, id, m);
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(CHAT)?;
+            if t.get((ch, id))?.is_none() {
+                anyhow::bail!("message not found");
+            }
+            t.insert((ch, id), blob.as_slice())?;
+            w.open_table(EDITS)?.insert((ch, id), at)?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// When each of `ids` (of one chat) was edited, for those that were.
+    pub fn edits(&self, ch: ChannelId, ids: &[MessageId]) -> R<Vec<(MessageId, u64)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(EDITS)?;
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(at) = t.get((ch, *id))? {
+                out.push((*id, at.value()));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn avatar(&self, uid: &str) -> R<Option<AvatarRecord>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(AVATARS)?;
+        Ok(t.get(uid)?.and_then(|v| dec(v.value())))
+    }
+
+    /// Saves (or, when it has neither a colour nor a picture, removes) an avatar.
+    pub fn save_avatar(&self, uid: &str, a: &AvatarRecord) -> R<()> {
+        let w = self.db.begin_write()?;
+        {
+            let mut t = w.open_table(AVATARS)?;
+            if a.color.is_none() && a.image.is_empty() {
+                t.remove(uid)?;
+            } else {
+                t.insert(uid, enc(a).as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn web_prefs(&self, uid: &str) -> R<Option<WebPrefs>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(WEB_PREFS)?;
+        Ok(t.get(uid)?.and_then(|v| dec(v.value())))
+    }
+
+    pub fn save_web_prefs(&self, uid: &str, p: &WebPrefs) -> R<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(WEB_PREFS)?.insert(uid, enc(p).as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn get_chat(&self, ch: ChannelId, id: MessageId) -> R<Option<StoredMessage>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(CHAT)?;
@@ -789,6 +896,10 @@ impl Store {
             let keys: Vec<(u64, u64)> = t.range((ch, 0)..=(ch, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, _)| k.value()).collect();
             for k in &keys {
                 t.remove(*k)?;
+            }
+            let mut e = w.open_table(EDITS)?;
+            for k in &keys {
+                e.remove(*k)?;
             }
             keys.len()
         };
@@ -819,6 +930,7 @@ impl Store {
     pub fn delete_chat(&self, ch: ChannelId, id: MessageId) -> R<()> {
         let w = self.db.begin_write()?;
         w.open_table(CHAT)?.remove((ch, id))?;
+        w.open_table(EDITS)?.remove((ch, id))?;
         w.commit()?;
         Ok(())
     }
@@ -846,8 +958,10 @@ impl Store {
         let w = self.db.begin_write()?;
         {
             let mut t = w.open_table(CHAT)?;
+            let mut e = w.open_table(EDITS)?;
             for k in &doomed {
                 t.remove(*k)?;
+                e.remove(*k)?;
             }
         }
         w.commit()?;

@@ -209,7 +209,7 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.19.0";
+pub const MIN_CLIENT_VERSION: &str = "1.20.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -238,7 +238,8 @@ fn default_groups() -> Vec<GroupInfo> {
         | FILE_DOWNLOAD
         | SCREEN_SHARE
         | CHANNEL_COMMANDER
-        | CHANNEL_JOIN;
+        | CHANNEL_JOIN
+        | CHAT_EDIT_OWN;
     // Join power mirrors TeamSpeak: Admin 75, Normal 10, Guest 0. A channel with
     // "needed join power" 10 is therefore members-only, 75 is admins-only.
     let g = |id, kind, name: &str, perms, talk_power, sort, show_name| GroupInfo {
@@ -875,6 +876,17 @@ impl Server {
             }
         }
         st.broadcast(S2C::ClientJoined(info.clone()));
+        // Pictures: everyone online for the newcomer, the newcomer's for everyone else.
+        if !voxa_proto::update::is_newer("1.20.0", &info.version) {
+            let metas = st.sessions.values().map(|s| s.info.uid.as_str()).chain(std::iter::once(uid.as_str())).filter_map(|u| self.avatar_meta(u)).collect::<Vec<_>>();
+            tx.send(Out::Msg(S2C::AvatarInfo(metas)));
+        }
+        if let Some(meta) = self.avatar_meta(&uid) {
+            let others: Vec<ClientId> = st.sessions.keys().copied().collect();
+            for c in others {
+                st.send_if_supported(c, "1.20.0", S2C::AvatarInfo(vec![meta.clone()]));
+            }
+        }
         info!("client {} ({}) connected from {ip} as id {id}", info.nickname, uid);
         st.sessions.insert(
             id,
@@ -1368,15 +1380,33 @@ impl Server {
             C2S::GetPeople => {
                 let s = st.session(me)?;
                 if s.client_at_least("1.18.0") {
-                    let people = db(self.store.all_clients())?
-                        .into_iter()
-                        .map(|c| Person { uid: c.uid, nickname: c.nickname, last_seen: c.last_seen })
-                        .collect();
+                    let clients = db(self.store.all_clients())?;
+                    let avatars: Vec<AvatarMeta> =
+                        if s.client_at_least("1.20.0") { clients.iter().filter_map(|c| self.avatar_meta(&c.uid)).collect() } else { Vec::new() };
+                    let people = clients.into_iter().map(|c| Person { uid: c.uid, nickname: c.nickname, last_seen: c.last_seen }).collect();
                     st.send(me, S2C::People(people));
+                    if !avatars.is_empty() {
+                        st.send(me, S2C::AvatarInfo(avatars));
+                    }
                 }
                 Ok(())
             }
             C2S::SendOffline { to_uid, text } => self.send_offline(st, me, to_uid, text),
+            C2S::EditMessage { target, id, text } => self.edit_message(st, me, target, id, text),
+            C2S::SetAvatar { color, image } => self.set_avatar(st, me, color, image),
+            C2S::GetAvatar(uid) => {
+                if uid.len() > 64 {
+                    return Err("Unknown user".into());
+                }
+                if let Some(a) = db(self.store.avatar(&uid))? {
+                    st.send_if_supported(me, "1.20.0", S2C::AvatarInfo(vec![AvatarMeta { uid: uid.clone(), color: a.color, image: a.hash }]));
+                    if !a.image.is_empty() {
+                        st.send_if_supported(me, "1.20.0", S2C::AvatarImage { uid, image: a.hash, data: a.image });
+                    }
+                }
+                Ok(())
+            }
+            C2S::ClearAvatar(uid) => self.clear_avatar(st, me, uid),
             C2S::GetFileLimits => {
                 st.send(me, S2C::FileLimits(st.file_limits));
                 Ok(())
@@ -1912,7 +1942,7 @@ impl Server {
         let rows = db(self.store.history(ch, before, limit))?;
         let online: HashMap<&str, ClientId> = st.sessions.values().map(|s| (s.info.uid.as_str(), s.info.id)).collect();
         let complete = rows.len() < limit;
-        let messages = rows
+        let messages: Vec<ChatMessage> = rows
             .into_iter()
             .map(|(id, m)| ChatMessage {
                 id,
@@ -1924,7 +1954,14 @@ impl Server {
                 text: m.text,
             })
             .collect();
+        let ids: Vec<MessageId> = messages.iter().map(|m: &ChatMessage| m.id).collect();
         st.send(me, S2C::History { target, messages, complete });
+        if st.session(me)?.client_at_least("1.20.0") {
+            let edits = db(self.store.edits(ch, &ids))?;
+            if !edits.is_empty() {
+                st.send(me, S2C::EditedMessages { target, edits });
+            }
+        }
         Ok(())
     }
 
@@ -1953,6 +1990,116 @@ impl Server {
             _ => st.broadcast(S2C::MessageDeleted { target, id }),
         }
         Ok(())
+    }
+
+    /// Changes the text of one of your own stored messages ("Edit own chat messages").
+    fn edit_message(&self, st: &mut State, me: ClientId, target: TextTarget, id: MessageId, text: String) -> Res {
+        let text = truncate(text.trim_end(), 8000);
+        if text.trim().is_empty() {
+            return Err("A message cannot be empty: delete it instead".into());
+        }
+        let s = st.session(me)?;
+        let ch = match target {
+            TextTarget::Server => SERVER_CHAT_CHANNEL,
+            TextTarget::Channel(c) => {
+                if s.info.channel != c {
+                    return Err("You can only edit messages in the channel you are in".into());
+                }
+                c
+            }
+            TextTarget::Private(_) => return Err("Direct messages are not stored on the server".into()),
+        };
+        let p = if ch == SERVER_CHAT_CHANNEL { st.server_perms(s) } else { self.perms_in(st, s, ch) };
+        self.need(p, perm::CHAT_EDIT_OWN)?;
+        let old = db(self.store.get_chat(ch, id))?.ok_or("Message not found")?;
+        if old.from_uid != s.info.uid {
+            return Err("You can only edit your own messages".into());
+        }
+        if ImageRef::parse(&old.text).is_some() || ImageRef::parse(&text).is_some() {
+            return Err("Images cannot be edited".into());
+        }
+        if old.text == text {
+            return Ok(());
+        }
+        let nick = s.info.nickname.clone();
+        st.spend_chat(me)?;
+        let at = now_unix();
+        db(self.store.edit_chat(ch, id, &StoredMessage { text: text.clone(), ..old }, at))?;
+        info!("{nick} edited their message {id} in {target:?}");
+        let msg = S2C::MessageEdited { target, id, text, edited_at: at };
+        let ids: Vec<ClientId> =
+            st.sessions.values().filter(|x| matches!(target, TextTarget::Server) || x.info.channel == ch).map(|x| x.info.id).collect();
+        for c in ids {
+            st.send_if_supported(c, "1.20.0", msg.clone());
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ avatars
+
+    fn avatar_meta(&self, uid: &str) -> Option<AvatarMeta> {
+        let a = self.store.avatar(uid).ok()??;
+        Some(AvatarMeta { uid: uid.to_string(), color: a.color, image: a.hash })
+    }
+
+    fn broadcast_avatar(&self, st: &State, meta: AvatarMeta) {
+        let ids: Vec<ClientId> = st.sessions.keys().copied().collect();
+        for c in ids {
+            st.send_if_supported(c, "1.20.0", S2C::AvatarInfo(vec![meta.clone()]));
+        }
+    }
+
+    /// Sets your picture and colour. Pictures must be small PNG / JPEG files.
+    fn set_avatar(&self, st: &mut State, me: ClientId, color: Option<u32>, image: Option<Vec<u8>>) -> Res {
+        if color.is_some_and(|c| c > 0xFF_FFFF) {
+            return Err("Invalid colour".into());
+        }
+        let image = image.unwrap_or_default();
+        if !image.is_empty() {
+            check_avatar_image(&image)?;
+        }
+        let uid = st.session(me)?.info.uid.clone();
+        let old = db(self.store.avatar(&uid))?.unwrap_or_default();
+        let hash = avatar_hash(&image);
+        if hash != 0 && hash == old.removed {
+            return Err("A moderator removed this picture, so it cannot be used here".into());
+        }
+        st.spend_chat(me)?;
+        let rec = AvatarRecord { color, image, hash, removed: old.removed };
+        db(self.store.save_avatar(&uid, &rec))?;
+        self.broadcast_avatar(st, AvatarMeta { uid, color, image: hash });
+        Ok(())
+    }
+
+    /// Removes someone's picture (their colour stays). It cannot be set again.
+    fn clear_avatar(&self, st: &mut State, me: ClientId, uid: String) -> Res {
+        let s = st.session(me)?;
+        if s.info.uid != uid {
+            self.need(st.server_perms(s), perm::CLIENT_DESCRIPTION_EDIT)?;
+            Self::outranks(st.server_perms(s), self.perms_of_uid(st, &uid))?;
+        }
+        let Some(mut rec) = db(self.store.avatar(&uid))? else { return Ok(()) };
+        if rec.image.is_empty() {
+            return Ok(());
+        }
+        if s.info.uid != uid {
+            rec.removed = rec.hash;
+            info!("{} removed the picture of {uid}", s.info.nickname);
+        }
+        rec.image.clear();
+        rec.hash = 0;
+        db(self.store.save_avatar(&uid, &rec))?;
+        self.broadcast_avatar(st, AvatarMeta { uid, color: rec.color, image: 0 });
+        Ok(())
+    }
+
+    /// Server-wide permissions of an identity, online or not.
+    fn perms_of_uid(&self, st: &State, uid: &str) -> u64 {
+        if let Some(s) = st.sessions.values().find(|s| s.info.uid == uid) {
+            return st.server_perms(s);
+        }
+        let groups = self.store.get_client(uid).ok().flatten().map(|c| c.server_groups).unwrap_or_default();
+        groups.iter().fold(self.store.client_perms(uid).unwrap_or(0), |acc, g| acc | st.group_perms(*g))
     }
 
     /// Pins / unpins a stored message ("Pin messages" permission, at most 50 per chat).
@@ -2486,6 +2633,20 @@ fn find_channel_by_path(st: &State, path: &str) -> Option<ChannelId> {
         found = Some(c.info.id);
     }
     found
+}
+
+/// A picture someone wants as their avatar: a small square-ish PNG or JPEG.
+fn check_avatar_image(data: &[u8]) -> Res {
+    if data.len() > MAX_AVATAR_BYTES {
+        return Err(format!("The picture is too big (at most {} KB)", MAX_AVATAR_BYTES / 1024));
+    }
+    if !matches!(image_kind(data), Some("png") | Some("jpg")) {
+        return Err("The picture must be a PNG or JPEG".into());
+    }
+    match image_dims(data) {
+        Some((w, h)) if (16..=MAX_AVATAR_DIM).contains(&w) && (16..=MAX_AVATAR_DIM).contains(&h) => Ok(()),
+        _ => Err(format!("The picture must be between 16 and {MAX_AVATAR_DIM} pixels wide and high")),
+    }
 }
 
 fn new_privilege_key() -> String {

@@ -25,6 +25,9 @@ pub struct Config {
     pub web_enabled: bool,
     pub web_bind: String,
     pub web_port: u16,
+    /// Web addresses the page may be signed in from, e.g. `["https://voxa.example.org"]`.
+    /// Empty: whatever address the page was opened with (as the browser / proxy reports it).
+    pub web_allowed_origins: Vec<String>,
 }
 
 impl Default for Config {
@@ -39,6 +42,7 @@ impl Default for Config {
             web_enabled: true,
             web_bind: "0.0.0.0".into(),
             web_port: 9980,
+            web_allowed_origins: Vec::new(),
         }
     }
 }

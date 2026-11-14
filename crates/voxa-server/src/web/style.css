@@ -90,7 +90,7 @@ input[type=range] { accent-color: var(--accent); }
 }
 .login-card {
   width: 440px; max-width: calc(100% - 32px); background: var(--side); border-radius: 12px; padding: 32px;
-  box-shadow: 0 10px 40px var(--shadow); text-align: center;
+  box-shadow: 0 10px 40px var(--shadow); text-align: center; margin: auto;
 }
 .login-card .logo { width: 84px; height: 84px; margin: 0 auto 14px; }
 .login-card h1 { font-size: 26px; font-weight: 400; margin: 0; color: var(--strong); }
@@ -103,6 +103,13 @@ input[type=range] { accent-color: var(--accent); }
 .login-card .row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
 .login-card .fp { font-family: Consolas, monospace; font-size: 11px; color: var(--dim); margin-top: 12px; word-break: break-all; }
 .login-theme { position: fixed; top: 12px; right: 12px; }
+.login-card .or { display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 11px; text-transform: uppercase; margin: 10px 0 2px; }
+.login-card .or::before, .login-card .or::after { content: ""; flex: 1; height: 1px; background: var(--control); }
+.login { overflow-y: auto; padding: 20px 0; }
+.avatar img { width: 100%; height: 100%; border-radius: inherit; object-fit: cover; display: block; }
+.msg .edited { color: var(--dim); font-size: 11px; margin-left: 4px; }
+.msg .edit-box { width: 100%; margin-top: 4px; }
+.msg .edit-hint { color: var(--dim); font-size: 11px; }
 
 /* ---------------------------------------------------------------- layout */
 .app { display: grid; grid-template-columns: 72px 300px 1fr 300px; height: 100%; }
@@ -142,9 +149,9 @@ input[type=range] { accent-color: var(--accent); }
 .row.client .label { color: var(--text); }
 .row.client.me .label { color: var(--strong); font-weight: 600; }
 .row.client .label { display: flex; align-items: center; gap: 5px; }
-.row.client .nick { overflow: hidden; text-overflow: ellipsis; }
+.row.client .nick { overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; min-width: 3em; }
 .row.client.away .nick { color: var(--dim); }
-.gtag { font-size: 11px; border-radius: 4px; padding: 0 4px; white-space: nowrap; flex: none; }
+.gtag { font-size: 11px; border-radius: 4px; padding: 0 4px; white-space: nowrap; flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .webtag, .live { font-size: 10px; font-weight: 700; border-radius: 4px; padding: 0 5px; color: #fff; }
 .webtag { background: var(--accent); }
 .live { background: var(--red); }

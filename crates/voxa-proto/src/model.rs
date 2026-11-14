@@ -51,8 +51,10 @@ pub mod perm {
     pub const CHAT_CLEAR: u64 = 1 << 34;
     /// Pin / unpin messages at the top of a channel or the server chat.
     pub const CHAT_PIN: u64 = 1 << 35;
+    /// Edit your own channel / server chat messages (servers 1.15.0+).
+    pub const CHAT_EDIT_OWN: u64 = 1 << 36;
 
-    pub const ALL: u64 = (1 << 36) - 1;
+    pub const ALL: u64 = (1 << 37) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -78,6 +80,7 @@ pub mod perm {
         (CHAT_DELETE, "Delete anyone's chat messages (incl. history)"),
         (CHAT_CLEAR, "Clear entire chat history"),
         (CHAT_PIN, "Pin messages"),
+        (CHAT_EDIT_OWN, "Edit own chat messages"),
         (GROUP_MANAGE, "Create, edit and delete groups"),
         (GROUP_ASSIGN_SERVER, "Assign server groups"),
         (GROUP_ASSIGN_CHANNEL, "Assign channel groups"),
@@ -446,6 +449,94 @@ pub struct Person {
     pub nickname: String,
     /// Unix time of the last disconnect (0 = never).
     pub last_seen: u64,
+}
+
+/// Someone's picture and colour (servers 1.15.0+, clients 1.20.0+). Without either the
+/// initials are shown on the usual colour.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct AvatarMeta {
+    pub uid: String,
+    /// Background colour of the initials, `0xRRGGBB`.
+    pub color: Option<u32>,
+    /// Version of the picture (`avatar_hash` of it); 0 = no picture.
+    pub image: u64,
+}
+
+/// Largest avatar picture (PNG or JPEG).
+pub const MAX_AVATAR_BYTES: usize = 96 * 1024;
+/// Side of the square pictures clients make.
+pub const AVATAR_SIZE: u32 = 128;
+/// Largest side a server accepts.
+pub const MAX_AVATAR_DIM: u32 = 256;
+
+/// Version of an avatar picture: the first 8 bytes of its SHA-256 (never 0).
+pub fn avatar_hash(data: &[u8]) -> u64 {
+    use sha2::{Digest, Sha256};
+    if data.is_empty() {
+        return 0;
+    }
+    let h = Sha256::digest(data);
+    u64::from_le_bytes(h[..8].try_into().unwrap_or([1; 8])).max(1)
+}
+
+/// Width and height of a PNG or JPEG, read from its header without decoding it.
+pub fn image_dims(data: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |i: usize| -> Option<u32> { Some(u16::from_be_bytes([*data.get(i)?, *data.get(i + 1)?]) as u32) };
+    match image_kind(data)? {
+        "png" => {
+            if data.get(12..16)? != b"IHDR" {
+                return None;
+            }
+            let w = u32::from_be_bytes(data.get(16..20)?.try_into().ok()?);
+            let h = u32::from_be_bytes(data.get(20..24)?.try_into().ok()?);
+            Some((w, h))
+        }
+        "jpg" => {
+            let mut i = 2;
+            loop {
+                if *data.get(i)? != 0xFF {
+                    return None;
+                }
+                let marker = *data.get(i + 1)?;
+                match marker {
+                    // Fill bytes before a marker.
+                    0xFF => i += 1,
+                    // Markers without a length.
+                    0x01 | 0xD0..=0xD9 => i += 2,
+                    // Start of frame (not DHT C4, JPG C8 or DAC CC): height then width.
+                    0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => return Some((be16(i + 7)?, be16(i + 5)?)),
+                    _ => {
+                        let len = be16(i + 2)? as usize;
+                        if len < 2 {
+                            return None;
+                        }
+                        i += 2 + len;
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod avatar_tests {
+    use super::*;
+
+    #[test]
+    fn png_and_jpeg_dimensions() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&128u32.to_be_bytes());
+        png.extend_from_slice(&64u32.to_be_bytes());
+        assert_eq!(image_dims(&png), Some((128, 64)));
+        // SOI, an APP0 segment, then SOF0 with height 48 and width 96.
+        let jpg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 1, 2, 0xFF, 0xC0, 0, 11, 8, 0, 48, 0, 96, 3];
+        assert_eq!(image_dims(&jpg), Some((96, 48)));
+        assert_eq!(image_dims(b"GIF89a...."), None);
+        assert_eq!(image_dims(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 0]), None, "a zero length segment");
+        assert_eq!(image_dims(&png[..20]), None, "truncated");
+        assert!(avatar_hash(b"x") != 0 && avatar_hash(b"") == 0);
+    }
 }
 
 /// A direct message delivered after the recipient came online.

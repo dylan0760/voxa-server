@@ -55,8 +55,14 @@
     for (const b of new TextEncoder().encode(s || '')) h = (Math.imul(h, 31) + b) >>> 0;
     return NAME_COLORS[h % NAME_COLORS.length];
   }
+  // Pictures and colours people chose (servers 1.15.0+): uid -> { color, image }.
+  const avatars = new Map();
+  const hexColor = (c) => '#' + (c >>> 0).toString(16).padStart(6, '0').slice(-6);
   function avatar(name, uid, size, dot, square) {
-    const a = el('span', { class: 'avatar' + (square ? ' sq' : ''), style: `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.4)}px;background:${nameColor(uid || name)}` }, initials(name));
+    const meta = uid ? avatars.get(uid) : null;
+    const bg = meta && meta.color != null ? hexColor(meta.color) : nameColor(uid || name);
+    const a = el('span', { class: 'avatar' + (square ? ' sq' : ''), style: `width:${size}px;height:${size}px;font-size:${Math.round(size * 0.4)}px;background:${bg}` },
+      meta && meta.image ? el('img', { src: '/api/avatar?uid=' + encodeURIComponent(uid) + '&v=' + meta.image, alt: '', loading: 'lazy' }) : initials(name));
     if (dot) a.append(el('span', { class: 'dot', style: 'background:' + dot }));
     return a;
   }
@@ -79,12 +85,13 @@
 
   // ---------------------------------------------------------------- themes
   const THEMES = [['dark', 'Dark'], ['light', 'Light'], ['sakura', 'Sakura'], ['layette', 'Layette'], ['crimson', 'Crimson'], ['midnight', 'Midnight'], ['celadon', 'Celadon']];
-  function applyTheme(t) {
+  function applyTheme(t, fromServer) {
     if (!THEMES.some(([k]) => k === t)) t = 'dark';
     document.documentElement.dataset.theme = t;
     try { localStorage.setItem('voxa-theme', t); } catch (_) { /* private mode */ }
+    if (!fromServer && typeof savePrefs === 'function') savePrefs({ theme: t });
   }
-  applyTheme(localStorage.getItem('voxa-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'));
+  applyTheme(localStorage.getItem('voxa-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'), true);
   function themeMenu(x, y) {
     const cur = document.documentElement.dataset.theme;
     menu(x, y, [{ head: 'Theme' }, ...THEMES.map(([k, label]) => ({ label: (k === cur ? '✔ ' : '\u2003 ') + label, onClick: () => applyTheme(k) }))]);
@@ -99,7 +106,7 @@
     GROUP_ASSIGN_CHANNEL: 20, TALK_POWER_GRANT: 21, PRIVILEGE_KEY_CREATE: 22, FILE_BROWSE: 23, FILE_UPLOAD: 24,
     FILE_DOWNLOAD: 25, FILE_DELETE: 26, SCREEN_SHARE: 27, CHANNEL_COMMANDER: 28, CHAT_HISTORY: 29,
     CLIENT_DESCRIPTION_EDIT: 30, IGNORE_SERVER_MAXCLIENTS: 31, CHANNEL_JOIN: 32, CHANNEL_JOIN_IGNORE_POWER: 33,
-    CHAT_CLEAR: 34, CHAT_PIN: 35,
+    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36,
   };
   const PERM_NAMES = [
     [P.SERVER_EDIT, 'Edit virtual server settings'], [P.CHANNEL_CREATE_PERMANENT, 'Create permanent channels'],
@@ -110,7 +117,7 @@
     [P.CLIENT_KICK_SERVER, 'Kick clients from server'], [P.CLIENT_BAN, 'Ban clients'], [P.BAN_LIST, 'View and edit ban list'],
     [P.CLIENT_POKE, 'Poke clients'], [P.PRIVATE_MESSAGE, 'Send private messages'], [P.SERVER_CHAT, 'Send server chat messages'],
     [P.CHANNEL_CHAT, 'Send channel chat messages'], [P.CHAT_HISTORY, 'Read chat history'], [P.CHAT_DELETE, "Delete anyone's chat messages (incl. history)"],
-    [P.CHAT_CLEAR, 'Clear entire chat history'], [P.CHAT_PIN, 'Pin messages'], [P.GROUP_MANAGE, 'Create, edit and delete groups'],
+    [P.CHAT_CLEAR, 'Clear entire chat history'], [P.CHAT_PIN, 'Pin messages'], [P.CHAT_EDIT_OWN, 'Edit own chat messages'], [P.GROUP_MANAGE, 'Create, edit and delete groups'],
     [P.GROUP_ASSIGN_SERVER, 'Assign server groups'], [P.GROUP_ASSIGN_CHANNEL, 'Assign channel groups'], [P.TALK_POWER_GRANT, 'Grant / revoke talk power'],
     [P.PRIVILEGE_KEY_CREATE, 'Create privilege keys'], [P.FILE_BROWSE, 'Browse channel files'], [P.FILE_UPLOAD, 'Upload files'],
     [P.FILE_DOWNLOAD, 'Download files'], [P.FILE_DELETE, 'Delete files'], [P.SCREEN_SHARE, 'Share screen / applications'],
@@ -203,16 +210,37 @@
   }
 
   // ---------------------------------------------------------------- sign-in
+  // The proof is bound to this page's origin, so a look-alike site cannot reuse it.
+  const PROOF_CONTEXT = 'voxa-web-login-v2';
+  const PENDING = 'voxa-web-pending';
+  const channelBus = 'BroadcastChannel' in window ? new BroadcastChannel('voxa-web') : null;
+
   async function boot() {
     if (!C.selfTest()) {
       put(document.getElementById('root'), el('div', { class: 'login' }, el('div', { class: 'login-card' }, el('h1', null, 'Unsupported browser'), el('p', { class: 'sub' }, 'This browser computed the sign-in cryptography wrongly. Please use a current Chrome, Edge, Firefox or Safari.'))));
       return;
     }
+    // A sign-in through Voxa that never finished must not leave a password behind.
+    try {
+      const p = JSON.parse(localStorage.getItem(PENDING) || 'null');
+      if (p && !(Date.now() - p.ts < 180000)) localStorage.removeItem(PENDING);
+    } catch (_) { localStorage.removeItem(PENDING); }
+    // Opened by the Voxa client with a proof for this page.
+    if (location.hash.startsWith('#voxa-login=')) {
+      const data = location.hash.slice('#voxa-login='.length);
+      history.replaceState(null, '', location.pathname);
+      try {
+        await finishClientSignIn(data);
+        return;
+      } catch (ex) {
+        return showLogin(ex.message);
+      }
+    }
     if ((await signedIn()) === true) return connect();
     const remembered = localStorage.getItem('voxa-web-key');
     if (remembered) {
       try {
-        await signIn(remembered, localStorage.getItem('voxa-web-nick') || 'Web admin', sessionStorage.getItem('voxa-web-pw') || '');
+        await signInWithKey(remembered, pendingFromForm(localStorage.getItem('voxa-web-nick') || '', null, '', sessionStorage.getItem('voxa-web-pw') || ''));
         return connect();
       } catch (_) { /* show the form */ }
     }
@@ -229,17 +257,83 @@
     }
   }
 
-  async function signIn(key, nickname, password) {
+  async function challenge() {
+    const ch = await (await fetch('/api/challenge', { cache: 'no-store', credentials: 'same-origin' })).json();
+    if (ch.error) throw new Error(ch.error);
+    return ch;
+  }
+
+  function pendingFromForm(nickname, channel, channelPassword, password) {
+    return { nickname: nickname || '', channel, channel_password: channelPassword || null, password: password || null };
+  }
+
+  function loginBody(id, pub, proof, p) {
+    return { id, public: pub, proof, origin: location.origin, nickname: p.nickname, password: p.password, channel: p.channel, channel_password: p.channel_password };
+  }
+
+  async function signInWithKey(key, p) {
     let priv;
     try { priv = C.b64decode(key.trim()); } catch (_) { priv = null; }
     if (!priv || priv.length !== 32) throw new Error('That is not a Voxa identity key (it should be 44 characters ending in "=").');
-    const ch = await (await fetch('/api/challenge', { cache: 'no-store', credentials: 'same-origin' })).json();
-    if (ch.error) throw new Error(ch.error);
+    const ch = await challenge();
     const serverKey = C.b64decode(ch.server_key);
     const pub = C.publicKey(priv);
     const shared = C.sharedKey(priv, serverKey);
-    const proof = C.hmacSha256(shared, C.concat(C.utf8('voxa-web-login-v1'), serverKey, C.b64decode(ch.nonce), pub));
-    return post('/api/login', { id: ch.id, public: C.b64encode(pub), proof: C.b64encode(proof), nickname, password: password || null });
+    const proof = C.hmacSha256(shared, C.concat(C.utf8(PROOF_CONTEXT), serverKey, C.b64decode(ch.nonce), pub, C.utf8(location.origin)));
+    return post('/api/login', loginBody(ch.id, C.b64encode(pub), C.b64encode(proof), p));
+  }
+
+  /// Asks the installed Voxa client to sign this page in: it computes the proof with the
+  /// identity it uses for this server (after the user agrees) and opens this page again
+  /// with it. The page that asked then picks up the sign-in.
+  async function signInWithClient(p, status) {
+    const ch = await challenge();
+    localStorage.setItem(PENDING, JSON.stringify({ ...p, ts: Date.now() }));
+    const q = new URLSearchParams({ o: location.origin, i: ch.id, k: ch.server_key, n: ch.nonce, f: ch.fingerprint || '', s: ch.name || '' });
+    location.href = 'voxa://web-login?' + q.toString();
+    status('Waiting for Voxa… Confirm the sign-in in the Voxa window.');
+    // Picked up when the tab Voxa opens has signed in (same browser, so the same cookie).
+    const started = Date.now();
+    return new Promise((resolve, reject) => {
+      const done = () => { clearInterval(timer); if (channelBus) channelBus.removeEventListener('message', onMsg); };
+      const onMsg = (e) => {
+        if (e.data && e.data.type === 'signed-in') {
+          channelBus.postMessage({ type: 'taken' });
+          done();
+          resolve();
+        }
+      };
+      if (channelBus) channelBus.addEventListener('message', onMsg);
+      const timer = setInterval(async () => {
+        if ((await signedIn()) === true) { done(); resolve(); }
+        else if (Date.now() - started > 120000) { done(); localStorage.removeItem(PENDING); reject(new Error('Voxa did not answer. Is it installed and running? You can paste your identity key instead.')); }
+      }, 2000);
+    });
+  }
+
+  async function finishClientSignIn(data) {
+    let d;
+    try { d = JSON.parse(new TextDecoder().decode(C.b64decode(data.replace(/-/g, '+').replace(/_/g, '/')))); } catch (_) { throw new Error('The sign-in from Voxa could not be read.'); }
+    let p = {};
+    try { p = JSON.parse(localStorage.getItem(PENDING) || '{}'); } catch (_) { /* none */ }
+    localStorage.removeItem(PENDING);
+    if (!p.ts || Date.now() - p.ts > 180000) p = pendingFromForm('', null, '', '');
+    await post('/api/login', loginBody(d.i, d.p, d.proof, p));
+    // If the page that asked is still open, it takes over and this tab closes.
+    if (channelBus) {
+      const taken = await new Promise((resolve) => {
+        const t = setTimeout(() => resolve(false), 600);
+        channelBus.addEventListener('message', (e) => { if (e.data && e.data.type === 'taken') { clearTimeout(t); resolve(true); } }, { once: true });
+        channelBus.postMessage({ type: 'signed-in' });
+      });
+      if (taken) {
+        put(document.getElementById('root'), el('div', { class: 'login' }, el('div', { class: 'login-card' },
+          el('img', { class: 'logo', src: '/icon.svg', alt: '' }), el('h1', null, 'Signed in'), el('p', { class: 'sub' }, 'You are signed in in your other tab. You can close this one.'))));
+        window.close();
+        return;
+      }
+    }
+    connect();
   }
 
   async function showLogin(error) {
@@ -247,20 +341,56 @@
     S.connected = false;
     let info = {};
     try { info = await (await fetch('/api/challenge', { cache: 'no-store' })).json(); } catch (_) { /* offline */ }
+    let channels = [];
+    try { channels = (await (await fetch('/api/channels', { cache: 'no-store' })).json()).channels || []; } catch (_) { /* none */ }
+    const lastChannel = localStorage.getItem('voxa-web-channel');
     const key = el('textarea', { placeholder: 'Paste your exported identity key', spellcheck: 'false', autocomplete: 'off' });
-    const nick = el('input', { type: 'text', value: localStorage.getItem('voxa-web-nick') || '', placeholder: 'Web admin', maxlength: '30' });
+    const nick = el('input', { type: 'text', value: localStorage.getItem('voxa-web-nick') || '', placeholder: 'Last used, or "Web admin"', maxlength: '30' });
     const pw = el('input', { type: 'password', placeholder: 'Server password', autocomplete: 'current-password' });
+    // The channel to join: a list when the server shares it, otherwise a path.
+    const chSel = channels.length
+      ? el('select', null,
+        el('option', { value: '\u0001', selected: lastChannel == null }, 'The one I used last time'),
+        el('option', { value: '', selected: lastChannel === '' }, 'The default channel'),
+        channels.map((c) => el('option', { value: c.path, selected: c.path === lastChannel }, c.path + (c.password ? '  🔒' : ''))))
+      : el('input', { type: 'text', placeholder: 'e.g. Lobby/Games (empty: the one used last time)', value: lastChannel || '' });
+    const chPw = el('input', { type: 'password', placeholder: 'Channel password', autocomplete: 'off' });
+    const chPwRow = el('div', { style: 'display:flex;flex-direction:column;gap:6px' }, el('label', null, 'Channel password'), chPw);
+    const updPw = () => { const c = channels.find((x) => x.path === chSel.value); chPwRow.classList.toggle('hidden', !(c && c.password) && channels.length > 0); };
+    chSel.addEventListener('change', updPw);
+    updPw();
     const remember = el('input', { type: 'checkbox', id: 'remember' });
     const err = el('div', { class: 'error' }, error || '');
-    const btn = el('button', { class: 'btn primary', type: 'submit' }, 'Sign in');
+    const btn = el('button', { class: 'btn primary', type: 'submit' }, 'Sign in with key');
+    const voxaBtn = el('button', { class: 'btn primary', type: 'button' }, '🎧 Sign in with Voxa');
+    const pending = () => {
+      let channel = chSel.value;
+      if (channel === '\u0001') channel = null;
+      else if (!channels.length && !channel.trim()) channel = null;
+      localStorage.setItem('voxa-web-nick', nick.value.trim());
+      if (channel == null) localStorage.removeItem('voxa-web-channel'); else localStorage.setItem('voxa-web-channel', channel);
+      return pendingFromForm(nick.value.trim(), channel, chPw.value, pw.value);
+    };
+    const busy = (on) => { btn.disabled = on; voxaBtn.disabled = on; };
+    voxaBtn.addEventListener('click', async () => {
+      err.textContent = '';
+      busy(true);
+      try {
+        await signInWithClient(pending(), (t) => { err.style.color = 'var(--dim)'; err.textContent = t; });
+        connect();
+      } catch (ex) {
+        err.style.color = '';
+        err.textContent = ex.message;
+        busy(false);
+      }
+    });
     const form = el('form', {
       onsubmit: async (e) => {
         e.preventDefault();
         err.textContent = '';
-        btn.disabled = true;
+        busy(true);
         try {
-          await signIn(key.value, nick.value.trim() || 'Web admin', pw.value);
-          localStorage.setItem('voxa-web-nick', nick.value.trim());
+          await signInWithKey(key.value, pending());
           if (remember.checked) {
             localStorage.setItem('voxa-web-key', key.value.trim());
             if (pw.value) sessionStorage.setItem('voxa-web-pw', pw.value);
@@ -269,16 +399,23 @@
           connect();
         } catch (ex) {
           err.textContent = ex.message;
-          btn.disabled = false;
+          busy(false);
         }
       },
     },
-      el('label', null, 'Identity key'), key,
-      el('label', null, 'Nickname'), nick,
-      info.has_password ? [el('label', null, 'Server password'), pw] : null,
+      voxaBtn,
+      el('div', { class: 'help', style: 'margin:2px 0 6px;text-align:center' }, 'Uses the identity Voxa on this PC has for this server. Voxa asks you to confirm.'),
+      el('div', { class: 'or' }, 'or paste an identity key'),
+      key,
       el('div', { class: 'row' }, remember, el('label', { for: 'remember', style: 'margin:0;color:var(--text);font-size:13px' }, 'Remember the key in this browser')),
-      err, btn);
-    put(document.getElementById('root'), 
+      btn,
+      el('div', { class: 'or' }, 'options'),
+      el('label', null, 'Nickname'), nick,
+      el('label', null, 'Join channel'), chSel,
+      chPwRow,
+      info.has_password ? [el('label', null, 'Server password'), pw] : null,
+      err);
+    put(document.getElementById('root'),
       el('div', { class: 'login' },
         el('button', { class: 'icon-btn login-theme', title: 'Theme', onclick: (e) => themeMenu(e.clientX - 160, e.clientY + 10) }, '🎨'),
         el('div', { class: 'login-card' },
@@ -286,9 +423,8 @@
           el('h1', null, info.name || 'Voxa Server'),
           el('div', { class: 'sub' }, 'Server administration · Voxa Server ' + (info.version || '')),
           form,
-          el('div', { class: 'help' }, 'Sign in with a Voxa identity: in Voxa, open your identities (click your name at the bottom left ▸ Identities) and export the one you use on this server. You get the same rights here as that identity has in Voxa. The key stays in this browser: only a proof that you own it is sent.'),
+          el('div', { class: 'help' }, 'You get the same rights here as your identity has in Voxa. To get a key, in Voxa click your name at the bottom left ▸ Identities and export the one you use on this server. Keys stay in this browser: only a proof that you own one is sent.'),
           info.fingerprint ? el('div', { class: 'fp' }, 'Server fingerprint: ' + info.fingerprint) : null)));
-    key.focus();
   }
 
   async function signOut() {
@@ -296,6 +432,22 @@
     sessionStorage.removeItem('voxa-web-pw');
     try { await post('/api/logout'); } catch (_) { /* already gone */ }
     showLogin('Signed out.');
+  }
+
+  /// Theme, nickname and channel are remembered per identity on the server, so they
+  /// follow you to other browsers and addresses.
+  async function loadPrefs() {
+    try {
+      const r = await fetch('/api/prefs', { credentials: 'same-origin', cache: 'no-store' });
+      if (!r.ok) return;
+      const p = await r.json();
+      if (p.theme) applyTheme(p.theme, true);
+      if (p.nickname) localStorage.setItem('voxa-web-nick', p.nickname);
+      localStorage.setItem('voxa-web-channel', p.channel || '');
+    } catch (_) { /* keep the local ones */ }
+  }
+  function savePrefs(p) {
+    if (S.connected) post('/api/prefs', p).catch(() => {});
   }
 
   // ---------------------------------------------------------------- live connection
@@ -365,11 +517,14 @@
         S.clients = new Map(v.clients.map((c) => [c.id, c]));
         S.groups = new Map(v.groups.map((g) => [g.id, g]));
         S.logs = new Map();
+        S.editing = null;
+        avatars.clear();
         S.connected = true;
         S.msgDirty = true;
         banner('');
         closeDialogs(true);
         buildApp();
+        loadPrefs();
         activateTab(S.tab.startsWith('dm:') ? S.tab : S.tab);
         break;
       }
@@ -489,6 +644,26 @@
       case 'People':
         S.people = v;
         break;
+      case 'AvatarInfo':
+        for (const m of v) avatars.set(m.uid, m);
+        S.msgDirty = true;
+        break;
+      case 'MessageEdited': {
+        const key = keyOf(v.target);
+        const line = key && log(key).lines.find((x) => x.msg && x.msg.id === v.id);
+        if (line) { line.msg.text = v.text; line.msg.edited = v.edited_at; }
+        if (S.pins) for (const p of S.pins) if (p.message.id === v.id) p.message.text = v.text;
+        if (key === tabKey()) S.msgDirty = true;
+        break;
+      }
+      case 'EditedMessages': {
+        const key = keyOf(v.target);
+        if (!key) break;
+        const at = new Map(v.edits);
+        for (const x of log(key).lines) if (x.msg && at.has(x.msg.id)) x.msg.edited = at.get(x.msg.id);
+        if (key === tabKey()) S.msgDirty = true;
+        break;
+      }
       case 'OfflineMessages':
         for (const m of v) {
           openDm(m.from_uid, m.from_name);
@@ -835,7 +1010,10 @@
       const cont = prev && prev.from_uid === m.from_uid && m.ts - prev.ts < 300;
       const mine = m.from_uid === S.uid;
       const canDel = isDm || mine || can(P.CHAT_DELETE);
+      const canEdit = !isDm && mine && m.id && !IMAGE_RE.test(m.text) && can(P.CHAT_EDIT_OWN);
+      const editing = S.editing && S.editing.key === key && S.editing.id === m.id;
       const actions = el('div', { class: 'actions' },
+        canEdit && !editing ? el('button', { class: 'icon-btn', title: 'Edit message', onclick: () => startEdit(key, m) }, '✏️') : null,
         el('button', { class: 'icon-btn', title: 'Copy text', onclick: () => copy(m.text) }, '📋'),
         !isDm && can(P.CHAT_PIN) && m.id ? el('button', { class: 'icon-btn', title: 'Pin', onclick: () => send({ PinMessage: { target, id: m.id, pin: true } }) }, '📌') : null,
         canDel ? el('button', { class: 'icon-btn', title: isDm ? 'Remove from this page' : 'Delete message', style: 'color:var(--red)', onclick: () => deleteMessage(m) }, '🗑') : null);
@@ -843,13 +1021,37 @@
         avatar(m.from_name, m.from_uid, 36),
         el('div', { class: 'body' },
           cont ? null : el('div', { class: 'head' }, el('span', { class: 'from' }, m.from_name), el('span', { class: 'time' }, fmtTime(m.ts))),
-          el('div', { class: 'text', title: fmtDate(m.ts) }, messageText(m.text))),
+          editing ? [S.editing.box, el('div', { class: 'edit-hint' }, 'Enter to save · Esc to cancel · Shift+Enter for a new line')]
+            : el('div', { class: 'text', title: fmtDate(m.ts) }, messageText(m.text), m.edited ? el('span', { class: 'edited', title: 'Edited ' + fmtDate(m.edited) }, '(edited)') : null)),
         actions));
       prev = m;
     }
+    const editFocused = S.editing && document.activeElement === S.editing.box;
     put(box, ...out);
+    if (editFocused) S.editing.box.focus();
     if (atBottom || box.dataset.key !== key) box.scrollTop = box.scrollHeight;
     box.dataset.key = key;
+  }
+
+  /// Edits one of your own messages in place (servers 1.15.0+).
+  function startEdit(key, m) {
+    const box = el('textarea', { class: 'edit-box', rows: String(Math.min(8, m.text.split('\n').length + 1)), value: m.text, maxlength: '8000' });
+    const target = tabTarget();
+    const stop = () => { S.editing = null; S.msgDirty = true; schedule(); };
+    box.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); stop(); }
+      else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        const text = box.value.trim();
+        if (!text) { toast('A message cannot be empty: delete it instead', 'warn'); return; }
+        if (text !== m.text) send({ EditMessage: { target, id: m.id, text } });
+        stop();
+      }
+    });
+    S.editing = { key, id: m.id, box };
+    S.msgDirty = true;
+    schedule();
+    setTimeout(() => { box.focus(); box.setSelectionRange(box.value.length, box.value.length); }, 0);
   }
 
   function deleteMessage(m) {
@@ -1112,6 +1314,7 @@
       can(P.GROUP_ASSIGN_CHANNEL) ? { label: '👥  Channel Group…', onClick: () => channelGroupDialog(c) } : null,
       can(P.GROUP_MANAGE) ? { label: '🔐  Permissions…', onClick: () => clientPermsDialog(c) } : null,
       can(P.CLIENT_DESCRIPTION_EDIT) ? { label: '📝  Edit Description…', onClick: () => editDescription(c) } : null,
+      can(P.CLIENT_DESCRIPTION_EDIT) && avatars.get(c.uid)?.image ? { label: '🖼  Remove Avatar Picture…', danger: true, onClick: () => confirmDialog('Remove avatar picture', 'Remove the avatar picture of ' + c.nickname + '? They cannot use the same picture again on this server.', 'Remove', true).then((ok) => ok && send({ ClearAvatar: c.uid })) } : null,
       { label: '📋  Copy Unique ID', onClick: () => copy(c.uid) },
       { sep: true },
       can(P.CLIENT_KICK_CHANNEL) ? { label: '👢  Kick from Channel…', danger: true, onClick: () => kickClient(c, false) } : null,
@@ -1187,6 +1390,7 @@
       if (n && n.trim()) {
         send({ UpdateSelf: { nickname: n.trim() } });
         localStorage.setItem('voxa-web-nick', n.trim());
+        savePrefs({ nickname: n.trim() });
       }
     });
   }

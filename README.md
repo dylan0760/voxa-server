@@ -75,21 +75,31 @@ with the same layout and the same seven themes as the Voxa client (🎨 at the b
 left).
 
 * **Open it:** `http://<server>:9980/`, or **🌐 Open Web Admin** in Voxa Server Manager.
-* **Sign in** with a Voxa identity. In Voxa, click your name at the bottom left ▸
-  **Identities**, export the identity you use on this server, and paste the key.
-  * You get exactly the rights that identity has: an admin identity can do everything,
-    a normal one only what normal users can.
-  * The key never leaves the browser. The page proves it owns the key (X25519 key
-    agreement with a one-time server key, then HMAC-SHA256); only that proof is sent.
+* **Sign in** with a Voxa identity. You get exactly the rights that identity has: an
+  admin identity can do everything, a normal one only what normal users can.
+  * **🎧 Sign in with Voxa** (Voxa 1.20.0+ on this PC): Voxa pops up, shows the web
+    address and the server (recognised by its fingerprint), and asks which identity to
+    use. Confirm, and the browser is signed in. The key never leaves Voxa.
+  * **Or paste a key:** in Voxa, click your name at the bottom left ▸ **Identities**,
+    export the identity, and paste it. The key never leaves the browser.
+  * Either way only a proof is sent: an X25519 key agreement with a one-time server key,
+    then HMAC-SHA256 over the challenge **and the page's web address**. A proof made for
+    a look-alike site is useless on the real one.
   * **Remember the key in this browser** is off by default; a sign-in lasts 12 hours.
+* **Join channel:** choose the channel the page joins when signing in (a list on
+  servers without a password, otherwise type a path like `Lobby/Games`), with its
+  password if it has one.
+* **Remembered for you:** the theme, nickname and channel are saved per identity on the
+  server, so they follow you to other browsers, PCs and web addresses.
 * **What you can do:**
   * create, edit, clone, reorder and delete channels and separators; join channels;
   * drag people onto channels to move them; poke, kick, ban, talk power, server and
     channel groups, personal permissions, descriptions;
   * edit the virtual server and the file limits, groups and permissions, the ban list,
     and privilege keys;
-  * read and write server and channel chat (with history, pins and images), and send
-    direct messages, including to people who are offline.
+  * read and write server and channel chat (with history, pins and images), edit your
+    own messages, and send direct messages, including to people who are offline;
+  * see everyone's avatars, and remove an offensive avatar picture.
 * **How it appears:** a signed-in page is an ordinary session of that identity, shown
   with a **WEB** badge and no voice. It can run alongside the same identity's desktop
   client without replacing it.
@@ -108,8 +118,14 @@ Behind a proxy on the same PC or local network, the visitor's address comes from
 sign-in cookie is marked `Secure` when the proxy reports HTTPS. Other proxies (Caddy,
 Traefik, IIS…) work the same way.
 
+The proxy must pass the original `Host` header (Nginx Proxy Manager does). If sign-in
+says *"This sign-in was made for a different web address"*, the proxy rewrites it.
+
 To change the port or address, set `web_port` / `web_bind` in `server.toml`. To turn
-the page off, set `web_enabled = false`. Restart the server after editing.
+the page off, set `web_enabled = false`. For extra safety, list the exact address(es)
+the page may be signed in from, e.g.
+`web_allowed_origins = ["https://voxa-admin.example.com", "http://192.168.1.35:9980"]`.
+Restart the server after editing.
 
 ## Client version
 With `require_latest_client = true` (the default in `server.toml`), the server only
@@ -160,6 +176,14 @@ their update window by themselves. To allow older clients, set
     messages*.
   * *Clear entire chat history* wipes a whole channel or server chat.
   * **Pinned messages**.
+  * **Edit your own messages** with the *Edit own chat messages* permission (on for the
+    Normal and Server Admin groups; existing servers get it added to Normal when they
+    update). Nobody can edit someone else's message, and images can't be edited. Edited
+    messages are marked "(edited)" for everyone.
+* **Avatars:** people can pick a colour for their initials or upload a picture (Voxa
+  1.20.0). Pictures are checked: PNG or JPEG, at most 96 KB and 16–256 pixels per side.
+  Moderators with *Edit client descriptions* can remove a picture, and the same picture
+  can't be set again.
 * **People list:** everyone who has been on the server, with when they were last seen.
   Everyone can see it.
 * **Offline messages:** people can message someone who is offline.
@@ -205,9 +229,12 @@ their update window by themselves. To allow older clients, set
   * the upload quota cannot be bypassed by uploading in parallel.
 * **Voice addresses:** voice is only sent to the address a client is connected from.
 * **Web admin page:**
-  * Sign-in by proof of identity (the key stays in the browser); one-time challenges
-    expire after 2 minutes; 10 failed sign-ins from one address lock it out for 10
-    minutes.
+  * Sign-in by proof of identity (the key stays in the browser or in Voxa), bound to the
+    page's web address so phishing sites can't reuse it; optionally pinned to the
+    addresses in `web_allowed_origins`.
+  * One-time challenges expire after 2 minutes; 10 failed sign-ins from one address
+    lock it out for 10 minutes.
+  * Signing in with Voxa always needs a click in Voxa, which shows the web address.
   * The session cookie is `HttpOnly` and `SameSite=Strict`; every action also needs a
     header other sites can't send (no cross-site requests).
   * A strict Content Security Policy (no inline or third-party scripts), no framing, and
@@ -235,6 +262,7 @@ Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
 | `web_enabled` | `true` | Serve the [web admin page](#web-admin-page) |
 | `web_bind` | `0.0.0.0` | Address the web admin page listens on |
 | `web_port` | `9980` | TCP port of the web admin page |
+| `web_allowed_origins` | `[]` | Web addresses the page may be signed in from (empty = any) |
 
 Restart the server after editing.
 
