@@ -222,11 +222,15 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.24.0";
+pub const MIN_CLIENT_VERSION: &str = "1.27.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
 pub const OFFLINE_DAYS: u64 = 30;
+/// Answer to messages and images for the Server tab, which shows server events only.
+pub const SERVER_TAB_READ_ONLY: &str = "The Server tab only shows what happens on the server: chat in a channel, or with direct or group messages";
+/// Group chats one person can be in.
+pub const MAX_GROUP_CHATS_PER_USER: usize = 100;
 
 /// Most channels a server holds, and how deeply they can be nested.
 pub const MAX_CHANNELS: usize = 2000;
@@ -946,6 +950,21 @@ impl Server {
                 _ => {}
             }
         }
+        // Group chats, then the group messages that arrived while this person was offline.
+        if !voxa_proto::update::is_newer("1.27.0", &info.version) {
+            let chats = self.store.group_chats_of(&uid).unwrap_or_default();
+            let infos: Vec<GroupChatInfo> = chats.iter().map(|(id, rec)| self.group_info(&st, *id, rec)).collect();
+            tx.send(Out::Msg(S2C::GroupChats(infos)));
+            match self.store.take_group_queue(&uid) {
+                Ok(msgs) => {
+                    for m in msgs.into_iter().filter(|m| chats.iter().any(|(id, _)| *id == m.group)) {
+                        let target = TextTarget::Group(m.group);
+                        tx.send(Out::Msg(S2C::Text(ChatMessage { id: 0, target, from: None, from_uid: m.from_uid, from_name: m.from_name, ts: m.ts, text: m.text })));
+                    }
+                }
+                Err(e) => warn!("could not read waiting group messages: {e:#}"),
+            }
+        }
         // Presences of the people the newcomer can see (busy, and invisible for administrators).
         if !voxa_proto::update::is_newer("1.22.0", &info.version) {
             for s in st.sessions.values().filter(|s| s.presence != Presence::Online && (!s.hidden() || viewer_admin)) {
@@ -1456,7 +1475,7 @@ impl Server {
                         self.need(self.perms_in(st, s, ch), perm::CHAT_CLEAR)?;
                         ch
                     }
-                    TextTarget::Private(_) => return Err("Private conversations are not stored".into()),
+                    TextTarget::Private(_) | TextTarget::Group(_) => return Err("Private conversations are not stored".into()),
                 };
                 let by = s.info.nickname.clone();
                 let n = db(self.store.clear_chat(ch))?;
@@ -1553,6 +1572,10 @@ impl Server {
             }
             C2S::Hardware(tokens) => self.set_hardware(st, me, tokens, kicks),
             C2S::SetPresence(p) => self.set_presence(st, me, p),
+            C2S::CreateGroupChat { name, members } => self.create_group_chat(st, me, name, members),
+            C2S::InviteToGroupChat { id, uids } => self.invite_to_group_chat(st, me, id, uids),
+            C2S::RenameGroupChat { id, name } => self.rename_group_chat(st, me, id, name),
+            C2S::LeaveGroupChat(id) => self.leave_group_chat(st, me, id),
             C2S::BanWith { target, uid, ip, hardware, duration_secs, reason } => self.ban_with(st, me, target, [uid, ip, hardware], duration_secs, reason, kicks),
             C2S::GetFileLimits => {
                 st.send(me, S2C::FileLimits(st.file_limits));
@@ -2057,12 +2080,8 @@ impl Server {
         let from_name = s.info.nickname.clone();
         let ts = now_unix();
         match target {
-            TextTarget::Server => {
-                self.need(st.server_perms(s), perm::SERVER_CHAT)?;
-                let stored = StoredMessage { from_uid: from_uid.clone(), from_name: from_name.clone(), ts, text: text.clone() };
-                let id = db(self.store.append_chat(SERVER_CHAT_CHANNEL, &stored))?;
-                st.broadcast(S2C::Text(ChatMessage { id, target, from: Some(me), from_uid, from_name, ts, text }));
-            }
+            // The Server tab only shows what happens on the server (1.19.0+).
+            TextTarget::Server => return Err(SERVER_TAB_READ_ONLY.into()),
             TextTarget::Channel(ch) => {
                 if s.info.channel != ch {
                     return Err("You can only write to the channel you are in".into());
@@ -2079,7 +2098,154 @@ impl Server {
                 st.send(other, S2C::Text(m.clone()));
                 st.send(me, S2C::Text(ChatMessage { target: TextTarget::Private(other), ..m }));
             }
+            TextTarget::Group(id) => {
+                self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
+                let rec = self.member_group(id, &from_uid)?;
+                let m = ChatMessage { id: 0, target, from: Some(me), from_uid, from_name, ts, text };
+                self.deliver_group(st, id, &rec, m);
+            }
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------ group chats
+
+    /// A group chat `uid` is in (anything else looks like it does not exist).
+    fn member_group(&self, id: GroupChatId, uid: &str) -> Res<crate::store::GroupChatRec> {
+        db(self.store.group_chat(id))?.filter(|r| r.members.iter().any(|m| m == uid)).ok_or_else(|| "Group chat not found".into())
+    }
+
+    /// The nickname of a uid: online, else as last seen.
+    fn nickname_of(&self, st: &State, uid: &str) -> String {
+        st.sessions
+            .values()
+            .find(|s| s.info.uid == uid)
+            .map(|s| s.info.nickname.clone())
+            .or_else(|| self.store.get_client(uid).ok().flatten().map(|c| c.nickname))
+            .unwrap_or_default()
+    }
+
+    fn group_info(&self, st: &State, id: GroupChatId, rec: &crate::store::GroupChatRec) -> GroupChatInfo {
+        GroupChatInfo {
+            id,
+            name: rec.name.clone(),
+            owner: rec.owner.clone(),
+            members: rec.members.iter().map(|u| (u.clone(), self.nickname_of(st, u))).collect(),
+            created: rec.created,
+        }
+    }
+
+    /// Sends a message to every session of `uids` that understands group chats.
+    fn send_to_uids(st: &State, uids: &[String], msg: &S2C) {
+        for s in st.sessions.values().filter(|s| uids.contains(&s.info.uid) && s.client_at_least("1.27.0")) {
+            s.tx.send(Out::Msg(msg.clone()));
+        }
+    }
+
+    /// A group message to every member: live to those online (the sender's sessions too, so
+    /// it shows there), kept for the others until they connect.
+    fn deliver_group(&self, st: &State, id: GroupChatId, rec: &crate::store::GroupChatRec, m: ChatMessage) {
+        let msg = S2C::Text(m.clone());
+        Self::send_to_uids(st, &rec.members, &msg);
+        for uid in rec.members.iter().filter(|u| **u != m.from_uid) {
+            let online = st.sessions.values().any(|s| &s.info.uid == uid && s.client_at_least("1.27.0"));
+            if online || self.store.group_queue_count(uid).unwrap_or(usize::MAX) >= MAX_OFFLINE_WAITING {
+                continue;
+            }
+            let q = crate::store::QueuedGroupMessage { group: id, from_uid: m.from_uid.clone(), from_name: m.from_name.clone(), ts: m.ts, text: m.text.clone() };
+            if let Err(e) = self.store.queue_group_message(uid, &q) {
+                warn!("could not keep a group message for {uid}: {e:#}");
+            }
+        }
+    }
+
+    /// Checks people to add to a group chat: known to the server, not yet in it.
+    fn new_group_members(&self, rec_members: &[String], uids: Vec<String>) -> Res<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        for u in uids {
+            if u.len() > 64 || rec_members.contains(&u) || out.contains(&u) {
+                continue;
+            }
+            if db(self.store.get_client(&u))?.is_none() {
+                return Err("Unknown user".into());
+            }
+            out.push(u);
+        }
+        if rec_members.len() + out.len() > MAX_GROUP_CHAT_MEMBERS {
+            return Err(format!("A group chat can have at most {MAX_GROUP_CHAT_MEMBERS} people").into());
+        }
+        Ok(out)
+    }
+
+    fn create_group_chat(&self, st: &mut State, me: ClientId, name: String, members: Vec<String>) -> Res {
+        let s = st.session(me)?;
+        self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
+        let my_uid = s.info.uid.clone();
+        if db(self.store.group_chats_of(&my_uid))?.len() >= MAX_GROUP_CHATS_PER_USER {
+            return Err(format!("You can be in at most {MAX_GROUP_CHATS_PER_USER} group chats").into());
+        }
+        let others = self.new_group_members(std::slice::from_ref(&my_uid), members.into_iter().take(MAX_GROUP_CHAT_MEMBERS * 2).collect())?;
+        if others.is_empty() {
+            return Err("Add at least one other person".into());
+        }
+        st.spend_chat(me)?;
+        let mut name = clean_line(&name, 50);
+        if name.trim().is_empty() {
+            name = "Group chat".into();
+        }
+        let id = db(self.store.new_group_chat_id())?;
+        let rec = crate::store::GroupChatRec { name, owner: my_uid.clone(), members: std::iter::once(my_uid).chain(others).collect(), created: now_unix() };
+        db(self.store.save_group_chat(id, &rec))?;
+        info!("group chat {id} \"{}\" created with {} people", rec.name, rec.members.len());
+        let info = self.group_info(st, id, &rec);
+        Self::send_to_uids(st, &rec.members, &S2C::GroupChatUpdated(info));
+        Ok(())
+    }
+
+    fn invite_to_group_chat(&self, st: &mut State, me: ClientId, id: GroupChatId, uids: Vec<String>) -> Res {
+        let s = st.session(me)?;
+        self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
+        let mut rec = self.member_group(id, &s.info.uid)?;
+        let add = self.new_group_members(&rec.members, uids.into_iter().take(MAX_GROUP_CHAT_MEMBERS * 2).collect())?;
+        if add.is_empty() {
+            return Ok(());
+        }
+        st.spend_chat(me)?;
+        rec.members.extend(add);
+        db(self.store.save_group_chat(id, &rec))?;
+        let info = self.group_info(st, id, &rec);
+        Self::send_to_uids(st, &rec.members, &S2C::GroupChatUpdated(info));
+        Ok(())
+    }
+
+    fn rename_group_chat(&self, st: &mut State, me: ClientId, id: GroupChatId, name: String) -> Res {
+        let s = st.session(me)?;
+        let mut rec = self.member_group(id, &s.info.uid)?;
+        let name = clean_line(&name, 50);
+        if name.trim().is_empty() || name == rec.name {
+            return Ok(());
+        }
+        st.spend_chat(me)?;
+        rec.name = name;
+        db(self.store.save_group_chat(id, &rec))?;
+        let info = self.group_info(st, id, &rec);
+        Self::send_to_uids(st, &rec.members, &S2C::GroupChatUpdated(info));
+        Ok(())
+    }
+
+    fn leave_group_chat(&self, st: &mut State, me: ClientId, id: GroupChatId) -> Res {
+        let s = st.session(me)?;
+        let my_uid = s.info.uid.clone();
+        let mut rec = self.member_group(id, &my_uid)?;
+        rec.members.retain(|m| *m != my_uid);
+        if rec.members.is_empty() {
+            db(self.store.delete_group_chat(id))?;
+        } else {
+            db(self.store.save_group_chat(id, &rec))?;
+            let info = self.group_info(st, id, &rec);
+            Self::send_to_uids(st, &rec.members, &S2C::GroupChatUpdated(info));
+        }
+        Self::send_to_uids(st, std::slice::from_ref(&my_uid), &S2C::GroupChatLeft(id));
         Ok(())
     }
 
@@ -2096,7 +2262,7 @@ impl Server {
                 self.need(self.perms_in(st, s, ch), perm::CHAT_HISTORY)?;
                 Ok(ch)
             }
-            TextTarget::Private(_) => Err("Private conversations are not stored".into()),
+            TextTarget::Private(_) | TextTarget::Group(_) => Err("Private conversations are not stored".into()),
         }
     }
 
@@ -2172,7 +2338,7 @@ impl Server {
                 }
                 c
             }
-            TextTarget::Private(_) => return Err("Direct messages are not stored on the server".into()),
+            TextTarget::Private(_) | TextTarget::Group(_) => return Err("Direct messages are not stored on the server".into()),
         };
         let p = if ch == SERVER_CHAT_CHANNEL { st.server_perms(s) } else { self.perms_in(st, s, ch) };
         self.need(p, perm::CHAT_EDIT_OWN)?;
@@ -2766,6 +2932,11 @@ impl Server {
             Err(e) => warn!("offline message cleanup failed: {e:#}"),
             _ => {}
         }
+        match self.store.purge_group_queue_before(cutoff) {
+            Ok(n) if n > 0 => info!("removed {n} undelivered group chat message(s)"),
+            Err(e) => warn!("group message cleanup failed: {e:#}"),
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------------------ periodic
@@ -2801,6 +2972,9 @@ impl Server {
         let mut name = truncate(name.trim(), 100);
         if name.is_empty() {
             name = format!("image.{ext}");
+        }
+        if target == TextTarget::Server {
+            return Err(SERVER_TAB_READ_ONLY.into());
         }
         let mut guard = self.state.lock();
         let st = &mut *guard;
@@ -2852,6 +3026,17 @@ impl Server {
                 let m = ChatMessage { id: 0, target: TextTarget::Private(me), from: Some(me), from_uid, from_name: from_name.clone(), ts, text };
                 st.send(other, S2C::Text(m.clone()));
                 st.send(me, S2C::Text(ChatMessage { target: TextTarget::Private(other), ..m }));
+            }
+            TextTarget::Group(id) => {
+                // Like a private image: only the chat's members (at the time) may open it.
+                self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
+                let rec = self.member_group(id, &from_uid)?;
+                let image = db(self.store.new_image_id())?;
+                let text = ImageRef { id: image, width, height, name: name.clone() }.to_text();
+                let meta = ImageMeta { ch: None, msg: 0, uids: rec.members.clone(), ts, name: name.clone() };
+                db(self.store.put_image(image, &meta, &data))?;
+                let m = ChatMessage { id: 0, target, from: Some(me), from_uid, from_name: from_name.clone(), ts, text };
+                self.deliver_group(st, id, &rec, m);
             }
         }
         info!("{from_name} posted image \"{name}\" ({} KB) to {target:?}", size / 1024);

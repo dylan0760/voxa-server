@@ -351,6 +351,27 @@ pub enum TextTarget {
     Channel(ChannelId),
     /// Private conversation; the id is the *other* participant.
     Private(ClientId),
+    /// A group chat (servers 1.19.0+). Like direct messages, never stored on the server
+    /// (only kept there for members who are offline, until they connect).
+    Group(GroupChatId),
+}
+
+/// Id of a group chat (servers 1.19.0+).
+pub type GroupChatId = u64;
+
+/// Most people in one group chat.
+pub const MAX_GROUP_CHAT_MEMBERS: usize = 50;
+
+/// A group chat you are in (servers 1.19.0+).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GroupChatInfo {
+    pub id: GroupChatId,
+    pub name: String,
+    /// Who made it.
+    pub owner: String,
+    /// Members: (uid, nickname as last seen).
+    pub members: Vec<(String, String)>,
+    pub created: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

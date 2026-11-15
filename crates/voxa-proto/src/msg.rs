@@ -120,6 +120,15 @@ pub enum C2S {
     // --- added in 1.17.0; only sent to servers that are 1.17.0 or newer ---
     /// Online, busy or invisible (away goes through `UpdateSelf`, as before).
     SetPresence(Presence),
+
+    // --- added in 1.19.0; only sent to servers that are 1.19.0 or newer ---
+    /// Starts a group chat with you and these people (uids). Messages go with
+    /// `SendText { target: TextTarget::Group(id) }`.
+    CreateGroupChat { name: String, members: Vec<String> },
+    /// Adds people to a group chat you are in.
+    InviteToGroupChat { id: GroupChatId, uids: Vec<String> },
+    RenameGroupChat { id: GroupChatId, name: String },
+    LeaveGroupChat(GroupChatId),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -226,6 +235,14 @@ pub enum S2C {
     /// Someone's presence (Online or Busy; Invisible only to administrators, who can see
     /// invisible people). Sent after Welcome for everyone not Online, and on changes.
     ClientPresence { id: ClientId, presence: Presence },
+
+    // --- added in 1.19.0; only sent to clients that are 1.27.0 or newer ---
+    /// The group chats you are in (after Welcome, before any waiting group messages).
+    GroupChats(Vec<GroupChatInfo>),
+    /// A group chat you are in was created or changed (members, name).
+    GroupChatUpdated(GroupChatInfo),
+    /// You are no longer in this group chat (you left it).
+    GroupChatLeft(GroupChatId),
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file

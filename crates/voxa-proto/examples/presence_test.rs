@@ -111,10 +111,13 @@ async fn main() {
     println!("2. even an admin reading \"channel 0\": \"{}\"", error(&mut admin).await);
     admin.w.send(&C2S::MoveClient { target: bob.id, channel: NO_CHANNEL }).await.unwrap();
     println!("2. moving someone to \"channel 0\": \"{}\"", error(&mut admin).await);
-    // Server chat still works.
+    // The Server tab only shows server events (1.19.0+); direct messages work without a channel.
     alice.w.send(&C2S::SendText { target: TextTarget::Server, text: "hello from the lobby".into() }).await.unwrap();
+    println!("2. writing in the Server tab: \"{}\"", error(&mut alice).await);
+    let bob_id = bob.id;
+    alice.w.send(&C2S::SendText { target: TextTarget::Private(bob_id), text: "hello from the lobby".into() }).await.unwrap();
     assert!(wait(&mut bob, 5, |m| matches!(m, S2C::Text(t) if t.text == "hello from the lobby").then_some(())).await.is_some());
-    println!("2. server chat works without a channel");
+    println!("2. direct messages work without a channel");
 
     // 3. Joining and leaving a channel.
     alice.w.send(&C2S::SwitchChannel { channel: lobby, password: None }).await.unwrap();

@@ -144,7 +144,8 @@ Obsidian) and the two-tone ones where one colour blends into another.
     channel groups, personal permissions, descriptions;
   * edit the virtual server and the file limits, groups and permissions, the ban list,
     and privilege keys;
-  * read and write server and channel chat (with history, pins and images), edit your
+  * read the Server tab (server events) and read and write channel chat (with history,
+    pins and images), edit your
     own messages, and send direct messages, including to people who are offline;
   * see everyone's avatars, and remove an offensive avatar picture;
   * ban by unique ID, IP address and / or hardware;
@@ -224,7 +225,9 @@ their update window by themselves. To allow older clients, set
   * **Join channels regardless of join power** lets moderators bypass the check.
   * A channel group assigned in a specific channel also counts, so you can let
     individual people into one restricted channel.
-* **Persistent encrypted chat:** channel and server chat is stored on the server
+* **The Server tab** (1.19.0) shows only what happens on the server (who connects and
+  leaves); nobody can write there. Older history stays readable.
+* **Persistent encrypted chat:** channel chat is stored on the server
   (XChaCha20-Poly1305), with configurable retention.
   * Delete single messages: your own always, anyone's with *Delete anyone's chat
     messages*.
@@ -253,7 +256,7 @@ their update window by themselves. To allow older clients, set
   can't be set again.
 * **On the server without a channel** (Voxa 1.22.0): like Discord, people can be
   connected without being in a channel. They show as online (in the People list, not the
-  channel tree), can use server chat and direct messages, and can't talk, use channel
+  channel tree), can use direct and group messages, and can't talk, use channel
   chat or files, or share or watch screens until they join a channel.
 * **Status** (Voxa 1.22.0): Online, Away, Do not disturb or Invisible.
   * Invisible people look offline while they are not in a channel. They are left out of
@@ -267,6 +270,17 @@ their update window by themselves. To allow older clients, set
     with joins and leaves.
 * **People list:** everyone who has been on the server, with when they were last seen.
   Everyone can see it.
+* **Group chats** (1.19.0, Voxa 1.27.0): like Steam's, chats with several people.
+  * Any member can add people, rename the chat or leave it; at most 50 people per chat
+    and 100 chats per person. When the last person leaves, the chat is deleted.
+  * Only members can send to it, add people or see it; people must be known to the
+    server. Messages share the chat rate limit.
+  * Like direct messages, the messages are **not stored** on the server: they go
+    straight to the members who are online, and are kept (encrypted) only for members
+    who are offline, until they connect (at most 100 waiting per person, 30 days).
+    Voxa older than 1.27.0 gets them once it is updated.
+  * Pictures in a group chat can only be opened by its members.
+  * The members of each chat are stored encrypted in the database (and in backups).
 * **Offline messages:** people can message someone who is offline.
   * The server keeps the message encrypted, delivers it when the person comes online,
     and then deletes it.

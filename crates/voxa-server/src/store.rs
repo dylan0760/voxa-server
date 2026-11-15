@@ -37,6 +37,29 @@ const AVATARS: TableDefinition<&str, &[u8]> = TableDefinition::new("avatars");
 const WEB_PREFS: TableDefinition<&str, &[u8]> = TableDefinition::new("web_prefs");
 /// Hardware tokens banned along with a ban (1.16.0+): ban id -> Vec<String>.
 const HW_BANS: TableDefinition<u64, &[u8]> = TableDefinition::new("hardware_bans");
+/// Group chats (1.19.0+): id -> sealed GroupChatRec. Their messages are not stored.
+const GROUP_CHATS: TableDefinition<u64, &[u8]> = TableDefinition::new("group_chats");
+/// Group chat messages waiting for members who are offline: (uid, id) -> sealed message.
+const GROUP_QUEUE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("group_queue");
+
+/// A group chat: who is in it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct GroupChatRec {
+    pub name: String,
+    pub owner: String,
+    pub members: Vec<String>,
+    pub created: u64,
+}
+
+/// A group chat message waiting for someone who is offline.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct QueuedGroupMessage {
+    pub group: u64,
+    pub from_uid: String,
+    pub from_name: String,
+    pub ts: u64,
+    pub text: String,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct StoredSettings {
@@ -164,6 +187,8 @@ impl Store {
             w.open_table(AVATARS)?;
             w.open_table(WEB_PREFS)?;
             w.open_table(HW_BANS)?;
+            w.open_table(GROUP_CHATS)?;
+            w.open_table(GROUP_QUEUE)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -198,6 +223,8 @@ impl Store {
             AVATARS.name(),
             WEB_PREFS.name(),
             HW_BANS.name(),
+            GROUP_CHATS.name(),
+            GROUP_QUEUE.name(),
         ];
         for t in r.list_tables()? {
             if !known.contains(&t.name()) {
@@ -218,7 +245,7 @@ impl Store {
                 }
             })*};
         }
-        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS);
+        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS, GROUP_CHATS, GROUP_QUEUE);
         w.commit()?;
         Ok(())
     }
@@ -782,6 +809,115 @@ impl Store {
             for (uid, id, blob) in rows {
                 let old = self.unseal_raw(&Self::offline_aad(&uid, id), &blob).and_then(|p| dec::<OfflineMessage>(&p)).map(|m| m.ts < cutoff).unwrap_or(true);
                 if old {
+                    t.remove((uid.as_str(), id))?;
+                    n += 1;
+                }
+            }
+        }
+        w.commit()?;
+        Ok(n)
+    }
+
+    // ---------- group chats (members encrypted at rest; messages only queued) ----------
+
+    fn group_aad(id: u64) -> Vec<u8> {
+        [b"voxa-group-chat".as_slice(), &id.to_be_bytes()].concat()
+    }
+
+    fn group_queue_aad(uid: &str, id: u64) -> Vec<u8> {
+        [b"voxa-group-queue".as_slice(), uid.as_bytes(), &id.to_be_bytes()].concat()
+    }
+
+    pub fn new_group_chat_id(&self) -> R<u64> {
+        self.next_id("next_group_chat")
+    }
+
+    pub fn group_chat(&self, id: u64) -> R<Option<GroupChatRec>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(GROUP_CHATS)?;
+        Ok(t.get(id)?.and_then(|v| self.unseal_raw(&Self::group_aad(id), v.value())).and_then(|p| dec(&p)))
+    }
+
+    pub fn save_group_chat(&self, id: u64, rec: &GroupChatRec) -> R<()> {
+        let blob = self.seal_raw(&Self::group_aad(id), &enc(rec));
+        let w = self.db.begin_write()?;
+        w.open_table(GROUP_CHATS)?.insert(id, blob.as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_group_chat(&self, id: u64) -> R<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(GROUP_CHATS)?.remove(id)?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// The group chats `uid` is in.
+    pub fn group_chats_of(&self, uid: &str) -> R<Vec<(u64, GroupChatRec)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(GROUP_CHATS)?;
+        let mut out = Vec::new();
+        for row in t.iter()? {
+            let (k, v) = row?;
+            let id = k.value();
+            if let Some(rec) = self.unseal_raw(&Self::group_aad(id), v.value()).and_then(|p| dec::<GroupChatRec>(&p)) {
+                if rec.members.iter().any(|m| m == uid) {
+                    out.push((id, rec));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn group_queue_count(&self, uid: &str) -> R<usize> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(GROUP_QUEUE)?;
+        Ok(t.range((uid, 0)..=(uid, u64::MAX))?.count())
+    }
+
+    pub fn queue_group_message(&self, to_uid: &str, m: &QueuedGroupMessage) -> R<()> {
+        let id = self.next_id("next_group_queue")?;
+        let blob = self.seal_raw(&Self::group_queue_aad(to_uid, id), &enc(m));
+        let w = self.db.begin_write()?;
+        w.open_table(GROUP_QUEUE)?.insert((to_uid, id), blob.as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Removes and returns the group messages waiting for `uid` (oldest first).
+    pub fn take_group_queue(&self, uid: &str) -> R<Vec<QueuedGroupMessage>> {
+        let w = self.db.begin_write()?;
+        let mut out = Vec::new();
+        {
+            let mut t = w.open_table(GROUP_QUEUE)?;
+            let rows: Vec<(u64, Vec<u8>)> = t.range((uid, 0)..=(uid, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, v)| (k.value().1, v.value().to_vec())).collect();
+            for (id, blob) in rows {
+                if let Some(m) = self.unseal_raw(&Self::group_queue_aad(uid, id), &blob).and_then(|p| dec::<QueuedGroupMessage>(&p)) {
+                    out.push(m);
+                }
+                t.remove((uid, id))?;
+            }
+        }
+        w.commit()?;
+        Ok(out)
+    }
+
+    /// Deletes waiting group messages older than `cutoff`, or of chats that no longer exist.
+    pub fn purge_group_queue_before(&self, cutoff: u64) -> R<usize> {
+        let w = self.db.begin_write()?;
+        let mut n = 0;
+        {
+            let chats = w.open_table(GROUP_CHATS)?;
+            let mut t = w.open_table(GROUP_QUEUE)?;
+            let rows: Vec<(String, u64, Vec<u8>)> = t.iter()?.filter_map(|r| r.ok()).map(|(k, v)| (k.value().0.to_string(), k.value().1, v.value().to_vec())).collect();
+            for (uid, id, blob) in rows {
+                let keep = self
+                    .unseal_raw(&Self::group_queue_aad(&uid, id), &blob)
+                    .and_then(|p| dec::<QueuedGroupMessage>(&p))
+                    .map(|m| m.ts >= cutoff && chats.get(m.group).ok().flatten().is_some())
+                    .unwrap_or(false);
+                if !keep {
                     t.remove((uid.as_str(), id))?;
                     n += 1;
                 }

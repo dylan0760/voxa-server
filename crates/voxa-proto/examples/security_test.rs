@@ -168,7 +168,7 @@ async fn main() {
 
     // 6. Chat rate limit: a burst of 10, then the server refuses.
     for i in 0..14 {
-        mia.w.send(&C2S::SendText { target: TextTarget::Server, text: format!("spam {i}") }).await.unwrap();
+        mia.w.send(&C2S::SendText { target: TextTarget::Private(admin.id), text: format!("spam {i}") }).await.unwrap();
     }
     let err = until(&mut mia, |m| if let S2C::Error(e) = m { Some(e) } else { None }).await;
     assert!(err.contains("too fast"), "{err}");

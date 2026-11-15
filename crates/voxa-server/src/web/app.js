@@ -1198,7 +1198,9 @@
 
   function renderComposer() {
     let placeholder, allowed = true, note;
-    if (S.tab === 'server') { placeholder = 'Message the server'; allowed = can(P.SERVER_CHAT); note = '🔒 Messages are encrypted in transit and stored encrypted on the server'; }
+    // The Server tab shows what happens on the server (connects, leaves): no messages there.
+    R.composer.classList.toggle('hidden', S.tab === 'server');
+    if (S.tab === 'server') { placeholder = ''; allowed = false; note = 'ℹ This tab shows what happens on the server. Chat in a channel, or with direct messages.'; }
     else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); placeholder = 'Message #' + (ch ? ch.name : ''); allowed = can(P.CHANNEL_CHAT); note = '🔒 Messages are encrypted in transit and stored encrypted on the server'; }
     else { placeholder = 'Message @' + personName(S.tab.slice(3)); allowed = can(P.PRIVATE_MESSAGE); note = '🔒 Encrypted in transit · direct messages are not kept by the web page'; }
     if (!allowed) placeholder = 'You do not have permission to write here';
@@ -1221,7 +1223,7 @@
     if (!text) return;
     R.input.value = '';
     autoGrow();
-    if (S.tab === 'server') send({ SendText: { target: 'Server', text } });
+    if (S.tab === 'server') return;
     else if (S.tab === 'channel') send({ SendText: { target: { Channel: myChannel() }, text } });
     else {
       const uid = S.tab.slice(3);
