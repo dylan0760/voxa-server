@@ -23,7 +23,8 @@ The installer:
 * installs the **VoxaServer** service (automatic start, restarts on failure);
 * opens **TCP 9987** and **UDP 9987** in Windows Firewall, and **TCP 9980** (the
   [web admin page](#web-admin-page)) for the local network only;
-* installs **Voxa Server Manager**, which starts in the system tray at sign-in.
+* installs **Voxa Server Manager**, which starts in the system tray at sign-in (each user
+  can turn that off in the manager's **Startup** section).
 
 **When updating, update the Voxa clients first.** By default the server only accepts the
 newest Voxa client (see [Client version](#client-version)).
@@ -53,11 +54,15 @@ Open it from the Start menu (**Voxa Server Manager**) or from its tray icon. It 
   **Use Privilege Key** and paste it to become admin;
 * buttons for the data folder, `server.toml` and the log, plus a live log view;
 * **🌐 Open Web Admin**, which opens the [web admin page](#web-admin-page);
+* **Startup**: whether the manager opens in the system tray when you sign in to Windows
+  (on by default, per user);
 * **Updates**: checks GitHub and installs new versions;
 * **What's new**, with the change log of every version.
 
-Closing the window (✕) keeps the manager in the system tray. The server itself always
-runs as a service, even when the manager is closed.
+Everything below the Start / Stop / Restart header scrolls, so a small window still
+reaches every section. Closing the window (✕) keeps the manager in the system tray. The
+server itself always runs as a service that starts with Windows, even before anyone
+signs in and when the manager is closed.
 
 ## Updates
 * **Manager:** it checks this repository's releases at startup and every 12 hours. You
@@ -71,8 +76,9 @@ runs as a service, even when the manager is closed.
 
 ## Web admin page
 Manage the server from a browser: the channel tree, chat, people and every admin dialog,
-with the same layout and the same seven themes as the Voxa client (🎨 at the bottom
-left).
+with the same layout and the same themes as the Voxa client: 🎨 at the bottom left opens
+a picker with a preview of every theme, the solid ones (including Mustard, Slate and
+Obsidian) and the two-tone ones where one colour blends into another.
 
 * **Open it:** `http://<server>:9980/`, or **🌐 Open Web Admin** in Voxa Server Manager.
 * **Sign in** with a Voxa identity. You get exactly the rights that identity has: an
@@ -88,7 +94,10 @@ left).
   * **Remember the key in this browser** is off by default; a sign-in lasts 12 hours.
 * **Join channel:** choose the channel the page joins when signing in (a list on
   servers without a password, otherwise type a path like `Lobby/Games`), with its
-  password if it has one.
+  password if it has one, or **No channel** to just be on the server.
+* **Status:** click your name at the bottom left for Online, Away, Do not disturb or
+  Invisible (remembered in the browser), and **Leave Channel**. Do not disturb mutes the
+  page's sounds.
 * **Remembered for you:** the theme, nickname and channel are saved per identity on the
   server, so they follow you to other browsers, PCs and web addresses.
 * **What you can do:**
@@ -204,6 +213,20 @@ their update window by themselves. To allow older clients, set
   1.20.0). Pictures are checked: PNG or JPEG, at most 96 KB and 16–256 pixels per side.
   Moderators with *Edit client descriptions* can remove a picture, and the same picture
   can't be set again.
+* **On the server without a channel** (Voxa 1.22.0): like Discord, people can be
+  connected without being in a channel. They show as online (in the People list, not the
+  channel tree), can use server chat and direct messages, and can't talk, use channel
+  chat or files, or share or watch screens until they join a channel.
+* **Status** (Voxa 1.22.0): Online, Away, Do not disturb or Invisible.
+  * Invisible people look offline while they are not in a channel. They are left out of
+    everyone else's client list, avatars, chat-history sender ids and group member lists.
+    Pokes, kicks and messages aimed at their session get "Client not found", and their
+    "last seen" stays at the time they were last visible.
+  * A direct message to an invisible person is delivered at once, but the sender is told
+    it was "kept for later".
+  * Administrators (*Edit virtual server*) see invisible people, to moderate.
+  * Status changes share the chat rate limit, so toggling Invisible can't flood everyone
+    with joins and leaves.
 * **People list:** everyone who has been on the server, with when they were last seen.
   Everyone can see it.
 * **Offline messages:** people can message someone who is offline.
@@ -265,6 +288,12 @@ their update window by themselves. To allow older clients, set
     all user text is shown as text, never as HTML.
   * Every action goes through the same permission checks as the desktop client.
   * Server statistics are only given to administrators (*Edit virtual server*).
+* **No channel ("channel 0"):** it is not a real channel, and the server chat's storage
+  slot shares its number, so every message that names channel 0 where a channel is needed
+  (chat, history, pins, files, moving people, channel groups, keys) is refused, even for
+  administrators.
+* **Invisible people:** see [Features](#features). Nothing the server sends to people who
+  can't see them reveals that they are connected.
 * **Text:** names, topics and messages are cleaned of control characters and invisible
   direction-changing characters.
 

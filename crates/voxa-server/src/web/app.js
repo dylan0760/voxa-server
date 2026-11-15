@@ -85,7 +85,12 @@
   }
 
   // ---------------------------------------------------------------- themes
-  const THEMES = [['dark', 'Dark'], ['light', 'Light'], ['sakura', 'Sakura'], ['layette', 'Layette'], ['crimson', 'Crimson'], ['midnight', 'Midnight'], ['celadon', 'Celadon']];
+  // The client's themes: solid ones, then two-tone ones (a colour blending into another).
+  const THEMES = [['dark', 'Dark'], ['light', 'Light'], ['sakura', 'Sakura'], ['layette', 'Layette'], ['crimson', 'Crimson'], ['midnight', 'Midnight'], ['celadon', 'Celadon'],
+    ['mustard', 'Mustard'], ['slate', 'Slate'], ['obsidian', 'Obsidian'],
+    ['citrus', 'Citrus', 1], ['candyfloss', 'Candyfloss', 1], ['spearmint', 'Spearmint', 1], ['lofi', 'Lo-fi', 1], ['dune', 'Dune', 1],
+    ['raincloud', 'Raincloud', 1], ['afterglow', 'Afterglow', 1], ['bloodmoon', 'Blood Moon', 1], ['nightshade', 'Nightshade', 1], ['twilight', 'Twilight', 1],
+    ['synthwave', 'Synthwave', 1], ['pinklemonade', 'Pink Lemonade', 1], ['aurora', 'Aurora', 1], ['woodland', 'Woodland', 1]];
   function applyTheme(t, fromServer) {
     if (!THEMES.some(([k]) => k === t)) t = 'dark';
     document.documentElement.dataset.theme = t;
@@ -93,10 +98,30 @@
     if (!fromServer && typeof savePrefs === 'function') savePrefs({ theme: t });
   }
   applyTheme(localStorage.getItem('voxa-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'), true);
-  function themeMenu(x, y) {
-    const cur = document.documentElement.dataset.theme;
-    menu(x, y, [{ head: 'Theme' }, ...THEMES.map(([k, label]) => ({ label: (k === cur ? '✔ ' : '\u2003 ') + label, onClick: () => applyTheme(k) }))]);
+  // The theme picker, like the client's Options ▸ Application ▸ Themes: a miniature of each
+  // theme (the tile carries data-theme, so it gets that theme's colours). Clicking applies it.
+  function themeDialog() {
+    const tiles = [];
+    const tile = ([k, label]) => {
+      const t = el('div', { class: 'theme-tile', title: label, onclick: () => { applyTheme(k); for (const x of tiles) x.classList.toggle('on', x === t); } },
+        el('div', { class: 'tt-pic', 'data-theme': k },
+          el('div', { class: 'tt-rail' }, el('span', { class: 'tt-dot' })),
+          el('div', { class: 'tt-side' }, el('i'), el('i'), el('i')),
+          el('div', { class: 'tt-main' }, el('div', { class: 'tt-msg' }, el('i')), el('span', { class: 'tt-btn' }))),
+        el('div', { class: 'tt-name' }, label));
+      if (k === document.documentElement.dataset.theme) t.classList.add('on');
+      tiles.push(t);
+      return t;
+    };
+    dialog('Theme', el('div', null,
+      el('div', { class: 'section', style: 'margin-top:0' }, 'Solid'),
+      el('div', { class: 'dim small' }, 'One colour family per theme.'),
+      el('div', { class: 'theme-grid' }, THEMES.filter((t) => !t[2]).map(tile)),
+      el('div', { class: 'section' }, 'Two-tone'),
+      el('div', { class: 'dim small' }, 'A colour that blends into another, behind see-through panels.'),
+      el('div', { class: 'theme-grid' }, THEMES.filter((t) => t[2]).map(tile))), [{ label: 'Done', primary: true }], { wide: true });
   }
+  const themeMenu = () => themeDialog();
 
   // ---------------------------------------------------------------- permissions
   const P = {
@@ -169,7 +194,7 @@
     me: 0, uid: '', server: null, channels: new Map(), clients: new Map(), groups: new Map(), extra: 0,
     logs: new Map(), tab: 'channel', dms: [], selected: { kind: 'server' }, right: 'info', showRight: true,
     people: [], peopleAsked: 0, collapsed: new Set(), pins: null, showPins: false, wait: {}, dragging: false,
-    connected: false, msgDirty: true,
+    connected: false, msgDirty: true, presences: new Map(),
   };
   let es = null;
 
@@ -179,6 +204,23 @@
     return l;
   }
   const myChannel = () => S.clients.get(S.me)?.channel;
+  // Channel 0: on the server, but in no channel (like Discord).
+  const inChannel = () => { const c = myChannel(); return c != null && c !== 0; };
+  const PRESENCES = [
+    ['Online', 'var(--green)', 'Online', 'Everyone sees you online'],
+    ['Away', 'var(--yellow)', 'Away', 'Shown as away'],
+    ['Busy', 'var(--red)', 'Do not disturb', 'No sounds for joins and leaves'],
+    ['Invisible', 'var(--dim)', 'Invisible', 'Appear offline while you are not in a channel (administrators still see you)'],
+  ];
+  function myPresence() {
+    const me = S.clients.get(S.me);
+    if (me && me.away != null) return 'Away';
+    return S.presences.get(S.me) || 'Online';
+  }
+  function setPresence(p) {
+    localStorage.setItem('voxa-web-presence', p);
+    send({ SetPresence: p });
+  }
   function tabKey(tab = S.tab) {
     if (tab === 'server') return 'server';
     if (tab === 'channel') return 'ch:' + myChannel();
@@ -353,6 +395,7 @@
       ? el('select', null,
         el('option', { value: '\u0001', selected: lastChannel == null }, 'The one I used last time'),
         el('option', { value: '', selected: lastChannel === '' }, 'The default channel'),
+        el('option', { value: '\u0001nochannel\u0001', selected: lastChannel === '\u0001nochannel\u0001' }, 'No channel (just be on the server)'),
         channels.map((c) => el('option', { value: c.path, selected: c.path === lastChannel }, c.path + (c.password ? '  🔒' : ''))))
       : el('input', { type: 'text', placeholder: 'e.g. Lobby/Games (empty: the one used last time)', value: lastChannel || '' });
     const chPw = el('input', { type: 'password', placeholder: 'Channel password', autocomplete: 'off' });
@@ -454,7 +497,7 @@
   // ---------------------------------------------------------------- live connection
   function connect() {
     if (es) es.close();
-    es = new EventSource('/api/events', { withCredentials: true });
+    es = new EventSource('/api/events' + (localStorage.getItem('voxa-web-presence') === 'Invisible' ? '?invisible=1' : ''), { withCredentials: true });
     es.onmessage = (e) => {
       let m;
       try { m = JSON.parse(e.data); } catch (_) { return; }
@@ -518,6 +561,7 @@
         S.clients = new Map(v.clients.map((c) => [c.id, c]));
         S.groups = new Map(v.groups.map((g) => [g.id, g]));
         S.logs = new Map();
+        S.presences = new Map();
         S.editing = null;
         avatars.clear();
         S.connected = true;
@@ -526,9 +570,14 @@
         closeDialogs(true);
         buildApp();
         loadPrefs();
-        activateTab(S.tab.startsWith('dm:') ? S.tab : S.tab);
+        activateTab(S.tab);
+        // Your status from last time (invisible was already asked for when joining).
+        { const p = localStorage.getItem('voxa-web-presence'); if (p === 'Busy' || p === 'Away') setPresence(p); }
         break;
       }
+      case 'ClientPresence':
+        if (v.presence === 'Online') S.presences.delete(v.id); else S.presences.set(v.id, v.presence);
+        break;
       case 'Refused':
         stopped('Could not join the server', v);
         break;
@@ -555,7 +604,7 @@
       case 'ClientJoined':
         S.clients.set(v.id, v);
         if (v.id !== S.me) pushEvent('server', v.nickname + ' connected' + (v.platform === 'Web' ? ' (web)' : ''), 'good');
-        if (v.id !== S.me && v.channel === myChannel()) tones(JOIN_TONES);
+        if (v.id !== S.me && inChannel() && v.channel === myChannel()) tones(JOIN_TONES);
         break;
       case 'ServerOptions':
         S.options = v;
@@ -565,9 +614,10 @@
         break;
       case 'ClientLeft': {
         const c = S.clients.get(v.id);
-        if (c && v.id !== S.me && c.channel === myChannel()) tones(LEAVE_TONES);
+        if (c && v.id !== S.me && inChannel() && c.channel === myChannel()) tones(LEAVE_TONES);
         if (c) pushEvent('server', c.nickname + ' ' + leaveText(v.reason), v.reason.Kicked || v.reason.Banned ? 'bad' : '');
         S.clients.delete(v.id);
+        S.presences.delete(v.id);
         if (S.selected.kind === 'client' && S.selected.id === v.id) S.selected = { kind: 'server' };
         break;
       }
@@ -580,7 +630,7 @@
             S.msgDirty = true;
             if (S.tab === 'channel') activateTab('channel');
             if (v.by) toast('You were moved by ' + v.by);
-          } else if (was === myChannel() || v.channel === myChannel()) {
+          } else if (inChannel() && (was === myChannel() || v.channel === myChannel())) {
             tones(v.channel === myChannel() ? JOIN_TONES : LEAVE_TONES);
             const ch = S.channels.get(v.channel);
             pushEvent('ch:' + myChannel(), c.nickname + (v.channel === myChannel() ? ' joined the channel' : ' went to ' + (ch ? ch.name : 'another channel')) + (v.by ? ' (moved by ' + v.by + ')' : ''));
@@ -698,7 +748,7 @@
   const LEAVE_TONES = [[784, 70], [523, 90]];
   let audio = null;
   function tones(list) {
-    if (localStorage.getItem('voxa-web-sounds') === 'off') return;
+    if (localStorage.getItem('voxa-web-sounds') === 'off' || myPresence() === 'Busy') return;
     try {
       audio = audio || new AudioContext();
       let t = audio.currentTime + 0.01;
@@ -823,9 +873,13 @@
     const me = S.clients.get(S.me);
     if (!me) return;
     const away = me.away != null;
+    const pr = PRESENCES.find((p) => p[0] === myPresence()) || PRESENCES[0];
+    const status = away ? awayText(me.away) : pr[2];
     put(R.meCard, 
-      avatar(me.nickname, me.uid, 36, away ? 'var(--yellow)' : 'var(--green)'),
-      el('div', { class: 'who' }, el('div', { class: 'n' }, me.nickname), el('div', { class: 'small', style: 'color:' + (away ? 'var(--yellow)' : 'var(--green)') }, away ? awayText(me.away) : 'Online')),
+      avatar(me.nickname, me.uid, 36, pr[1]),
+      el('div', { class: 'who', style: 'cursor:pointer', title: 'Set your status', onclick: (e) => presenceMenu(e.clientX, e.clientY - 220) },
+        el('div', { class: 'n' }, me.nickname),
+        el('div', { class: 'small', style: 'color:' + pr[1] }, '● ' + status + (inChannel() ? '' : ' · not in a channel'))),
       el('button', { class: 'icon-btn' + (away ? ' on' : ''), title: away ? 'Set online' : 'Set away', onclick: toggleAway }, '🌙'),
       el('button', { class: 'icon-btn', title: 'Change nickname', onclick: changeNickname }, '✏️'));
   }
@@ -852,6 +906,7 @@
         walk(ch.id, depth + 1);
       }
     };
+    // People in no channel are listed under People, not in the tree.
     walk(null, 0);
     put(R.tree, ...out);
   }
@@ -931,6 +986,8 @@
         tags.map((t) => { const col = nameColor(t); return el('span', { class: 'gtag', style: `color:${col};background:${col}40` }, t); })),
       el('span', { class: 'badges' },
         c.platform === 'Web' ? el('span', { class: 'webtag', title: 'On the web admin page' }, 'WEB') : null,
+        S.presences.get(c.id) === 'Busy' ? el('span', { title: 'Do not disturb', style: 'color:var(--red)' }, '⛔') : null,
+        S.presences.get(c.id) === 'Invisible' ? el('span', { title: 'Invisible: others see them as offline', style: 'color:var(--dim)' }, '👻') : null,
         c.streaming ? el('span', { class: 'live', title: c.streaming.title + ' (' + c.streaming.width + 'x' + c.streaming.height + ')' }, 'LIVE') : null,
         c.output_muted ? el('span', { title: 'Speakers muted', style: 'color:var(--red)' }, '🔇') : null,
         c.input_muted ? el('span', { title: 'Microphone muted', style: 'color:var(--red)' }, '🎤') : null,
@@ -948,6 +1005,8 @@
 
   // ---------------------------------------------------------------- chat
   function activateTab(tab) {
+    // Not in a channel: there is no channel chat.
+    if (tab === 'channel' && !inChannel()) tab = 'server';
     S.tab = tab;
     S.pins = null;
     const key = tabKey();
@@ -988,7 +1047,7 @@
     const ch = S.channels.get(myChannel());
     put(R.tabs, 
       tab('server', '🖥 Server', S.tab === 'server' ? 0 : log('server').unread),
-      tab('channel', '# ' + (ch ? ch.name : 'Channel'), S.tab === 'channel' ? 0 : log('ch:' + myChannel()).unread),
+      inChannel() ? tab('channel', '# ' + (ch ? ch.name : 'Channel'), S.tab === 'channel' ? 0 : log('ch:' + myChannel()).unread) : null,
       S.dms.map((d) => tab('dm:' + d.uid, '@ ' + personName(d.uid) + (onlineByUid(d.uid) ? '' : ' (offline)'), S.tab === 'dm:' + d.uid ? 0 : log('dm:' + d.uid).unread, d.uid)));
   }
 
@@ -1300,12 +1359,20 @@
     const online = [...S.clients.values()].filter((c) => c.uid !== S.uid && match(c.nickname)).sort((a, b) => a.nickname.localeCompare(b.nickname)).filter((c) => (seen.has(c.uid) ? false : seen.add(c.uid)));
     const onlineUids = new Set([...S.clients.values()].map((c) => c.uid));
     const offline = S.people.filter((p) => !onlineUids.has(p.uid) && p.uid !== S.uid && match(p.nickname)).sort((a, b) => b.last_seen - a.last_seen);
-    const row = (uid, name, sub, isOnline) => el('div', { class: 'person' + (isOnline ? '' : ' off'), title: isOnline ? 'Send a direct message' : 'Send a message: it is delivered when they come online', onclick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
-      avatar(name, uid, 30, isOnline ? 'var(--green)' : null),
+    const row = (uid, name, sub, dot) => el('div', { class: 'person' + (dot ? '' : ' off'), title: dot ? 'Send a direct message' : 'Send a message: it is delivered when they come online', onclick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
+      avatar(name, uid, 30, dot),
       el('div', { style: 'min-width:0' }, el('div', { class: 'n' }, name), el('div', { class: 'dim small' }, sub)));
+    // Where they are (a channel, or just on the server like Discord) and their status.
+    const status = (c) => {
+      const ch = c.channel !== 0 && S.channels.get(c.channel);
+      const place = ch ? 'in ' + ch.name : 'on the server';
+      const p = S.presences.get(c.id);
+      const [dot, st] = c.away != null ? ['var(--yellow)', awayText(c.away)] : p === 'Busy' ? ['var(--red)', 'Do not disturb'] : p === 'Invisible' ? ['var(--dim)', 'Invisible'] : ['var(--green)', ''];
+      return [dot, (st ? st + ' · ' : '') + place + (c.platform === 'Web' ? ' · web' : '')];
+    };
     return [
       el('div', { class: 'section' }, 'Online — ' + online.length),
-      online.map((c) => row(c.uid, c.nickname, 'in ' + (S.channels.get(c.channel)?.name || '') + (c.platform === 'Web' ? ' · web' : ''), true)),
+      online.map((c) => { const [dot, sub] = status(c); return row(c.uid, c.nickname, sub, dot); }),
       offline.length ? el('div', { class: 'section' }, 'Offline — ' + offline.length) : null,
       offline.map((p) => row(p.uid, p.nickname, p.last_seen ? 'last seen ' + fmtDuration(now() - p.last_seen) + ' ago' : 'offline', false)),
     ].flat().filter(Boolean);
@@ -1389,7 +1456,7 @@
       menu(x, y, [
         { head: c.nickname },
         { label: '✏  Change Nickname…', onClick: changeNickname },
-        { label: '🌙  Set Away / Online', onClick: toggleAway },
+        { label: '🟢  Set Status…', onClick: () => presenceMenu(x, y) },
         can(P.CHANNEL_COMMANDER) ? { label: '⭐  Toggle Channel Commander', onClick: () => send({ UpdateSelf: { commander: !c.commander } }) } : null,
         { label: '📝  Edit Description…', onClick: () => editDescription(c) },
         { label: '📋  Copy Unique ID', onClick: () => copy(c.uid) },
@@ -1401,7 +1468,7 @@
       { label: '💬  Send Message', onClick: () => { openDm(c.uid, c.nickname); activateTab('dm:' + c.uid); } },
       can(P.CLIENT_POKE) ? { label: '👉  Poke…', onClick: () => pokeClient(c) } : null,
       can(P.CLIENT_MOVE) ? { label: '➜  Move to Channel…', onClick: () => moveClientDialog(c) } : null,
-      can(P.CLIENT_MOVE) && c.channel !== myChannel() ? { label: '⤵  Move to My Channel', onClick: () => send({ MoveClient: { target: c.id, channel: myChannel() } }) } : null,
+      can(P.CLIENT_MOVE) && inChannel() && c.channel !== myChannel() ? { label: '⤵  Move to My Channel', onClick: () => send({ MoveClient: { target: c.id, channel: myChannel() } }) } : null,
       can(P.TALK_POWER_GRANT) ? { label: c.is_talker ? '🗣  Revoke Talk Power' : '🗣  Grant Talk Power', onClick: () => send({ SetTalker: { target: c.id, talker: !c.is_talker } }) } : null,
       { sep: true },
       can(P.GROUP_ASSIGN_SERVER) ? { label: '👥  Server Groups…', onClick: () => serverGroupsDialog(c) } : null,
@@ -1488,11 +1555,24 @@
       }
     });
   }
+  function presenceMenu(x, y) {
+    const cur = myPresence();
+    menu(x, y, [
+      { head: 'Status' },
+      ...PRESENCES.map(([p, , label]) => ({ label: (cur === p ? '◉  ' : '○  ') + label, onClick: () => setPresence(p) })),
+      { label: '🌙  Away with a message…', onClick: toggleAwayMessage },
+      inChannel() ? { sep: true } : null,
+      inChannel() ? { label: '🚪  Leave Channel', onClick: () => send({ SwitchChannel: { channel: 0, password: null } }) } : null,
+    ]);
+  }
+  function toggleAwayMessage() {
+    promptDialog('Set away', 'Message', '', 'Set away', { max: 80, note: 'Optional, shown next to your name.' }).then((m) => m != null && send({ UpdateSelf: { away: m.trim() } }));
+  }
   function toggleAway() {
     const me = S.clients.get(S.me);
     if (!me) return;
-    if (me.away != null) send({ UpdateSelf: { away: null } });
-    else promptDialog('Set away', 'Message', '', 'Set away', { max: 80, note: 'Optional, shown next to your name.' }).then((m) => m != null && send({ UpdateSelf: { away: m.trim() } }));
+    if (me.away != null) setPresence('Online');
+    else toggleAwayMessage();
   }
   function editDescription(c) {
     promptDialog('Edit description', 'Description', c.description, 'Save', { multiline: true, max: 500 }).then((d) => {

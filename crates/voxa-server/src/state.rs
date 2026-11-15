@@ -69,6 +69,8 @@ pub struct Session {
     pub hardware: Vec<String>,
     /// Voxa 1.21.0+ must report its hardware by then.
     pub hardware_due: Option<Instant>,
+    /// Online / away / busy / invisible (1.17.0+).
+    pub presence: Presence,
 }
 
 /// Chat messages, images and pokes: bursts of this many, then `CHAT_RATE` per second.
@@ -92,6 +94,11 @@ impl Session {
     /// Feature detection for messages added after 1.2 (old clients cannot decode them).
     pub fn client_at_least(&self, min: &str) -> bool {
         !voxa_proto::update::is_newer(min, &self.info.version)
+    }
+
+    /// Invisible and not in a channel: shown to others as offline.
+    pub fn hidden(&self) -> bool {
+        self.presence == Presence::Invisible && self.info.channel == NO_CHANNEL
     }
 }
 
@@ -215,7 +222,7 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.21.0";
+pub const MIN_CLIENT_VERSION: &str = "1.22.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -323,7 +330,49 @@ impl State {
 
     fn broadcast_client(&self, id: ClientId) {
         if let Some(s) = self.sessions.get(&id) {
-            self.broadcast(S2C::ClientUpdated(s.info.clone()));
+            self.broadcast_about(id, S2C::ClientUpdated(s.info.clone()));
+        }
+    }
+
+    /// Administrators see invisible people (to moderate); everyone sees themselves.
+    fn sees(&self, viewer: &Session, subject: &Session) -> bool {
+        viewer.info.id == subject.info.id || !subject.hidden() || self.server_perms(viewer) & perm::SERVER_EDIT != 0
+    }
+
+    /// Sends a message about someone to everyone who can see them.
+    fn broadcast_about(&self, subject: ClientId, msg: S2C) {
+        let Some(sub) = self.sessions.get(&subject) else { return };
+        for s in self.sessions.values().filter(|s| self.sees(s, sub)) {
+            s.tx.send(Out::Msg(msg.clone()));
+        }
+    }
+
+    /// After someone's visibility may have changed (`was_hidden` before): people who can
+    /// now see them get them as joined, people who no longer can get them as gone.
+    /// `avatar` is their picture, for people who never got it while they were hidden.
+    fn announce_visibility(&self, id: ClientId, was_hidden: bool, avatar: Option<AvatarMeta>) {
+        let Some(sub) = self.sessions.get(&id) else { return };
+        let now_hidden = sub.hidden();
+        if was_hidden == now_hidden {
+            return;
+        }
+        for v in self.sessions.values().filter(|v| v.info.id != id && self.server_perms(v) & perm::SERVER_EDIT == 0) {
+            if now_hidden {
+                v.tx.send(Out::Msg(S2C::ClientLeft { id, reason: LeaveReason::Disconnected(String::new()) }));
+            } else {
+                v.tx.send(Out::Msg(S2C::ClientJoined(sub.info.clone())));
+                if let Some(meta) = avatar.as_ref().filter(|_| v.client_at_least("1.20.0")) {
+                    v.tx.send(Out::Msg(S2C::AvatarInfo(vec![meta.clone()])));
+                }
+            }
+        }
+    }
+
+    /// Someone's presence for the clients that know presences and can see them.
+    fn broadcast_presence(&self, id: ClientId) {
+        let Some(sub) = self.sessions.get(&id) else { return };
+        for v in self.sessions.values().filter(|v| self.sees(v, sub) && v.client_at_least("1.22.0")) {
+            v.tx.send(Out::Msg(S2C::ClientPresence { id, presence: sub.presence }));
         }
     }
 
@@ -390,7 +439,8 @@ impl State {
     }
 
     pub fn can_talk(&self, s: &Session) -> bool {
-        if s.info.input_muted {
+        // Nobody to talk to outside a channel.
+        if s.info.input_muted || s.info.channel == NO_CHANNEL {
             return false;
         }
         let needed = self.channels.get(&s.info.channel).map(|c| c.info.needed_talk_power).unwrap_or(0);
@@ -697,7 +747,7 @@ impl Server {
     ) -> Res {
         let (server_hash, channel_hash) = {
             let st = self.state.lock();
-            let ch = default_channel.and_then(|p| find_channel_by_path(&st, p));
+            let ch = default_channel.map(join::parse).filter(|(no, _, _)| !no).and_then(|(_, _, p)| find_channel_by_path(&st, p));
             (st.settings.password_hash.clone(), ch.and_then(|c| st.channels.get(&c)).and_then(|c| c.password_hash.clone()))
         };
         if let Some(h) = &server_hash {
@@ -805,9 +855,12 @@ impl Server {
         let nickname = self.unique_nickname(&st, &sanitize_nick(&nickname), None);
         let id = (1..=u16::MAX).find(|i| !st.sessions.contains_key(i)).ok_or("No free client slots")?;
 
+        // Join options (stay out of channels, invisible), then the channel path.
+        let (no_channel, invisible, path) = default_channel.as_deref().map(join::parse).map(|(a, b, p)| (a, b, p.to_string())).unwrap_or((false, false, String::new()));
+        let presence = if invisible { Presence::Invisible } else { Presence::Online };
         // Default channel, optionally by path.
-        let mut channel = st.default_channel();
-        if let Some(path) = default_channel.filter(|p| !p.trim().is_empty()) {
+        let mut channel = if no_channel { NO_CHANNEL } else { st.default_channel() };
+        if let Some(path) = Some(path).filter(|p| !no_channel && !p.trim().is_empty()) {
             if let Some(ch) = find_channel_by_path(&st, &path) {
                 let c = &st.channels[&ch];
                 let pw_ok = match &c.password_hash {
@@ -830,7 +883,10 @@ impl Server {
         let channel_group = self.channel_group_for(&st, &uid, channel);
 
         record.nickname = nickname.clone();
-        record.last_seen = now_unix();
+        // "Last seen" is shown to everyone (People): invisible people keep the old time.
+        if !(invisible && no_channel) {
+            record.last_seen = now_unix();
+        }
         record.connections += 1;
         record.last_ip = ip.to_string();
         db(self.store.save_client(&record))?;
@@ -856,12 +912,20 @@ impl Server {
         };
         let voice_key: [u8; 32] = crate::secrets::random_bytes();
         let bulk_token: [u8; 32] = crate::secrets::random_bytes();
+        let viewer_admin = (group_perms | self.store.client_perms(&uid).unwrap_or(0)) & perm::SERVER_EDIT != 0;
         let welcome = S2C::Welcome {
             your_id: id,
             your_uid: uid.clone(),
             server: st.server_info(self),
             channels: st.channels.values().map(|c| c.info.clone()).collect(),
-            clients: st.sessions.values().map(|s| s.info.clone()).chain(std::iter::once(info.clone())).collect(),
+            // Invisible people are left out, except for administrators.
+            clients: st
+                .sessions
+                .values()
+                .filter(|s| !s.hidden() || viewer_admin)
+                .map(|s| s.info.clone())
+                .chain(std::iter::once(info.clone()))
+                .collect(),
             groups: st.groups.values().cloned().collect(),
             voice: VoiceSetup { key: voice_key, udp_port: self.cfg.port },
             bulk_token,
@@ -882,7 +946,12 @@ impl Server {
                 _ => {}
             }
         }
-        st.broadcast(S2C::ClientJoined(info.clone()));
+        // Presences of the people the newcomer can see (busy, and invisible for administrators).
+        if !voxa_proto::update::is_newer("1.22.0", &info.version) {
+            for s in st.sessions.values().filter(|s| s.presence != Presence::Online && (!s.hidden() || viewer_admin)) {
+                tx.send(Out::Msg(S2C::ClientPresence { id: s.info.id, presence: s.presence }));
+            }
+        }
         // Server options and (for Voxa 1.21.0+) a deadline to report the hardware.
         let new_client = !voxa_proto::update::is_newer("1.21.0", &info.version);
         if new_client {
@@ -891,16 +960,18 @@ impl Server {
         let hardware_due = (new_client && !web).then(|| Instant::now() + std::time::Duration::from_secs(20));
         // Pictures: everyone online for the newcomer, the newcomer's for everyone else.
         if !voxa_proto::update::is_newer("1.20.0", &info.version) {
-            let metas = st.sessions.values().map(|s| s.info.uid.as_str()).chain(std::iter::once(uid.as_str())).filter_map(|u| self.avatar_meta(u)).collect::<Vec<_>>();
+            let metas = st
+                .sessions
+                .values()
+                .filter(|s| !s.hidden() || viewer_admin)
+                .map(|s| s.info.uid.as_str())
+                .chain(std::iter::once(uid.as_str()))
+                .filter_map(|u| self.avatar_meta(u))
+                .collect::<Vec<_>>();
             tx.send(Out::Msg(S2C::AvatarInfo(metas)));
         }
-        if let Some(meta) = self.avatar_meta(&uid) {
-            let others: Vec<ClientId> = st.sessions.keys().copied().collect();
-            for c in others {
-                st.send_if_supported(c, "1.20.0", S2C::AvatarInfo(vec![meta.clone()]));
-            }
-        }
-        info!("client {} ({}) connected from {ip} as id {id}", info.nickname, uid);
+        let avatar = self.avatar_meta(&uid);
+        info!("client {} ({}) connected from {ip} as id {id}{}", info.nickname, uid, if invisible { " (invisible)" } else { "" });
         st.sessions.insert(
             id,
             Session {
@@ -921,9 +992,24 @@ impl Server {
                 chat_budget: (CHAT_BURST, Instant::now()),
                 web,
                 hardware: Vec::new(),
-                hardware_due: hardware_due,
+                hardware_due,
+                presence,
             },
         );
+        // Everyone who can see the newcomer is told (invisible people stay unseen).
+        let joined = st.sessions[&id].info.clone();
+        let sub = &st.sessions[&id];
+        for s in st.sessions.values().filter(|s| s.info.id != id && st.sees(s, sub)) {
+            s.tx.send(Out::Msg(S2C::ClientJoined(joined.clone())));
+            if presence != Presence::Online && s.client_at_least("1.22.0") {
+                s.tx.send(Out::Msg(S2C::ClientPresence { id, presence }));
+            }
+            if let Some(meta) = &avatar {
+                if s.client_at_least("1.20.0") {
+                    s.tx.send(Out::Msg(S2C::AvatarInfo(vec![meta.clone()])));
+                }
+            }
+        }
         Ok(id)
     }
 
@@ -991,16 +1077,23 @@ impl Server {
     /// Removes a session and tells everyone. Safe to call more than once.
     pub fn remove_session(&self, id: ClientId, reason: LeaveReason) {
         let mut st = self.state.lock();
+        // Only people who could see them are told they left.
+        let told: Vec<ClientId> = match st.sessions.get(&id) {
+            Some(sub) => st.sessions.values().filter(|v| v.info.id != id && st.sees(v, sub)).map(|v| v.info.id).collect(),
+            None => return,
+        };
         let Some(s) = st.sessions.remove(&id) else { return };
         info!("client {} (id {id}) left: {reason:?}", s.info.nickname);
         for other in st.sessions.values_mut() {
             other.viewers.remove(&id);
         }
-        if let Ok(Some(mut rec)) = self.store.get_client(&s.info.uid) {
-            rec.last_seen = now_unix();
-            let _ = self.store.save_client(&rec);
+        // Someone leaving while invisible keeps the "last seen" time they were last visible.
+        if !s.hidden() {
+            self.touch_last_seen(&s.info.uid);
         }
-        st.broadcast(S2C::ClientLeft { id, reason });
+        for v in told {
+            st.send(v, S2C::ClientLeft { id, reason: reason.clone() });
+        }
         self.cleanup_temporary(&mut st, s.info.channel);
     }
 
@@ -1051,6 +1144,19 @@ impl Server {
     }
 
     fn dispatch(&self, st: &mut State, me: ClientId, msg: C2S, kicks: &mut Vec<(ClientId, LeaveReason)>) -> Res {
+        // "Channel 0" means "not in a channel": it is not a real channel (and 0 is the
+        // server chat's storage slot), so nothing may be read from or written to it.
+        if names_no_channel(&msg) {
+            return Err("You are not in a channel: join one first".into());
+        }
+        // Invisible people look offline: acting on them must look the same as on nobody.
+        if let Some(t) = names_client(&msg) {
+            if let (Some(a), Some(b)) = (st.sessions.get(&me), st.sessions.get(&t)) {
+                if !st.sees(a, b) {
+                    return Err("Client not found".into());
+                }
+            }
+        }
         match msg {
             C2S::Hello { .. } | C2S::AttachBulk(_) => Err("Unexpected message".into()),
             C2S::Ping(t) => {
@@ -1059,6 +1165,11 @@ impl Server {
             }
             C2S::Disconnect(_) => Ok(()),
             C2S::UpdateSelf(u) => self.update_self(st, me, u),
+            // Channel "0": leave your channel and stay on the server.
+            C2S::SwitchChannel { channel: NO_CHANNEL, .. } => {
+                self.move_client(st, me, NO_CHANNEL, None);
+                Ok(())
+            }
             C2S::SwitchChannel { channel, password } => {
                 self.check_join(st, me, channel, password.as_deref())?;
                 self.move_client(st, me, channel, None);
@@ -1089,6 +1200,9 @@ impl Server {
                     self.need(st.server_perms(s), perm::CLIENT_KICK_SERVER)?;
                     kicks.push((target, LeaveReason::Kicked { by, reason }));
                 } else {
+                    if t.info.channel == NO_CHANNEL {
+                        return Err("This person is not in a channel".into());
+                    }
                     self.need(self.perms_in(st, s, t.info.channel), perm::CLIENT_KICK_CHANNEL)?;
                     let def = st.default_channel();
                     if t.info.channel == def {
@@ -1223,7 +1337,8 @@ impl Server {
                     return Err("Insufficient permissions".into());
                 }
                 let group = st.groups.get(&g).ok_or("Group not found")?;
-                let online: HashSet<&str> = st.sessions.values().map(|s| s.info.uid.as_str()).collect();
+                // Invisible people count as offline, unless the asker may see them.
+                let online: HashSet<&str> = st.sessions.values().filter(|x| st.sees(s, x)).map(|x| x.info.uid.as_str()).collect();
                 let members = match group.kind {
                     GroupKind::Server => db(self.store.all_clients())?
                         .into_iter()
@@ -1308,6 +1423,9 @@ impl Server {
             }
             C2S::StartStream(mut info) => {
                 let s = st.session(me)?;
+                if s.info.channel == NO_CHANNEL {
+                    return Err("Join a channel to share your screen".into());
+                }
                 self.need(self.perms_in(st, s, s.info.channel), perm::SCREEN_SHARE)?;
                 info.title = clean_line(&info.title, 80);
                 info.fps = info.fps.clamp(1, 60);
@@ -1434,6 +1552,7 @@ impl Server {
                 Ok(())
             }
             C2S::Hardware(tokens) => self.set_hardware(st, me, tokens, kicks),
+            C2S::SetPresence(p) => self.set_presence(st, me, p),
             C2S::BanWith { target, uid, ip, hardware, duration_secs, reason } => self.ban_with(st, me, target, [uid, ip, hardware], duration_secs, reason, kicks),
             C2S::GetFileLimits => {
                 st.send(me, S2C::FileLimits(st.file_limits));
@@ -1454,7 +1573,7 @@ impl Server {
                     if t.info.streaming.is_none() {
                         return Err("This client is not sharing their screen".into());
                     }
-                    if t.info.channel != my_channel {
+                    if t.info.channel != my_channel || my_channel == NO_CHANNEL {
                         return Err("You can only watch streams in your own channel".into());
                     }
                     t.viewers.insert(me);
@@ -1576,8 +1695,13 @@ impl Server {
             return;
         }
         let uid = s.info.uid.clone();
+        let was_hidden = s.hidden();
         let cg = self.channel_group_for(st, &uid, ch);
         let s = st.sessions.get_mut(&id).unwrap();
+        if ch == NO_CHANNEL {
+            // Nothing to share outside a channel.
+            s.info.streaming = None;
+        }
         s.info.channel = ch;
         s.info.channel_group = cg;
         s.info.is_talker = false;
@@ -1588,7 +1712,20 @@ impl Server {
                 other.viewers.remove(&id);
             }
         }
-        st.broadcast(S2C::ClientMoved { id, channel: ch, by });
+        // Invisible people become visible in a channel and vanish again when they leave it.
+        let now_hidden = st.sessions[&id].hidden();
+        if was_hidden == now_hidden {
+            st.broadcast_about(id, S2C::ClientMoved { id, channel: ch, by });
+        } else {
+            if now_hidden {
+                self.touch_last_seen(&uid);
+            }
+            st.announce_visibility(id, was_hidden, self.avatar_meta(&uid));
+            // Administrators (and the person) saw them all along.
+            for v in st.sessions.values().filter(|v| v.info.id == id || st.server_perms(v) & perm::SERVER_EDIT != 0) {
+                v.tx.send(Out::Msg(S2C::ClientMoved { id, channel: ch, by: by.clone() }));
+            }
+        }
         st.broadcast_client(id);
         self.cleanup_temporary(st, old);
     }
@@ -1895,7 +2032,7 @@ impl Server {
             s.info.channel = def;
             s.info.channel_group = cg;
             s.info.is_talker = false;
-            st.broadcast(S2C::ClientMoved { id: c, channel: def, by: Some(by.clone()) });
+            st.broadcast_about(c, S2C::ClientMoved { id: c, channel: def, by: Some(by.clone()) });
             st.broadcast_client(c);
         }
         for ch in tree {
@@ -1968,7 +2105,7 @@ impl Server {
         let ch = self.history_channel(st, s, target)?;
         let limit = limit.clamp(1, 200) as usize;
         let rows = db(self.store.history(ch, before, limit))?;
-        let online: HashMap<&str, ClientId> = st.sessions.values().map(|s| (s.info.uid.as_str(), s.info.id)).collect();
+        let online: HashMap<&str, ClientId> = st.sessions.values().filter(|x| st.sees(s, x)).map(|x| (x.info.uid.as_str(), x.info.id)).collect();
         let complete = rows.len() < limit;
         let messages: Vec<ChatMessage> = rows
             .into_iter()
@@ -2065,15 +2202,26 @@ impl Server {
 
     // ------------------------------------------------------------------ avatars
 
+    /// Someone was just seen (or just went invisible, which looks like leaving).
+    fn touch_last_seen(&self, uid: &str) {
+        if let Ok(Some(mut rec)) = self.store.get_client(uid) {
+            rec.last_seen = now_unix();
+            let _ = self.store.save_client(&rec);
+        }
+    }
+
     fn avatar_meta(&self, uid: &str) -> Option<AvatarMeta> {
         let a = self.store.avatar(uid).ok()??;
         Some(AvatarMeta { uid: uid.to_string(), color: a.color, image: a.hash })
     }
 
     fn broadcast_avatar(&self, st: &State, meta: AvatarMeta) {
-        let ids: Vec<ClientId> = st.sessions.keys().copied().collect();
-        for c in ids {
-            st.send_if_supported(c, "1.20.0", S2C::AvatarInfo(vec![meta.clone()]));
+        // A change by someone invisible would give away that they are online.
+        let owners: Vec<&Session> = st.sessions.values().filter(|s| s.info.uid == meta.uid).collect();
+        for v in st.sessions.values() {
+            if (owners.is_empty() || owners.iter().any(|o| st.sees(v, o))) && v.client_at_least("1.20.0") {
+                v.tx.send(Out::Msg(S2C::AvatarInfo(vec![meta.clone()])));
+            }
         }
     }
 
@@ -2171,7 +2319,7 @@ impl Server {
         let ch = self.history_channel(st, s, target)?;
         let mut pins = Vec::new();
         {
-            let online: HashMap<&str, ClientId> = st.sessions.values().map(|s| (s.info.uid.as_str(), s.info.id)).collect();
+            let online: HashMap<&str, ClientId> = st.sessions.values().filter(|x| st.sees(s, x)).map(|x| (x.info.uid.as_str(), x.info.id)).collect();
             for (id, meta) in db(self.store.pins(ch))? {
                 match db(self.store.get_chat(ch, id))? {
                     Some(m) => pins.push(PinnedMessage {
@@ -2256,6 +2404,42 @@ impl Server {
             if hit && t.info.id != me {
                 kicks.push((t.info.id, LeaveReason::Banned { by: by.clone(), reason: reason.clone() }));
             }
+        }
+        Ok(())
+    }
+
+    /// Online, away, busy or invisible.
+    fn set_presence(&self, st: &mut State, me: ClientId, p: Presence) -> Res {
+        let s = st.sessions.get_mut(&me).ok_or("Client not found")?;
+        // Away may also have been set with UpdateSelf (idle), so the away field is
+        // checked too: "Online" must clear it even when the presence did not change.
+        let away_ok = (p == Presence::Away) == s.info.away.is_some();
+        if s.presence == p && away_ok {
+            return Ok(());
+        }
+        let changed = s.presence != p;
+        // Each change is announced to everyone (and invisible ones as joins / leaves), so
+        // changes share the chat rate limit.
+        st.spend_chat(me)?;
+        let s = st.sessions.get_mut(&me).ok_or("Client not found")?;
+        let was_hidden = s.hidden();
+        s.presence = p;
+        match p {
+            Presence::Away => {
+                if s.info.away.is_none() {
+                    s.info.away = Some(String::new());
+                }
+            }
+            _ => s.info.away = None,
+        }
+        let uid = s.info.uid.clone();
+        if !was_hidden && s.hidden() {
+            self.touch_last_seen(&uid);
+        }
+        st.announce_visibility(me, was_hidden, self.avatar_meta(&uid));
+        st.broadcast_client(me);
+        if changed {
+            st.broadcast_presence(me);
         }
         Ok(())
     }
@@ -2544,7 +2728,21 @@ impl Server {
         if s.info.uid == to_uid {
             return Err("You cannot message yourself".into());
         }
-        if st.sessions.values().any(|x| x.info.uid == to_uid) {
+        let online: Vec<ClientId> = st.sessions.values().filter(|x| x.info.uid == to_uid).map(|x| x.info.id).collect();
+        if !online.is_empty() {
+            // Someone invisible looks offline: hand the message over directly, and answer
+            // as if it was kept for later (so the sender does not learn they are online).
+            if online.iter().all(|t| !st.sees(s, &st.sessions[t])) {
+                let (from_uid, from_name) = (s.info.uid.clone(), s.info.nickname.clone());
+                st.spend_chat(me)?;
+                let ts = now_unix();
+                let m = ChatMessage { id: 0, target: TextTarget::Private(me), from: Some(me), from_uid, from_name, ts, text };
+                for t in online {
+                    st.send(t, S2C::Text(m.clone()));
+                }
+                st.send(me, S2C::OfflineQueued { to_uid, ts });
+                return Ok(());
+            }
             return Err("This person is online now: send the message again".into());
         }
         let (from_uid, from_name) = (s.info.uid.clone(), s.info.nickname.clone());
@@ -2617,7 +2815,7 @@ impl Server {
             TextTarget::Server | TextTarget::Channel(_) => {
                 let ch = match target {
                     TextTarget::Channel(ch) => {
-                        if s.info.channel != ch {
+                        if s.info.channel != ch || ch == NO_CHANNEL {
                             return Err("You can only post to the channel you are in".into());
                         }
                         self.need(self.perms_in(st, s, ch), perm::CHANNEL_CHAT)?;
@@ -2772,6 +2970,41 @@ fn find_channel_by_path(st: &State, path: &str) -> Option<ChannelId> {
         found = Some(c.info.id);
     }
     found
+}
+
+/// Whether a message refers to "channel 0" (not in a channel) where a real channel is needed.
+fn names_no_channel(msg: &C2S) -> bool {
+    let t = |x: &TextTarget| matches!(x, TextTarget::Channel(NO_CHANNEL));
+    match msg {
+        C2S::SendText { target, .. }
+        | C2S::FetchHistory { target, .. }
+        | C2S::DeleteMessage { target, .. }
+        | C2S::PinMessage { target, .. }
+        | C2S::EditMessage { target, .. } => t(target),
+        C2S::GetPins(target) | C2S::ClearChat(target) => t(target),
+        C2S::FileList { channel, .. } | C2S::FileDelete { channel, .. } | C2S::FileMkdir { channel, .. } => *channel == NO_CHANNEL,
+        C2S::MoveClient { channel, .. } | C2S::SetChannelGroup { channel, .. } => *channel == NO_CHANNEL,
+        C2S::CreatePrivilegeKey { channel: Some(c), .. } => *c == NO_CHANNEL,
+        C2S::EditChannel { id, .. } | C2S::DeleteChannel { id, .. } => *id == NO_CHANNEL,
+        C2S::CloneChannel { source, .. } => *source == NO_CHANNEL,
+        _ => false,
+    }
+}
+
+/// The person a message acts on, if any.
+fn names_client(msg: &C2S) -> Option<ClientId> {
+    match msg {
+        C2S::Poke { target, .. }
+        | C2S::Kick { target, .. }
+        | C2S::MoveClient { target, .. }
+        | C2S::SetTalker { target, .. }
+        | C2S::EditClientDescription { target, .. }
+        | C2S::BanWith { target, .. } => Some(*target),
+        C2S::Ban { target: BanTarget::Client(t), .. } => Some(*t),
+        C2S::WatchStream { streamer, .. } => Some(*streamer),
+        C2S::SendText { target: TextTarget::Private(t), .. } => Some(*t),
+        _ => None,
+    }
 }
 
 /// A picture someone wants as their avatar: a small square-ish PNG or JPEG.

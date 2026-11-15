@@ -8,6 +8,65 @@ pub type MessageId = u64;
 /// Channel id used for the server-wide chat in history storage.
 pub const SERVER_CHAT_CHANNEL: ChannelId = 0;
 
+/// The "channel" of people who are on the server but not in any channel (servers 1.17.0+).
+/// No real channel has this id. `SwitchChannel` to it leaves your channel.
+pub const NO_CHANNEL: ChannelId = 0;
+
+/// How someone shows up to others (servers 1.17.0+). Away is also the `away` field.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Presence {
+    #[default]
+    Online,
+    Away,
+    /// Do not disturb: no sounds or pop-ups for them.
+    Busy,
+    /// Shown as offline while not in a channel (administrators still see them).
+    Invisible,
+}
+
+/// Options for joining, put in `Hello::default_channel` before the channel path:
+/// `"\u{1}nochannel,invisible\u{1}Lobby"`. Older servers treat it as an unknown path
+/// and use the default channel.
+pub mod join {
+    pub const MARK: char = '\u{1}';
+
+    /// (stay out of channels, invisible, the channel path after the options).
+    pub fn parse(s: &str) -> (bool, bool, &str) {
+        let Some(rest) = s.strip_prefix(MARK) else { return (false, false, s) };
+        let Some((flags, path)) = rest.split_once(MARK) else { return (false, false, s) };
+        let has = |f: &str| flags.split(',').any(|x| x.trim() == f);
+        (has("nochannel"), has("invisible"), path)
+    }
+
+    pub fn build(no_channel: bool, invisible: bool, path: &str) -> String {
+        let mut flags = Vec::new();
+        if no_channel {
+            flags.push("nochannel");
+        }
+        if invisible {
+            flags.push("invisible");
+        }
+        if flags.is_empty() {
+            path.to_string()
+        } else {
+            format!("{MARK}{}{MARK}{path}", flags.join(","))
+        }
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    #[test]
+    fn join_options_round_trip() {
+        use super::join::*;
+        assert_eq!(parse(&build(true, true, "Lobby/Games")), (true, true, "Lobby/Games"));
+        assert_eq!(parse(&build(true, false, "")), (true, false, ""));
+        assert_eq!(parse("Lobby"), (false, false, "Lobby"));
+        assert_eq!(build(false, false, "Lobby"), "Lobby");
+        assert_eq!(parse("\u{1}broken"), (false, false, "\u{1}broken"));
+    }
+}
+
 /// Permission bits. Effective permissions are the union of all server groups and the
 /// channel group of the client in its current channel.
 pub mod perm {

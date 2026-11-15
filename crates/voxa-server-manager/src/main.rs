@@ -207,7 +207,18 @@ struct ManagerApp {
     updater: updater::Updater,
     whats_new: Option<updater::WhatsNew>,
     quitting: bool,
+    /// Started in the tray: frames left in which the window is hidden again (eframe shows
+    /// the window after its first frame no matter what).
+    hide_frames: u8,
+    /// Open in the tray when this user signs in to Windows.
+    autostart: bool,
     ctx: egui::Context,
+}
+
+/// The installer starts the manager for every user at sign-in (`--minimized`); someone who
+/// turned that off has this file, and the manager then exits at once.
+fn autostart_off_file() -> PathBuf {
+    state_dir().join("no_autostart")
 }
 
 impl ManagerApp {
@@ -273,6 +284,8 @@ impl ManagerApp {
             },
             whats_new: whats_new_on_start(&cc.egui_ctx),
             quitting: false,
+            hide_frames: if std::env::args().any(|a| a == "--minimized") { 3 } else { 0 },
+            autostart: !autostart_off_file().exists(),
             ctx,
         }
     }
@@ -445,6 +458,13 @@ impl eframe::App for ManagerApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         self.handle_tray(ctx);
+        if self.hide_frames > 0 {
+            self.hide_frames -= 1;
+            if self.hidden {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            }
+            ctx.request_repaint();
+        }
         // The close button (X) sends the manager to the system tray.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.tray.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -507,126 +527,151 @@ impl eframe::App for ManagerApp {
                 ui.label(RichText::new(m).color(if err { RED } else { DIM }));
             }
             ui.add_space(10.0);
-
-            card(ui, "Server", |ui| {
-                egui::Grid::new("st").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
-                    let row = |ui: &mut egui::Ui, k: &str, v: String| {
-                        ui.label(RichText::new(k).color(DIM));
-                        ui.label(v);
-                        ui.end_row();
-                    };
-                    match &self.status {
-                        Some(s) => {
-                            row(ui, "Clients online", s.online.to_string());
-                            row(ui, "Channels", s.channels.to_string());
-                            row(ui, "Uptime", fmt_duration(now_unix().saturating_sub(s.started)));
-                            row(ui, "Ports", format!("TCP {0} and UDP {0}", s.port));
-                            if !s.web_url.is_empty() {
-                                row(ui, "Web admin", s.web_url.clone());
+            // Everything below the header scrolls, so a small window still reaches it all.
+            let view_h = ui.available_height();
+            egui::ScrollArea::vertical().id_salt("page").auto_shrink([false, false]).show(ui, |ui| {
+                ui.set_width(ui.available_width() - 8.0);
+                card(ui, "Server", |ui| {
+                    egui::Grid::new("st").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
+                        let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                            ui.label(RichText::new(k).color(DIM));
+                            ui.label(v);
+                            ui.end_row();
+                        };
+                        match &self.status {
+                            Some(s) => {
+                                row(ui, "Clients online", s.online.to_string());
+                                row(ui, "Channels", s.channels.to_string());
+                                row(ui, "Uptime", fmt_duration(now_unix().saturating_sub(s.started)));
+                                row(ui, "Ports", format!("TCP {0} and UDP {0}", s.port));
+                                if !s.web_url.is_empty() {
+                                    row(ui, "Web admin", s.web_url.clone());
+                                }
+                                row(ui, "Version", s.version.clone());
+                                ui.label(RichText::new("Fingerprint").color(DIM));
+                                ui.label(RichText::new(&s.fingerprint).monospace().small());
+                                ui.end_row();
                             }
-                            row(ui, "Version", s.version.clone());
-                            ui.label(RichText::new("Fingerprint").color(DIM));
-                            ui.label(RichText::new(&s.fingerprint).monospace().small());
-                            ui.end_row();
+                            None => {
+                                row(ui, "Status", if self.svc == Svc::Running { "Starting up...".into() } else { "Server is not running".into() });
+                                row(ui, "Ports", "TCP 9987 and UDP 9987 (default)".into());
+                            }
                         }
-                        None => {
-                            row(ui, "Status", if self.svc == Svc::Running { "Starting up...".into() } else { "Server is not running".into() });
-                            row(ui, "Ports", "TCP 9987 and UDP 9987 (default)".into());
+                    });
+                });
+
+                if let Some(s) = &self.status {
+                    card(ui, "Traffic since the server started", |ui| {
+                        use voxa_proto::traffic::fmt_bytes;
+                        let t = &s.traffic;
+                        egui::Grid::new("traffic").num_columns(3).spacing([24.0, 4.0]).show(ui, |ui| {
+                            ui.label("");
+                            ui.label(RichText::new("⬇ Received").small().color(DIM));
+                            ui.label(RichText::new("⬆ Sent").small().color(DIM));
+                            ui.end_row();
+                            for (name, rx, tx) in t.rows() {
+                                ui.label(RichText::new(name).color(DIM));
+                                ui.label(fmt_bytes(rx));
+                                ui.label(fmt_bytes(tx));
+                                ui.end_row();
+                            }
+                            ui.label(RichText::new("Total").strong());
+                            ui.label(RichText::new(fmt_bytes(t.total_in())).strong());
+                            ui.label(RichText::new(fmt_bytes(t.total_out())).strong());
+                            ui.end_row();
+                        });
+                        ui.label(RichText::new(format!("All traffic combined: {}", fmt_bytes(t.total_in() + t.total_out()))).small().color(DIM))
+                            .on_hover_text("Received = from clients, sent = to clients. Bytes as sent over the network (encrypted), without TCP/IP headers. Updated every few seconds.");
+                    });
+                }
+
+                card(ui, "Startup", |ui| {
+                    if ui.checkbox(&mut self.autostart, "Open this manager in the system tray when I sign in to Windows").changed() {
+                        let f = autostart_off_file();
+                        let _ = std::fs::create_dir_all(state_dir());
+                        let r = if self.autostart {
+                            std::fs::remove_file(&f).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+                        } else {
+                            std::fs::write(&f, b"off")
+                        };
+                        if let Err(e) = r {
+                            *self.message.lock().unwrap() = Some((format!("Could not save the startup choice: {e}"), true));
+                            self.autostart = !autostart_off_file().exists();
+                        }
+                    }
+                    ui.label(
+                        RichText::new("Only this manager window. The server itself is a Windows service that always starts with Windows, even before anyone signs in.")
+                            .small()
+                            .color(DIM),
+                    );
+                });
+
+                card(ui, "Updates", |ui| {
+                    updater::ui(&mut self.updater, ui, "Voxa Server");
+                    if ui.button("🎉 What's new in this version").clicked() {
+                        self.whats_new = Some(updater::WhatsNew::fetch(UPDATE_REPO, voxa_proto::APP_VERSION, Some(state_dir()), self.ctx.clone()));
+                    }
+                });
+
+                card(ui, "Server Admin privilege key", |ui| match &self.key {
+                    Some(k) => {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Label::new(RichText::new(k).monospace().strong()).selectable(true));
+                            if ui.small_button("📋 Copy").clicked() {
+                                ui.ctx().copy_text(k.clone());
+                            }
+                        });
+                        ui.label(RichText::new("In the Voxa client click the server name ▸ Use Privilege Key and paste this key to become Server Admin.").small().color(DIM));
+                    }
+                    None => {
+                        ui.label(RichText::new("No unused admin key - an administrator has already claimed this server.").color(DIM));
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("📁 Open Data Folder").clicked() {
+                        Self::open_path(self.dir.clone(), false);
+                    }
+                    if ui.button("⚙ Edit Configuration").on_hover_text("server.toml - restart the server after editing").clicked() {
+                        Self::open_path(self.dir.join("server.toml"), true);
+                    }
+                    if ui.button("📄 Open Log File").clicked() {
+                        Self::open_path(self.dir.join("logs").join("server.log"), true);
+                    }
+                    let web = self.status.as_ref().map(|s| s.web_url.clone()).filter(|u| u.starts_with("http://"));
+                    if let Some(url) = web {
+                        if ui.button("🌐 Open Web Admin").on_hover_text("Manage the server in your browser, signed in with an identity exported from Voxa").clicked() {
+                            let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
                         }
                     }
                 });
-            });
-
-            if let Some(s) = &self.status {
-                card(ui, "Traffic since the server started", |ui| {
-                    use voxa_proto::traffic::fmt_bytes;
-                    let t = &s.traffic;
-                    egui::Grid::new("traffic").num_columns(3).spacing([24.0, 4.0]).show(ui, |ui| {
-                        ui.label("");
-                        ui.label(RichText::new("⬇ Received").small().color(DIM));
-                        ui.label(RichText::new("⬆ Sent").small().color(DIM));
-                        ui.end_row();
-                        for (name, rx, tx) in t.rows() {
-                            ui.label(RichText::new(name).color(DIM));
-                            ui.label(fmt_bytes(rx));
-                            ui.label(fmt_bytes(tx));
-                            ui.end_row();
-                        }
-                        ui.label(RichText::new("Total").strong());
-                        ui.label(RichText::new(fmt_bytes(t.total_in())).strong());
-                        ui.label(RichText::new(fmt_bytes(t.total_out())).strong());
-                        ui.end_row();
-                    });
-                    ui.label(RichText::new(format!("All traffic combined: {}", fmt_bytes(t.total_in() + t.total_out()))).small().color(DIM))
-                        .on_hover_text("Received = from clients, sent = to clients. Bytes as sent over the network (encrypted), without TCP/IP headers. Updated every few seconds.");
+                ui.add_space(8.0);
+                ui.label(RichText::new("LOG").small().strong().color(DIM));
+                Frame::new().fill(Color32::from_rgb(0x15, 0x16, 0x1A)).corner_radius(8).inner_margin(Margin::same(8)).show(ui, |ui| {
+                    egui::ScrollArea::both()
+                        .id_salt("log")
+                        .max_height((view_h * 0.5).clamp(160.0, 480.0))
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for l in self.log.iter().rev().take(300).rev() {
+                                let c = if l.contains(" WARN ") {
+                                    YELLOW
+                                } else if l.contains(" ERROR ") {
+                                    RED
+                                } else {
+                                    Color32::from_rgb(0xC8, 0xCC, 0xD2)
+                                };
+                                ui.label(RichText::new(l).monospace().size(11.0).color(c));
+                            }
+                        });
                 });
-            }
-
-            card(ui, "Updates", |ui| {
-                updater::ui(&mut self.updater, ui, "Voxa Server");
-                if ui.button("🎉 What's new in this version").clicked() {
-                    self.whats_new = Some(updater::WhatsNew::fetch(UPDATE_REPO, voxa_proto::APP_VERSION, Some(state_dir()), self.ctx.clone()));
-                }
+                ui.label(
+                    RichText::new("Closing this window keeps the manager in the system tray. The server runs as a Windows service and keeps running either way.")
+                        .small()
+                        .color(DIM),
+                );
             });
-
-            card(ui, "Server Admin privilege key", |ui| match &self.key {
-                Some(k) => {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(RichText::new(k).monospace().strong()).selectable(true));
-                        if ui.small_button("📋 Copy").clicked() {
-                            ui.ctx().copy_text(k.clone());
-                        }
-                    });
-                    ui.label(RichText::new("In the Voxa client click the server name ▸ Use Privilege Key and paste this key to become Server Admin.").small().color(DIM));
-                }
-                None => {
-                    ui.label(RichText::new("No unused admin key - an administrator has already claimed this server.").color(DIM));
-                }
-            });
-
-            ui.horizontal(|ui| {
-                if ui.button("📁 Open Data Folder").clicked() {
-                    Self::open_path(self.dir.clone(), false);
-                }
-                if ui.button("⚙ Edit Configuration").on_hover_text("server.toml - restart the server after editing").clicked() {
-                    Self::open_path(self.dir.join("server.toml"), true);
-                }
-                if ui.button("📄 Open Log File").clicked() {
-                    Self::open_path(self.dir.join("logs").join("server.log"), true);
-                }
-                let web = self.status.as_ref().map(|s| s.web_url.clone()).filter(|u| u.starts_with("http://"));
-                if let Some(url) = web {
-                    if ui.button("🌐 Open Web Admin").on_hover_text("Manage the server in your browser, signed in with an identity exported from Voxa").clicked() {
-                        let _ = std::process::Command::new("explorer.exe").arg(url).spawn();
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            ui.label(RichText::new("LOG").small().strong().color(DIM));
-            let footer_h = 22.0;
-            Frame::new().fill(Color32::from_rgb(0x15, 0x16, 0x1A)).corner_radius(8).inner_margin(Margin::same(8)).show(ui, |ui| {
-                egui::ScrollArea::both()
-                    .max_height((ui.available_height() - footer_h - 12.0).max(60.0))
-                    .auto_shrink([false, false])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for l in self.log.iter().rev().take(300).rev() {
-                            let c = if l.contains(" WARN ") {
-                                YELLOW
-                            } else if l.contains(" ERROR ") {
-                                RED
-                            } else {
-                                Color32::from_rgb(0xC8, 0xCC, 0xD2)
-                            };
-                            ui.label(RichText::new(l).monospace().size(11.0).color(c));
-                        }
-                    });
-            });
-            ui.label(
-                RichText::new("Closing this window keeps the manager in the system tray. The server runs as a Windows service and keeps running either way.")
-                    .small()
-                    .color(DIM),
-            );
         });
     }
 }
@@ -636,6 +681,10 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     };
     let minimized = std::env::args().any(|a| a == "--minimized");
+    // Started at sign-in by Windows, but this user turned that off.
+    if minimized && autostart_off_file().exists() {
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Voxa Server Manager")

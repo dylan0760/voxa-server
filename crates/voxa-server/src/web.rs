@@ -404,6 +404,13 @@ async fn events(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip
         close.notify_one();
         end_session(server, id, &close, "Opened in another tab");
     }
+    // "?invisible=1": join appearing offline (kept on the page like the client's status).
+    let channel = if req.param("invisible").as_deref() == Some("1") {
+        let (no_channel, _, path) = join::parse(&channel);
+        join::build(no_channel, true, path)
+    } else {
+        channel
+    };
     let channel = (!channel.is_empty()).then_some(channel);
     let _ = server.check_login_passwords(ip, password.as_deref(), channel.as_deref(), channel_password.as_deref()).await;
     let (tx, mut rx) = mpsc::channel::<Out>(OUTBOX_SIZE);
@@ -550,7 +557,11 @@ async fn channels(server: &Server, s: &mut TcpStream) -> std::io::Result<()> {
     json(s, "200 OK", &[], &serde_json::json!({ "channels": list })).await
 }
 
-const THEMES: [&str; 7] = ["dark", "light", "sakura", "layette", "crimson", "midnight", "celadon"];
+/// The client's themes (`style.css` has their colours).
+const THEMES: [&str; 24] = [
+    "dark", "light", "sakura", "layette", "crimson", "midnight", "celadon", "mustard", "slate", "obsidian", "citrus", "candyfloss", "spearmint", "lofi", "dune",
+    "raincloud", "afterglow", "bloodmoon", "nightshade", "twilight", "synthwave", "pinklemonade", "aurora", "woodland",
+];
 
 /// What this identity's web page remembers (theme, nickname, channel).
 async fn prefs(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> std::io::Result<()> {

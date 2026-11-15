@@ -116,6 +116,10 @@ pub enum C2S {
     Hardware(Vec<String>),
     /// Bans someone who is online by any combination of identity, address and hardware.
     BanWith { target: ClientId, uid: bool, ip: bool, hardware: bool, duration_secs: Option<u64>, reason: String },
+
+    // --- added in 1.17.0; only sent to servers that are 1.17.0 or newer ---
+    /// Online, busy or invisible (away goes through `UpdateSelf`, as before).
+    SetPresence(Presence),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -217,6 +221,11 @@ pub enum S2C {
     ServerOptions(ServerOptions),
     /// Which bans of the `BanList` just sent also ban hardware.
     BannedHardware(Vec<u64>),
+
+    // --- added in 1.17.0; only sent to clients that are 1.22.0 or newer ---
+    /// Someone's presence (Online or Busy; Invisible only to administrators, who can see
+    /// invisible people). Sent after Welcome for everyone not Online, and on changes.
+    ClientPresence { id: ClientId, presence: Presence },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
