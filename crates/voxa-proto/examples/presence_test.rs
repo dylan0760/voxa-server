@@ -114,6 +114,14 @@ async fn main() {
     // The Server tab only shows server events (1.19.0+); direct messages work without a channel.
     alice.w.send(&C2S::SendText { target: TextTarget::Server, text: "hello from the lobby".into() }).await.unwrap();
     println!("2. writing in the Server tab: \"{}\"", error(&mut alice).await);
+    // Only "See server events" (admins by default) opens the Server tab's history.
+    alice.w.send(&C2S::FetchHistory { target: TextTarget::Server, before: None, limit: 50 }).await.unwrap();
+    let e = error(&mut alice).await;
+    assert!(e.contains("See server events"), "{e}");
+    println!("2. a normal user reading the Server tab: \"{e}\"");
+    admin.w.send(&C2S::FetchHistory { target: TextTarget::Server, before: None, limit: 50 }).await.unwrap();
+    assert!(wait(&mut admin, 5, |m| matches!(m, S2C::History { target: TextTarget::Server, .. }).then_some(())).await.is_some());
+    println!("2. an admin reading the Server tab: ok");
     let bob_id = bob.id;
     alice.w.send(&C2S::SendText { target: TextTarget::Private(bob_id), text: "hello from the lobby".into() }).await.unwrap();
     assert!(wait(&mut bob, 5, |m| matches!(m, S2C::Text(t) if t.text == "hello from the lobby").then_some(())).await.is_some());

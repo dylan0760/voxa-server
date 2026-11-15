@@ -303,6 +303,10 @@ input[type=range] { accent-color: var(--accent); }
   width: 520px; max-width: calc(100% - 24px); max-height: calc(100% - 40px); display: flex; flex-direction: column;
 }
 .dialog.wide { width: 860px; }
+/* The Server tab without "See server events": the welcome message. */
+.welcome-tab { padding: 24px; display: flex; flex-direction: column; gap: 12px; }
+.welcome-tab h2 { margin: 0; color: var(--strong); font-size: 20px; }
+.welcome-tab .welcome-text { white-space: pre-wrap; line-height: 1.5; }
 /* Theme picker: miniatures of the client window in each theme's colours. */
 .theme-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(124px, 1fr)); gap: 12px; margin: 8px 0 4px; }
 .theme-tile { cursor: pointer; text-align: center; }

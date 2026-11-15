@@ -132,7 +132,7 @@
     GROUP_ASSIGN_CHANNEL: 20, TALK_POWER_GRANT: 21, PRIVILEGE_KEY_CREATE: 22, FILE_BROWSE: 23, FILE_UPLOAD: 24,
     FILE_DOWNLOAD: 25, FILE_DELETE: 26, SCREEN_SHARE: 27, CHANNEL_COMMANDER: 28, CHAT_HISTORY: 29,
     CLIENT_DESCRIPTION_EDIT: 30, IGNORE_SERVER_MAXCLIENTS: 31, CHANNEL_JOIN: 32, CHANNEL_JOIN_IGNORE_POWER: 33,
-    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36,
+    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37,
   };
   const PERM_NAMES = [
     [P.SERVER_EDIT, 'Edit virtual server settings'], [P.CHANNEL_CREATE_PERMANENT, 'Create permanent channels'],
@@ -141,7 +141,7 @@
     [P.CHANNEL_JOIN_IGNORE_POWER, 'Join channels regardless of join power'], [P.CHANNEL_JOIN_IGNORE_PASSWORD, 'Join channels without password'],
     [P.CHANNEL_JOIN_IGNORE_MAXCLIENTS, 'Join full channels'], [P.CLIENT_MOVE, 'Move clients'], [P.CLIENT_KICK_CHANNEL, 'Kick clients from channel'],
     [P.CLIENT_KICK_SERVER, 'Kick clients from server'], [P.CLIENT_BAN, 'Ban clients'], [P.BAN_LIST, 'View and edit ban list'],
-    [P.CLIENT_POKE, 'Poke clients'], [P.PRIVATE_MESSAGE, 'Send private messages'], [P.SERVER_CHAT, 'Send server chat messages'],
+    [P.CLIENT_POKE, 'Poke clients'], [P.PRIVATE_MESSAGE, 'Send private messages'], [P.SERVER_EVENTS, 'See server events (the Server tab)'], [P.SERVER_CHAT, 'Send server chat messages (no longer used)'],
     [P.CHANNEL_CHAT, 'Send channel chat messages'], [P.CHAT_HISTORY, 'Read chat history'], [P.CHAT_DELETE, "Delete anyone's chat messages (incl. history)"],
     [P.CHAT_CLEAR, 'Clear entire chat history'], [P.CHAT_PIN, 'Pin messages'], [P.CHAT_EDIT_OWN, 'Edit own chat messages'], [P.GROUP_MANAGE, 'Create, edit and delete groups'],
     [P.GROUP_ASSIGN_SERVER, 'Assign server groups'], [P.GROUP_ASSIGN_CHANNEL, 'Assign channel groups'], [P.TALK_POWER_GRANT, 'Grant / revoke talk power'],
@@ -592,6 +592,7 @@
         break;
       case 'ServerUpdated':
         S.server = v;
+        S.msgDirty = true;
         break;
       case 'ChannelCreated':
       case 'ChannelEdited':
@@ -640,6 +641,7 @@
       }
       case 'ClientUpdated':
         S.clients.set(v.id, v);
+        if (v.id === S.me) S.msgDirty = true;
         break;
       case 'Text': {
         const t = v.target;
@@ -690,9 +692,11 @@
         break;
       case 'GroupsUpdated':
         S.groups = new Map(v.map((g) => [g.id, g]));
+        S.msgDirty = true;
         break;
       case 'YourPerms':
         S.extra = v;
+        S.msgDirty = true;
         break;
       case 'Pins':
         if (keyOf(v.target) === tabKey()) S.pins = v.pins;
@@ -1013,7 +1017,9 @@
     const l = log(key);
     l.unread = 0;
     S.msgDirty = true;
-    const target = tabTarget();
+    // The Server tab's history only for people who may see server events (asked for
+    // again when the tab is opened later, e.g. once the permission arrived).
+    const target = (tabTarget() === 'Server' && !can(P.SERVER_EVENTS)) ? null : tabTarget();
     if (target && !l.loaded) {
       l.loaded = true;
       if (can(P.CHAT_HISTORY)) send({ FetchHistory: { target, before: null, limit: 50 } });
@@ -1026,14 +1032,14 @@
 
   function renderChatHead() {
     let title, sub;
-    if (S.tab === 'server') { title = '🖥  ' + (S.server ? S.server.name : 'Server'); sub = 'Server chat: everyone on the server'; }
+    if (S.tab === 'server') { title = '🖥  ' + (S.server ? S.server.name : 'Server'); sub = can(P.SERVER_EVENTS) ? 'Server events: who connects and leaves' : 'Welcome'; }
     else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); title = '#  ' + (ch ? ch.name : ''); sub = ch && ch.topic ? ch.topic : 'Channel chat'; }
     else { const uid = S.tab.slice(3); title = '@  ' + personName(uid); sub = onlineByUid(uid) ? 'Direct message' : 'Offline · gets your messages later'; }
     const isDm = S.tab.startsWith('dm:');
     const peopleOn = S.showRight && S.right === 'people';
     put(R.head, 
       el('div', { class: 't' }, el('div', { class: 'title' }, title), el('div', { class: 'subtitle' }, sub)),
-      !isDm ? el('button', { class: 'icon-btn' + (S.showPins ? ' on' : ''), title: 'Pinned messages', onclick: togglePins }, '📌') : null,
+      !isDm && !(S.tab === 'server' && !can(P.SERVER_EVENTS)) ? el('button', { class: 'icon-btn' + (S.showPins ? ' on' : ''), title: 'Pinned messages', onclick: togglePins }, '📌') : null,
       !isDm && can(P.CHAT_CLEAR) ? el('button', { class: 'icon-btn', title: 'Clear the entire chat history', onclick: clearChat }, '🗑') : null,
       isDm ? el('button', { class: 'icon-btn', title: 'Close this conversation', onclick: () => closeDm(S.tab.slice(3)) }, '✕') : null,
       el('button', { class: 'icon-btn' + (S.showRight ? ' on' : ''), title: 'Show / hide info panel', onclick: () => { S.showRight = !S.showRight; schedule(); } }, 'ℹ'),
@@ -1108,6 +1114,21 @@
     const target = tabTarget();
     const isDm = S.tab.startsWith('dm:');
     const out = [];
+    // Without "See server events" the Server tab shows the welcome message.
+    if (S.tab === 'server' && !can(P.SERVER_EVENTS)) {
+      const welcome = (S.server && S.server.welcome_message) || '';
+      put(box, el('div', { class: 'welcome-tab' },
+        el('h2', null, 'Welcome to ' + (S.server ? S.server.name : 'the server')),
+        el('div', { class: 'welcome-text' }, welcome.trim() ? welcome : 'The server has no welcome message.'),
+        el('div', { class: 'dim small' }, 'Chat in a channel (double-click one to join it), or with direct messages.')));
+      return;
+    }
+    // The permission arrived while the Server tab was open: load its history now.
+    if (S.tab === 'server' && target && !l.loaded) {
+      l.loaded = true;
+      if (can(P.CHAT_HISTORY)) send({ FetchHistory: { target, before: null, limit: 50 } });
+      else l.complete = true;
+    }
     if (target && l.loaded && !l.complete && l.lines.some((x) => x.msg)) {
       out.push(el('div', { class: 'older' }, el('button', { class: 'btn small', onclick: () => {
         const oldest = l.lines.find((x) => x.msg);
@@ -1200,7 +1221,7 @@
     let placeholder, allowed = true, note;
     // The Server tab shows what happens on the server (connects, leaves): no messages there.
     R.composer.classList.toggle('hidden', S.tab === 'server');
-    if (S.tab === 'server') { placeholder = ''; allowed = false; note = 'ℹ This tab shows what happens on the server. Chat in a channel, or with direct messages.'; }
+    if (S.tab === 'server') { placeholder = ''; allowed = false; note = can(P.SERVER_EVENTS) ? 'ℹ This tab shows what happens on the server. Chat in a channel, or with direct messages.' : ''; }
     else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); placeholder = 'Message #' + (ch ? ch.name : ''); allowed = can(P.CHANNEL_CHAT); note = '🔒 Messages are encrypted in transit and stored encrypted on the server'; }
     else { placeholder = 'Message @' + personName(S.tab.slice(3)); allowed = can(P.PRIVATE_MESSAGE); note = '🔒 Encrypted in transit · direct messages are not kept by the web page'; }
     if (!allowed) placeholder = 'You do not have permission to write here';

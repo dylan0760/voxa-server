@@ -144,8 +144,8 @@ Obsidian) and the two-tone ones where one colour blends into another.
     channel groups, personal permissions, descriptions;
   * edit the virtual server and the file limits, groups and permissions, the ban list,
     and privilege keys;
-  * read the Server tab (server events) and read and write channel chat (with history,
-    pins and images), edit your
+  * read the Server tab (server events with *See server events*, otherwise the welcome
+    message) and read and write channel chat (with history, pins and images), edit your
     own messages, and send direct messages, including to people who are offline;
   * see everyone's avatars, and remove an offensive avatar picture;
   * ban by unique ID, IP address and / or hardware;
@@ -226,7 +226,13 @@ their update window by themselves. To allow older clients, set
   * A channel group assigned in a specific channel also counts, so you can let
     individual people into one restricted channel.
 * **The Server tab** (1.19.0) shows only what happens on the server (who connects and
-  leaves); nobody can write there. Older history stays readable.
+  leaves); nobody can write there or edit old messages. Older history stays readable.
+  * **See server events** (1.20.0) decides who sees it. Only the **Server Admin** group
+    has it by default; give it to other groups or single people in the permission
+    editor. Everyone else sees the server's **welcome message** in that tab.
+  * The server enforces it: without the permission, the tab's history, pins and pictures
+    are refused (older Voxa versions included).
+  * *Send server chat messages* is no longer used.
 * **Persistent encrypted chat:** channel chat is stored on the server
   (XChaCha20-Poly1305), with configurable retention.
   * Delete single messages: your own always, anyone's with *Delete anyone's chat
@@ -290,7 +296,7 @@ their update window by themselves. To allow older clients, set
 * **Images in chat:**
   * They are stored encrypted next to the chat history, with the same permissions as
     sending text there.
-  * Only people who can see that chat can open them: everyone for server chat, channel
+  * Only people who can see that chat can open them: people with *See server events* for older Server tab pictures, channel
     members for a channel, and the two participants for a private chat.
   * PNG, JPEG, GIF, WebP and BMP, up to 10 MB each.
 * **Server-relayed screen sharing** with sound, up to 60 fps. Only viewers in the same

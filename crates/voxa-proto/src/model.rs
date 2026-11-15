@@ -112,8 +112,11 @@ pub mod perm {
     pub const CHAT_PIN: u64 = 1 << 35;
     /// Edit your own channel / server chat messages (servers 1.15.0+).
     pub const CHAT_EDIT_OWN: u64 = 1 << 36;
+    /// See the Server tab's events: who connects and leaves (servers 1.20.0+). Without it
+    /// the Server tab shows the welcome message instead.
+    pub const SERVER_EVENTS: u64 = 1 << 37;
 
-    pub const ALL: u64 = (1 << 37) - 1;
+    pub const ALL: u64 = (1 << 38) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -133,7 +136,8 @@ pub mod perm {
         (BAN_LIST, "View and edit ban list"),
         (CLIENT_POKE, "Poke clients"),
         (PRIVATE_MESSAGE, "Send private messages"),
-        (SERVER_CHAT, "Send server chat messages"),
+        (SERVER_EVENTS, "See server events (the Server tab)"),
+        (SERVER_CHAT, "Send server chat messages (no longer used)"),
         (CHANNEL_CHAT, "Send channel chat messages"),
         (CHAT_HISTORY, "Read chat history"),
         (CHAT_DELETE, "Delete anyone's chat messages (incl. history)"),

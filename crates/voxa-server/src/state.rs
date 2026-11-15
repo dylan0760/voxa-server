@@ -222,7 +222,7 @@ const MAX_QUEUED_FRAMES: usize = 8;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.27.0";
+pub const MIN_CLIENT_VERSION: &str = "1.28.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -2252,6 +2252,8 @@ impl Server {
     fn history_channel(&self, st: &State, s: &Session, target: TextTarget) -> Res<ChannelId> {
         match target {
             TextTarget::Server => {
+                // The Server tab is only for people who may see the server's events.
+                self.need(st.server_perms(s), perm::SERVER_EVENTS)?;
                 self.need(st.server_perms(s), perm::CHAT_HISTORY)?;
                 Ok(SERVER_CHAT_CHANNEL)
             }
@@ -2331,7 +2333,8 @@ impl Server {
         }
         let s = st.session(me)?;
         let ch = match target {
-            TextTarget::Server => SERVER_CHAT_CHANNEL,
+            // The Server tab is read-only (1.19.0+), old messages included.
+            TextTarget::Server => return Err(SERVER_TAB_READ_ONLY.into()),
             TextTarget::Channel(c) => {
                 if s.info.channel != c {
                     return Err("You can only edit messages in the channel you are in".into());
@@ -2469,7 +2472,11 @@ impl Server {
         let ids: Vec<ClientId> = st
             .sessions
             .values()
-            .filter(|x| matches!(target, TextTarget::Server) || x.info.channel == ch)
+            .filter(|x| match target {
+                // Server tab pins only for people who see the Server tab (1.20.0+).
+                TextTarget::Server => st.server_perms(x) & perm::SERVER_EVENTS != 0,
+                _ => x.info.channel == ch,
+            })
             .map(|x| x.info.id)
             .collect();
         for c in ids {
@@ -3051,7 +3058,8 @@ impl Server {
             let st = self.state.lock();
             let s = st.session(me)?;
             match meta.ch {
-                Some(SERVER_CHAT_CHANNEL) => {}
+                // Older Server tab pictures: like its history, only with "See server events".
+                Some(SERVER_CHAT_CHANNEL) => self.need(st.server_perms(s), perm::SERVER_EVENTS)?,
                 Some(ch) => {
                     if s.info.channel != ch && st.server_perms(s) & perm::CHANNEL_EDIT == 0 {
                         return Err("Join the channel to see its images".into());
