@@ -54,9 +54,11 @@
                         Arguments="--service">
           <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
                               ThirdFailureActionType="restart" RestartServiceDelayInSeconds="5" ResetPeriodInDays="1" />
-          <!-- Lets Voxa Server Manager start/stop the service without administrator rights. -->
+          <!-- Lets Voxa Server Manager start/stop the service and ask for a backup ("Back up
+               now", control 130; it goes to the folder an administrator chose) without
+               administrator rights. -->
           <util:PermissionEx User="[WIX_ACCOUNT_USERS]" ServiceQueryStatus="yes" ServiceQueryConfig="yes"
-                             ServiceInterrogate="yes" ServiceStart="yes" ServiceStop="yes" />
+                             ServiceInterrogate="yes" ServiceStart="yes" ServiceStop="yes" ServiceUserDefinedControl="yes" />
         </ServiceInstall>
         <ServiceControl Id="VoxaServiceControl" Name="VoxaServer" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
         <fire:FirewallException Id="FwTcp" Name="Voxa Server (TCP 9987)" Port="9987" Protocol="tcp" Scope="any" Profile="all" IgnoreFailure="yes" />

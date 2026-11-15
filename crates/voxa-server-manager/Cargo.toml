@@ -13,13 +13,14 @@ path = "src/main.rs"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "clipboard"] }
 egui = "0.37.0"
+rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tray-icon = "0.26.1"
 voxa-proto = { path = "../voxa-proto", features = ["update"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry"] }
 windows-service = "0.8.1"
 
 [build-dependencies]

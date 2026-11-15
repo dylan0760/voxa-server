@@ -54,6 +54,8 @@ Open it from the Start menu (**Voxa Server Manager**) or from its tray icon. It 
   **Use Privilege Key** and paste it to become admin;
 * buttons for the data folder, `server.toml` and the log, plus a live log view;
 * **🌐 Open Web Admin**, which opens the [web admin page](#web-admin-page);
+* **Backups**: settings, **Back up now**, the last and next backup, and **Restore** (see
+  [Backups](#backups));
 * **Startup**: whether the manager opens in the system tray when you sign in to Windows
   (on by default, per user);
 * **Updates**: checks GitHub and installs new versions;
@@ -63,6 +65,41 @@ Everything below the Start / Stop / Restart header scrolls, so a small window st
 reaches every section. Closing the window (✕) keeps the manager in the system tray. The
 server itself always runs as a service that starts with Windows, even before anyone
 signs in and when the manager is closed.
+
+## Backups
+A backup is **one password-protected file** (`Voxa Server backup 2026-11-15 030000.voxabackup`)
+with everything the server needs: `server.toml`, the settings, channels, groups,
+permissions, bans, people, chat history, chat images, avatars, the server's keys (so
+clients still recognise it and the history stays readable), the initial admin key and
+every uploaded channel file.
+
+* **Set it up:** Voxa Server Manager ▸ **Backups ▸ ⚙ Settings…** (asks for administrator
+  rights):
+  * the **folder**: a folder on this PC or a network share, e.g. `\\nas\backups\voxa`;
+  * for a network share, an optional **account** that may write there (the server runs as
+    a Windows service, which usually can't sign in to a NAS by itself);
+  * the **password** (at least 8 characters). It is needed to restore, so keep it safe:
+    without it a backup can't be opened;
+  * **automatic** backups **every day** or **every week** on a chosen day, at a chosen hour;
+  * how many backups to **keep** (older ones are deleted; 0 keeps all).
+* **Back up now:** in the manager (no administrator rights needed), or
+  `voxa-server.exe --backup-now` as administrator.
+* **Made by the running server**, so nobody is disconnected: the database is copied in one
+  read transaction. If the PC was off at backup time, the backup is made as soon as the
+  server runs again; a failed backup is retried an hour later. The manager shows the last
+  backup, any error and the next one.
+* **Restore:** **Backups ▸ ♻ Restore…**, pick the file and enter its password (asks for
+  administrator rights). The backup is unpacked and checked first; then the service is
+  stopped, the current data is moved to `before-restore` in the data folder, the backup is
+  put in place and the service starts again. Everyone is disconnected for a moment. A
+  backup can be restored on another PC (move a server). Without the manager:
+  `voxa-server.exe --restore <file>` as administrator.
+* **Encryption:** the password is stretched with Argon2id (64 MiB); the content is sealed
+  with XChaCha20-Poly1305 in 1 MiB chunks that can't be reordered, removed or cut off.
+  A wrong password or a damaged file is refused without touching the server.
+* **Where the settings live:** `backup.json` (schedule and folder) and `backup-status.json`
+  can be read by every user of the PC; the backup and share passwords are in `backup.key`,
+  readable by SYSTEM and Administrators only.
 
 ## Updates
 * **Manager:** it checks this repository's releases at startup and every 12 hours. You
@@ -96,8 +133,9 @@ Obsidian) and the two-tone ones where one colour blends into another.
   servers without a password, otherwise type a path like `Lobby/Games`), with its
   password if it has one, or **No channel** to just be on the server.
 * **Status:** click your name at the bottom left for Online, Away, Do not disturb or
-  Invisible (remembered in the browser), and **Leave Channel**. Do not disturb mutes the
-  page's sounds.
+  Invisible (remembered in the browser). Do not disturb mutes the page's sounds.
+* **Leave Channel** (stay on the server): in the status menu, your channel's menu or its
+  info panel.
 * **Remembered for you:** the theme, nickname and channel are saved per identity on the
   server, so they follow you to other browsers, PCs and web addresses.
 * **What you can do:**
@@ -294,13 +332,22 @@ their update window by themselves. To allow older clients, set
   administrators.
 * **Invisible people:** see [Features](#features). Nothing the server sends to people who
   can't see them reveals that they are connected.
+* **Backups:** only an administrator can change where backups go or restore one (both ask
+  for administrator rights); passwords travel to `voxa-server.exe` in a file in your own
+  temp folder, never on a command line, and that file is deleted at once. Normal users may
+  only ask for a backup into the folder an administrator chose. Temporary copies of the
+  database and keys are readable by SYSTEM and Administrators only, and a restore only
+  accepts the files it expects (no paths outside the data folder).
 * **Text:** names, topics and messages are cleaned of control characters and invisible
   direction-changing characters.
 
 ## Data & configuration
 Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
-`identity.key`, `chat.key`, `files\`, `logs\` and `status.json`.
-* Back up the whole folder. The `.key` files only work on the same machine.
+`identity.key`, `chat.key`, `files\`, `logs\`, `status.json`, and the backup settings
+(`backup.json`, `backup.key`, `backup-status.json`).
+* Use [Backups](#backups) rather than copying the folder: the `.key` files only work on
+  the same machine, and copying `voxa.db` while the server runs can catch it half-written.
+  A backup works on any PC.
 * Uninstalling keeps this folder.
 
 `server.toml` settings:

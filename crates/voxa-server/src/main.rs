@@ -2,6 +2,7 @@
 
 #[cfg(windows)]
 mod acl;
+mod backup;
 mod config;
 mod files;
 mod net;
@@ -35,6 +36,11 @@ OPTIONS:
     --check-update   Check GitHub for a newer Voxa Server release
     --update         Download and install the newest release (run as administrator)
     --clear-bans     Remove every ban (stop the server first; run as administrator)
+    --backup-now     Ask the running server for a backup now (run as administrator;
+                     choose the folder and password in Voxa Server Manager first)
+    --restore <FILE> Restore a .voxabackup file: asks for its password, stops the
+                     service, keeps the current data in before-restore and starts the
+                     service again (run as administrator)
     --version        Print version
     --help           Print this help
 
@@ -64,6 +70,50 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from)
         .unwrap_or_else(config::default_data_dir);
+
+    let arg_after = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+    // The installed service's own folder: restoring stops / starts the service and
+    // locks the files down.
+    let installed = data_dir == config::default_data_dir();
+    if let Some(job) = arg_after("--backup-settings") {
+        std::process::exit(backup_job(&job, |j: SettingsJob| {
+            backup::save_settings(&data_dir, j.settings, j.password, j.share_password, cfg!(windows) && installed)?;
+            Ok("Backup settings saved.".to_string())
+        }));
+    }
+    if let Some(job) = arg_after("--restore-job") {
+        std::process::exit(backup_job(&job, |j: RestoreJob| backup::restore(&data_dir, Path::new(&j.file), &j.password, installed, cfg!(windows) && installed)));
+    }
+    if let Some(file) = arg_after("--restore") {
+        print!("Password of the backup: ");
+        let _ = std::io::stdout().flush();
+        let mut pw = String::new();
+        let _ = std::io::stdin().read_line(&mut pw);
+        let pw = pw.trim_end_matches(['\r', '\n']);
+        std::process::exit(match backup::restore(&data_dir, Path::new(&file), pw, installed, cfg!(windows) && installed) {
+            Ok(m) => {
+                println!("{m}");
+                0
+            }
+            Err(e) => {
+                eprintln!("Restoring failed: {e:#}\nRun this as administrator.");
+                1
+            }
+        });
+    }
+    if args.iter().any(|a| a == "--backup-now") {
+        // The running server picks this up within a few seconds.
+        std::process::exit(match std::fs::write(data_dir.join("backup-now"), b"") {
+            Ok(()) => {
+                println!("Asked the server for a backup; see backup-status.json in {}.", data_dir.display());
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}\nRun this as administrator.");
+                1
+            }
+        });
+    }
 
     if args.iter().any(|a| a == "--clear-bans") {
         std::process::exit(match clear_bans(&data_dir) {
@@ -136,6 +186,43 @@ async fn watch_client_releases(server: Arc<Server>) {
             Err(_) => {}
         }
         tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+    }
+}
+
+/// Backup settings from Voxa Server Manager (`--backup-settings <job.json>`).
+#[derive(serde::Deserialize)]
+struct SettingsJob {
+    settings: backup::BackupSettings,
+    password: Option<String>,
+    share_password: Option<String>,
+}
+
+/// A restore from Voxa Server Manager (`--restore-job <job.json>`).
+#[derive(serde::Deserialize)]
+struct RestoreJob {
+    file: String,
+    password: String,
+}
+
+/// Runs a job the manager wrote to a file (it holds passwords, so it is deleted at once and
+/// passwords never appear on a command line), and writes `{ok, message}` next to it as
+/// `<job>.result`.
+fn backup_job<J: serde::de::DeserializeOwned>(path: &str, run: impl FnOnce(J) -> anyhow::Result<String>) -> i32 {
+    let text = std::fs::read(path);
+    let _ = std::fs::remove_file(path);
+    let result = match text.map_err(anyhow::Error::from).and_then(|t| serde_json::from_slice::<J>(&t).map_err(anyhow::Error::from)) {
+        Ok(job) => run(job),
+        Err(e) => Err(e.context("reading the request")),
+    };
+    let (ok, message) = match result {
+        Ok(m) => (true, m),
+        Err(e) => (false, format!("{e:#}")),
+    };
+    let _ = std::fs::write(format!("{path}.result"), serde_json::json!({ "ok": ok, "message": message }).to_string());
+    if ok {
+        0
+    } else {
+        1
     }
 }
 
@@ -264,6 +351,8 @@ pub async fn run(data_dir: PathBuf, console: bool, shutdown: impl std::future::F
     }
     tokio::spawn(voice::run(server.clone(), udp));
     tokio::spawn(web::start(server.clone()));
+    // Automatic backups and "Back up now". As the service its temporary files are locked down.
+    tokio::spawn(backup::scheduler(server.clone(), cfg!(windows) && !console));
     let hw = server.clone();
     tokio::spawn(async move {
         let mut t = tokio::time::interval(Duration::from_secs(5));

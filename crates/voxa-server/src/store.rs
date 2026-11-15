@@ -172,6 +172,57 @@ impl Store {
         Ok(store)
     }
 
+    /// Writes a consistent copy of the whole database to `path` (a new file) while the
+    /// server keeps running: every table is read in one read transaction. A table this
+    /// version does not know about makes it fail, so a backup never silently misses data.
+    pub fn snapshot_to(&self, path: &Path) -> R<()> {
+        use redb::TableHandle;
+        let _ = std::fs::remove_file(path);
+        let out = Database::create(path)?;
+        let r = self.db.begin_read()?;
+        let known = [
+            META.name(),
+            CHANNELS.name(),
+            GROUPS.name(),
+            CLIENTS.name(),
+            CHANNEL_GROUPS.name(),
+            BANS.name(),
+            PRIVKEYS.name(),
+            CHAT.name(),
+            CLIENT_PERMS.name(),
+            IMAGE_META.name(),
+            IMAGE_DATA.name(),
+            PINS.name(),
+            OFFLINE.name(),
+            EDITS.name(),
+            AVATARS.name(),
+            WEB_PREFS.name(),
+            HW_BANS.name(),
+        ];
+        for t in r.list_tables()? {
+            if !known.contains(&t.name()) {
+                anyhow::bail!("the database has a table this version cannot back up: {}", t.name());
+            }
+        }
+        if r.list_multimap_tables()?.next().is_some() {
+            anyhow::bail!("the database has tables this version cannot back up");
+        }
+        let w = out.begin_write()?;
+        macro_rules! copy {
+            ($($def:expr),* $(,)?) => {$({
+                let src = r.open_table($def)?;
+                let mut dst = w.open_table($def)?;
+                for e in src.iter()? {
+                    let (k, v) = e?;
+                    dst.insert(k.value(), v.value())?;
+                }
+            })*};
+        }
+        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS);
+        w.commit()?;
+        Ok(())
+    }
+
     /// Upgrades records written by older versions. Schema 1 (Voxa 1.0/1.1) had no
     /// join power on groups/channels and no "join channels" permission; schema 2
     /// (before 1.8.0) had no "pin messages" permission; schema 3 (before 1.15.0) had no

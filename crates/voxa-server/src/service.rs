@@ -50,6 +50,12 @@ fn run_service() -> windows_service::Result<()> {
             ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+        // Voxa Server Manager's "Back up now" (users may send it; the backup goes to the
+        // folder an administrator chose).
+        ServiceControl::UserEvent(code) if code.to_raw() == crate::backup::CONTROL_BACKUP_NOW => {
+            crate::backup::BACKUP_NOW.notify_one();
+            ServiceControlHandlerResult::NoError
+        }
         _ => ServiceControlHandlerResult::NotImplemented,
     })?;
     handle.set_service_status(status(ServiceState::Running, 0))?;

@@ -1315,6 +1315,7 @@
       ch.description ? [el('div', { class: 'section' }, 'Description'), el('div', { class: 'desc' }, ch.description)] : null,
       el('div', { class: 'actions-row' },
         !sp && ch.id !== myChannel() ? el('button', { class: 'btn', onclick: () => joinChannel(ch) }, '➜ Join') : null,
+        ch.id === myChannel() ? el('button', { class: 'btn', title: 'Stay connected to the server without being in a channel', onclick: leaveChannel }, '🚪 Leave') : null,
         can(P.CHANNEL_EDIT) ? el('button', { class: 'btn', onclick: () => channelDialog(ch) }, '✏️ Edit') : null,
         can(P.CHANNEL_DELETE) ? el('button', { class: 'btn danger', onclick: () => deleteChannel(ch) }, '🗑 Delete') : null),
     ].flat().filter(Boolean);
@@ -1437,6 +1438,7 @@
     menu(x, y, [
       { head: sp ? 'Separator' : ch.name },
       !sp && ch.id !== myChannel() ? { label: '➜  Join Channel', onClick: () => joinChannel(ch) } : null,
+      ch.id === myChannel() ? { label: '🚪  Leave Channel', onClick: leaveChannel } : null,
       { label: 'ℹ  Channel Info', onClick: () => { select({ kind: 'channel', id: ch.id }); S.showRight = true; } },
       { sep: true },
       canCreate() ? { label: '➕  Create Channel…', onClick: () => channelDialog(null, ch.parent ?? null) } : null,
@@ -1538,6 +1540,10 @@
   }
   let uniq = 0;
 
+  // Stay on the server without being in a channel.
+  function leaveChannel() {
+    send({ SwitchChannel: { channel: 0, password: null } });
+  }
   function joinChannel(ch) {
     if (spacer(ch.name)) return;
     if (ch.has_password && !can(P.CHANNEL_JOIN_IGNORE_PASSWORD)) {
@@ -1562,7 +1568,7 @@
       ...PRESENCES.map(([p, , label]) => ({ label: (cur === p ? '◉  ' : '○  ') + label, onClick: () => setPresence(p) })),
       { label: '🌙  Away with a message…', onClick: toggleAwayMessage },
       inChannel() ? { sep: true } : null,
-      inChannel() ? { label: '🚪  Leave Channel', onClick: () => send({ SwitchChannel: { channel: 0, password: null } }) } : null,
+      inChannel() ? { label: '🚪  Leave Channel', onClick: leaveChannel } : null,
     ]);
   }
   function toggleAwayMessage() {

@@ -4,6 +4,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod backup;
 mod gpu;
 mod icon;
 mod instance;
@@ -212,7 +213,29 @@ struct ManagerApp {
     hide_frames: u8,
     /// Open in the tray when this user signs in to Windows.
     autostart: bool,
+    /// The server's backup settings and status, re-read every few seconds.
+    backup: (backup::Settings, backup::Status),
+    backup_read: Option<std::time::Instant>,
+    backup_form: Option<BackupForm>,
+    restore_form: Option<RestoreForm>,
     ctx: egui::Context,
+}
+
+/// The "Backup settings" window.
+struct BackupForm {
+    s: backup::Settings,
+    password: String,
+    password2: String,
+    share_password: String,
+    error: String,
+}
+
+/// The "Restore a backup" window.
+#[derive(Default)]
+struct RestoreForm {
+    file: String,
+    password: String,
+    confirm: bool,
 }
 
 /// The installer starts the manager for every user at sign-in (`--minimized`); someone who
@@ -272,7 +295,8 @@ impl ManagerApp {
             polled: start_poller(data_dir(), ctx.clone()),
             seen_generation: 0,
             last_frame: None,
-            hidden: std::env::args().any(|a| a == "--minimized"),
+            // Without a tray icon a hidden window could never be opened again.
+            hidden: std::env::args().any(|a| a == "--minimized") && tray.is_some(),
             busy: Arc::new(Mutex::new(None)),
             message: Arc::new(Mutex::new(None)),
             tray,
@@ -286,6 +310,17 @@ impl ManagerApp {
             quitting: false,
             hide_frames: if std::env::args().any(|a| a == "--minimized") { 3 } else { 0 },
             autostart: !autostart_off_file().exists(),
+            backup: Default::default(),
+            backup_read: None,
+            // Debug builds: VOXA_MGR_OPEN=backup / restore opens that window (UI checks).
+            backup_form: (cfg!(debug_assertions) && std::env::var("VOXA_MGR_OPEN").as_deref() == Ok("backup")).then(|| BackupForm {
+                s: backup::Settings { folder: "\\\\nas\\backups\\voxa".into(), enabled: true, ..Default::default() },
+                password: String::new(),
+                password2: String::new(),
+                share_password: String::new(),
+                error: String::new(),
+            }),
+            restore_form: (cfg!(debug_assertions) && std::env::var("VOXA_MGR_OPEN").as_deref() == Ok("restore")).then(RestoreForm::default),
             ctx,
         }
     }
@@ -318,6 +353,204 @@ impl ManagerApp {
             });
             ctx.request_repaint();
         });
+    }
+
+    /// Like `run_op`, for work that reports its own message.
+    fn run_task(&self, label: &str, f: impl FnOnce() -> Result<String, String> + Send + 'static) {
+        let busy = self.busy.clone();
+        let msg = self.message.clone();
+        let ctx = self.ctx.clone();
+        *busy.lock().unwrap() = Some(label.to_string());
+        std::thread::spawn(move || {
+            let r = f();
+            *busy.lock().unwrap() = None;
+            *msg.lock().unwrap() = Some(match r {
+                Ok(m) => (m, false),
+                Err(e) => (e, true),
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn backup_settings_window(&mut self, ctx: &egui::Context) {
+        let Some(mut f) = self.backup_form.take() else { return };
+        let mut open = true;
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Backup settings")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("backup_form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Folder");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut f.s.folder).desired_width(250.0).hint_text("D:\\Backups or \\\\nas\\backups"));
+                        if ui.button("Browse…").clicked() {
+                            if let Some(p) = rfd::FileDialog::new().set_title("Folder for Voxa Server backups").pick_folder() {
+                                f.s.folder = p.display().to_string();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    if f.s.folder.starts_with("\\\\") {
+                        ui.label("Share account");
+                        ui.add(egui::TextEdit::singleline(&mut f.s.share_user).desired_width(250.0).hint_text("optional, e.g. NAS\\backup"))
+                            .on_hover_text("The server runs as a Windows service, which usually can't sign in to a NAS by itself. Enter an account that may write to the share.");
+                        ui.end_row();
+                        ui.label("Share password");
+                        ui.add(egui::TextEdit::singleline(&mut f.share_password).password(true).desired_width(250.0).hint_text("unchanged"));
+                        ui.end_row();
+                    }
+                    let hint = if f.s.password_set { "unchanged" } else { "at least 8 characters" };
+                    ui.label("Backup password");
+                    ui.add(egui::TextEdit::singleline(&mut f.password).password(true).desired_width(250.0).hint_text(hint));
+                    ui.end_row();
+                    ui.label("Repeat password");
+                    ui.add(egui::TextEdit::singleline(&mut f.password2).password(true).desired_width(250.0).hint_text(hint));
+                    ui.end_row();
+                    ui.label("Automatic");
+                    ui.checkbox(&mut f.s.enabled, "Back up automatically");
+                    ui.end_row();
+                    ui.label("How often");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut f.s.weekly, false, "Every day");
+                        ui.radio_value(&mut f.s.weekly, true, "Every week on");
+                        ui.add_enabled_ui(f.s.weekly, |ui| {
+                            egui::ComboBox::from_id_salt("weekday").selected_text(backup::WEEKDAYS[(f.s.weekday as usize).min(6)]).show_ui(ui, |ui| {
+                                for (i, d) in backup::WEEKDAYS.iter().enumerate() {
+                                    ui.selectable_value(&mut f.s.weekday, i as u8, *d);
+                                }
+                            });
+                        });
+                    });
+                    ui.end_row();
+                    ui.label("At");
+                    egui::ComboBox::from_id_salt("hour").selected_text(format!("{:02}:00", f.s.hour)).show_ui(ui, |ui| {
+                        for h in 0..24u8 {
+                            ui.selectable_value(&mut f.s.hour, h, format!("{h:02}:00"));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Keep");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut f.s.keep).range(0..=1000));
+                        ui.label(RichText::new("newest backups (0 = all); older ones are deleted").color(DIM));
+                    });
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Backups are made by the server while it runs, so nobody is disconnected. If the PC is off at that time, the backup is made as soon as the server runs again. The password is needed to restore: without it a backup can't be opened, so keep it somewhere safe.",
+                    )
+                    .small()
+                    .color(DIM),
+                );
+                if !f.error.is_empty() {
+                    ui.label(RichText::new(&f.error).color(RED));
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add(egui::Button::new(RichText::new("🛡 Save").color(Color32::WHITE)).fill(ACCENT)).on_hover_text("Asks for administrator rights").clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save {
+            f.error = if f.password != f.password2 {
+                "The passwords don't match.".into()
+            } else if !f.password.is_empty() && f.password.chars().count() < 8 {
+                "The password must be at least 8 characters.".into()
+            } else if !f.s.password_set && f.password.is_empty() && (f.s.enabled || !f.s.folder.trim().is_empty()) {
+                "Choose a password for the backups.".into()
+            } else if f.s.enabled && f.s.folder.trim().is_empty() {
+                "Choose a folder for the backups.".into()
+            } else {
+                String::new()
+            };
+            if f.error.is_empty() {
+                let job = serde_json::json!({
+                    "settings": f.s,
+                    "password": (!f.password.is_empty()).then(|| f.password.clone()),
+                    "share_password": (!f.share_password.is_empty()).then(|| f.share_password.clone()),
+                });
+                let dir = self.dir.clone();
+                self.run_task("Saving the backup settings...", move || backup::run_job(&dir, "--backup-settings", job));
+                self.backup_read = None;
+                return;
+            }
+        }
+        if open && !cancel {
+            self.backup_form = Some(f);
+        }
+    }
+
+    fn restore_window(&mut self, ctx: &egui::Context) {
+        let Some(mut f) = self.restore_form.take() else { return };
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        let folder = self.backup.0.folder.clone();
+        egui::Window::new("Restore a backup")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("restore_form").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Backup file");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut f.file).desired_width(250.0).hint_text("…\\Voxa Server backup ….voxabackup"));
+                        if ui.button("Browse…").clicked() {
+                            let mut d = rfd::FileDialog::new().set_title("Voxa Server backup to restore").add_filter("Voxa Server backup", &["voxabackup"]);
+                            if !folder.is_empty() {
+                                d = d.set_directory(&folder);
+                            }
+                            if let Some(p) = d.pick_file() {
+                                f.file = p.display().to_string();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Password");
+                    ui.add(egui::TextEdit::singleline(&mut f.password).password(true).desired_width(250.0));
+                    ui.end_row();
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "Restoring replaces everything on this server with the backup: settings, channels, groups, people, bans, chat history, avatars, the server's keys and uploaded files. The server restarts, so everyone is disconnected for a moment. The current data is kept in the \"before-restore\" folder.",
+                    )
+                    .color(YELLOW),
+                );
+                ui.checkbox(&mut f.confirm, "Replace this server's data with the backup");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let ready = f.confirm && !f.file.trim().is_empty() && !f.password.is_empty();
+                    if ui.add_enabled(ready, egui::Button::new(RichText::new("♻ Restore").color(Color32::WHITE)).fill(RED)).on_hover_text("Asks for administrator rights").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if go {
+            let job = serde_json::json!({ "file": f.file.trim(), "password": f.password });
+            let dir = self.dir.clone();
+            self.run_task("Restoring the backup (the server restarts)...", move || backup::run_job(&dir, "--restore-job", job));
+            return;
+        }
+        if open && !cancel {
+            self.restore_form = Some(f);
+        }
     }
 
     fn show(&mut self) {
@@ -484,6 +717,15 @@ impl eframe::App for ManagerApp {
             }
         }
         let busy = self.busy.lock().unwrap().clone();
+        if self.backup_read.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            self.backup = backup::read(&self.dir);
+            self.backup_read = Some(std::time::Instant::now());
+        }
+        if self.backup.1.running {
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
+        }
+        self.backup_settings_window(ui.ctx());
+        self.restore_window(ui.ctx());
         egui::CentralPanel::default().frame(Frame::new().fill(BG).inner_margin(Margin::same(16))).show(ui, |ui| {
             // Header.
             ui.horizontal(|ui| {
@@ -584,6 +826,60 @@ impl eframe::App for ManagerApp {
                             .on_hover_text("Received = from clients, sent = to clients. Bytes as sent over the network (encrypted), without TCP/IP headers. Updated every few seconds.");
                     });
                 }
+
+                card(ui, "Backups", |ui| {
+                    let (bs, bst) = self.backup.clone();
+                    let ready = bs.password_set && !bs.folder.is_empty();
+                    if bs.enabled && ready {
+                        ui.label(format!("Automatic: {}", backup::describe_schedule(&bs)));
+                    } else {
+                        ui.label(RichText::new("Automatic backups are off.").color(DIM));
+                    }
+                    if !bs.folder.is_empty() {
+                        ui.label(RichText::new(format!("Folder: {}", bs.folder)).small().color(DIM));
+                    }
+                    if bst.running {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Backing up...");
+                        });
+                    }
+                    if bst.last_ok > 0 {
+                        ui.label(RichText::new(format!("✔ Last backup: {} ({})", backup::fmt_time(bst.last_ok), backup::fmt_size(bst.last_size))).color(GREEN))
+                            .on_hover_text(&bst.last_file);
+                    }
+                    if !bst.last_error.is_empty() && bst.last_attempt > bst.last_ok && !bst.running {
+                        ui.label(RichText::new(format!("✖ The backup at {} failed: {}", backup::fmt_time(bst.last_attempt), bst.last_error)).color(RED));
+                    }
+                    if bst.next > 0 && !bst.running {
+                        ui.label(RichText::new(format!("Next automatic backup: {}", backup::fmt_time(bst.next))).small().color(DIM));
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("⚙ Settings…").clicked() {
+                            self.backup_form = Some(BackupForm { s: bs.clone(), password: String::new(), password2: String::new(), share_password: String::new(), error: String::new() });
+                        }
+                        let can = ready && self.svc == Svc::Running && !bst.running && busy.is_none();
+                        let now = ui
+                            .add_enabled(can, egui::Button::new("💾 Back up now"))
+                            .on_disabled_hover_text("Choose a folder and password under Settings first, and start the server.");
+                        if now.clicked() {
+                            let dir = self.dir.clone();
+                            self.run_task("Asking the server for a backup...", move || backup::back_up_now(&dir).map(|_| "The server is making a backup.".to_string()));
+                            self.backup_read = None;
+                        }
+                        if !bs.folder.is_empty() && ui.button("📂 Open Folder").clicked() {
+                            Self::open_path(PathBuf::from(&bs.folder), false);
+                        }
+                        if ui.add_enabled(busy.is_none(), egui::Button::new("♻ Restore…")).clicked() {
+                            self.restore_form = Some(RestoreForm::default());
+                        }
+                    });
+                    ui.label(
+                        RichText::new("One password-protected file with the settings, channels, groups, permissions, bans, people, chat history, avatars, the server's keys and every uploaded file.")
+                            .small()
+                            .color(DIM),
+                    );
+                });
 
                 card(ui, "Startup", |ui| {
                     if ui.checkbox(&mut self.autostart, "Open this manager in the system tray when I sign in to Windows").changed() {

@@ -76,6 +76,14 @@ pub fn stop() -> Result<(), String> {
     s.stop().map(|_| ()).map_err(describe)
 }
 
+/// "Back up now": a service control the installer lets users send (code 130).
+pub fn backup_now() -> Result<(), String> {
+    use windows_service::service::UserEventCode;
+    let s = open(ServiceAccess::USER_DEFINED_CONTROL | ServiceAccess::QUERY_STATUS).map_err(describe)?;
+    let code = UserEventCode::from_raw(130).map_err(|_| "invalid control code".to_string())?;
+    s.notify(code).map(|_| ()).map_err(describe)
+}
+
 pub fn restart() -> Result<(), String> {
     if query() == Svc::Running {
         stop()?;

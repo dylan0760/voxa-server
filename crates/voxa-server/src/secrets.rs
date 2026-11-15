@@ -63,7 +63,7 @@ mod dpapi {
 const MAGIC_DPAPI: &[u8] = b"VXD1";
 const MAGIC_PLAIN: &[u8] = b"VXP1";
 
-fn wrap(secret: &[u8]) -> Vec<u8> {
+pub fn wrap(secret: &[u8]) -> Vec<u8> {
     #[cfg(windows)]
     {
         if let Some(p) = dpapi::protect(secret) {
@@ -74,7 +74,7 @@ fn wrap(secret: &[u8]) -> Vec<u8> {
     [MAGIC_PLAIN, secret].concat()
 }
 
-fn unwrap(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+pub fn unwrap(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     if let Some(rest) = data.strip_prefix(MAGIC_PLAIN) {
         return Ok(rest.to_vec());
     }

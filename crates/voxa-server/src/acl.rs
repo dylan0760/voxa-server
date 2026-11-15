@@ -17,7 +17,15 @@ const ADMINS: &str = "*S-1-5-32-544";
 const USERS: &str = "*S-1-5-32-545";
 
 /// Files and folders that only SYSTEM and Administrators may read.
-const PRIVATE: &[&str] = &["identity.key", "chat.key", "voxa.db", "files"];
+const PRIVATE: &[&str] = &["identity.key", "chat.key", "voxa.db", "files", "backup.key", "backup-temp", "restore-temp", "before-restore"];
+
+/// Makes one file or folder readable by SYSTEM and Administrators only (for files created
+/// after the data folder was locked down, which would otherwise inherit "Users: read").
+pub fn lock_private(p: &Path) -> bool {
+    let full = |who: &str| format!("{who}:(OI)(CI)F");
+    let (sys, adm) = if p.is_dir() { (full(SYSTEM), full(ADMINS)) } else { (format!("{SYSTEM}:F"), format!("{ADMINS}:F")) };
+    icacls(&[p.as_os_str(), os("/inheritance:r"), os("/grant:r"), os(&sys), os(&adm), os("/C"), os("/Q")])
+}
 
 /// Marker for the one-time cleanup of objects created before the lockdown.
 const MARKER: &str = ".permissions-v1";
@@ -67,11 +75,9 @@ pub fn lock_down(dir: &Path) {
     std::fs::create_dir_all(dir.join("files")).ok();
     for name in PRIVATE {
         let p = dir.join(name);
-        if !p.exists() {
-            continue;
+        if p.exists() {
+            lock_private(&p);
         }
-        let (sys, adm) = if p.is_dir() { (full(SYSTEM), full(ADMINS)) } else { (format!("{SYSTEM}:F"), format!("{ADMINS}:F")) };
-        icacls(&[p.as_os_str(), os("/inheritance:r"), os("/grant:r"), os(&sys), os(&adm), os("/C"), os("/Q")]);
     }
     if ok {
         if first_time {
