@@ -27,10 +27,24 @@ pub struct Release {
     pub sha256: Option<String>,
 }
 
+/// HTTPS settings: Windows' own TLS (with the Windows certificate store when `platform`);
+/// on Android (no OpenSSL there) rustls with the Mozilla root certificates.
+pub fn tls_config(platform: bool) -> ureq::tls::TlsConfig {
+    #[cfg(not(target_os = "android"))]
+    {
+        let b = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls);
+        if platform { b.root_certs(ureq::tls::RootCerts::PlatformVerifier).build() } else { b.build() }
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = platform;
+        ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::Rustls).root_certs(ureq::tls::RootCerts::WebPki).build()
+    }
+}
+
 fn agent() -> ureq::Agent {
-    let tls = ureq::tls::TlsConfig::builder().provider(ureq::tls::TlsProvider::NativeTls).build();
     let cfg = ureq::Agent::config_builder()
-        .tls_config(tls)
+        .tls_config(tls_config(false))
         .timeout_global(Some(Duration::from_secs(600)))
         .user_agent(format!("Voxa-Updater/{}", crate::APP_VERSION))
         .build();

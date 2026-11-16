@@ -41,6 +41,16 @@ const HW_BANS: TableDefinition<u64, &[u8]> = TableDefinition::new("hardware_bans
 const GROUP_CHATS: TableDefinition<u64, &[u8]> = TableDefinition::new("group_chats");
 /// Group chat messages waiting for members who are offline: (uid, id) -> sealed message.
 const GROUP_QUEUE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("group_queue");
+/// Channel id -> the channel's calendars and events (encrypted).
+const CALENDARS: TableDefinition<u64, &[u8]> = TableDefinition::new("calendars");
+
+/// A channel's calendar: its calendars (tabs) and events.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ChannelCalendar {
+    pub calendars: Vec<voxa_proto::CalendarInfo>,
+    pub events: Vec<voxa_proto::CalendarEvent>,
+    pub next_id: u64,
+}
 
 /// A group chat: who is in it.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -189,6 +199,7 @@ impl Store {
             w.open_table(HW_BANS)?;
             w.open_table(GROUP_CHATS)?;
             w.open_table(GROUP_QUEUE)?;
+            w.open_table(CALENDARS)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -225,6 +236,7 @@ impl Store {
             HW_BANS.name(),
             GROUP_CHATS.name(),
             GROUP_QUEUE.name(),
+            CALENDARS.name(),
         ];
         for t in r.list_tables()? {
             if !known.contains(&t.name()) {
@@ -245,7 +257,7 @@ impl Store {
                 }
             })*};
         }
-        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS, GROUP_CHATS, GROUP_QUEUE);
+        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS, GROUP_CHATS, GROUP_QUEUE, CALENDARS);
         w.commit()?;
         Ok(())
     }
@@ -253,9 +265,9 @@ impl Store {
     /// Upgrades records written by older versions. Schema 1 (Voxa 1.0/1.1) had no
     /// join power on groups/channels and no "join channels" permission; schema 2
     /// (before 1.8.0) had no "pin messages" permission; schema 3 (before 1.15.0) had no
-    /// "edit own chat messages" permission.
+    /// "edit own chat messages" permission; schema 4 (before 1.21.0) had no calendar.
     fn migrate(&self) -> R<()> {
-        const SCHEMA: u64 = 4;
+        const SCHEMA: u64 = 5;
         let current = {
             let r = self.db.begin_read()?;
             let t = r.open_table(META)?;
@@ -363,6 +375,26 @@ impl Store {
             for mut g in self.load_groups()? {
                 if g.id == 4 && g.builtin && g.kind == GroupKind::Channel && g.perms & perm::CHAT_PIN == 0 {
                     g.perms |= perm::CHAT_PIN;
+                    self.save_group(&g)?;
+                }
+            }
+            let w = self.db.begin_write()?;
+            w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
+            w.commit()?;
+            tracing::info!("database migrated to schema {SCHEMA}");
+        }
+        if current < 5 {
+            // 1.21.0: the calendar. Normal members see it and answer invitations, Guests see
+            // it, Channel Admins arrange events and manage the calendars.
+            for mut g in self.load_groups()? {
+                let add = match (g.id, g.kind, g.builtin) {
+                    (2, GroupKind::Server, true) => perm::CALENDAR_VIEW | perm::CALENDAR_RSVP,
+                    (3, GroupKind::Server, true) => perm::CALENDAR_VIEW,
+                    (4, GroupKind::Channel, true) => perm::CALENDAR_EVENTS | perm::CALENDAR_MANAGE,
+                    _ => 0,
+                };
+                if add != 0 && g.perms & add != add {
+                    g.perms |= add;
                     self.save_group(&g)?;
                 }
             }
@@ -498,6 +530,7 @@ impl Store {
             for k in keys {
                 chat.remove(k)?;
             }
+            w.open_table(CALENDARS)?.remove(id)?;
         }
         w.commit()?;
         self.delete_images_where(|m| m.ch == Some(id))?;
@@ -816,6 +849,27 @@ impl Store {
         }
         w.commit()?;
         Ok(n)
+    }
+
+    // ---------- calendars (encrypted at rest) ----------
+
+    fn calendar_aad(ch: u64) -> Vec<u8> {
+        [b"voxa-calendar".as_slice(), &ch.to_be_bytes()].concat()
+    }
+
+    /// A channel's calendar (empty if it has none).
+    pub fn calendar(&self, ch: u64) -> R<ChannelCalendar> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(CALENDARS)?;
+        Ok(t.get(ch)?.and_then(|v| self.unseal_raw(&Self::calendar_aad(ch), v.value())).and_then(|p| dec(&p)).unwrap_or_default())
+    }
+
+    pub fn save_calendar(&self, ch: u64, cal: &ChannelCalendar) -> R<()> {
+        let blob = self.seal_raw(&Self::calendar_aad(ch), &enc(cal));
+        let w = self.db.begin_write()?;
+        w.open_table(CALENDARS)?.insert(ch, blob.as_slice())?;
+        w.commit()?;
+        Ok(())
     }
 
     // ---------- group chats (members encrypted at rest; messages only queued) ----------

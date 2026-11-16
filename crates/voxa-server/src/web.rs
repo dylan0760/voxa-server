@@ -491,7 +491,7 @@ async fn send(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> s
         Err(e) => return json(s, "400 Bad Request", &[], &serde_json::json!({ "error": format!("Bad message: {e}") })).await,
     };
     // The page has no voice, bulk connection or screen sharing.
-    if matches!(msg, C2S::Hello { .. } | C2S::AttachBulk(_) | C2S::Disconnect(_) | C2S::StartStream(_) | C2S::StopStream | C2S::WatchStream { .. }) {
+    if matches!(msg, C2S::Hello { .. } | C2S::AttachBulk(_) | C2S::Disconnect(_) | C2S::StartStream(_) | C2S::StopStream | C2S::WatchStream { .. } | C2S::StartCamera(_) | C2S::StopCamera) {
         return json(s, "400 Bad Request", &[], &serde_json::json!({ "error": "Not available on the web page" })).await;
     }
     if let Err(e) = server.prepare(id, &msg).await {

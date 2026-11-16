@@ -16,7 +16,13 @@ sha2 = "0.10"
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "default-resolver-crypto", "std"] }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["net", "io-util"] }
+
+# HTTPS for the update check: Windows' own TLS; rustls on Android (no OpenSSL there).
+[target.'cfg(not(target_os = "android"))'.dependencies]
 ureq = { version = "3.5.1", default-features = false, features = ["native-tls"], optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.54.1", features = ["full"] }

@@ -115,8 +115,16 @@ pub mod perm {
     /// See the Server tab's events: who connects and leaves (servers 1.20.0+). Without it
     /// the Server tab shows the welcome message instead.
     pub const SERVER_EVENTS: u64 = 1 << 37;
+    /// The channel's calendar (servers 1.21.0+): see it...
+    pub const CALENDAR_VIEW: u64 = 1 << 38;
+    /// ...answer invitations (going / maybe / can't)...
+    pub const CALENDAR_RSVP: u64 = 1 << 39;
+    /// ...create, edit and delete events...
+    pub const CALENDAR_EVENTS: u64 = 1 << 40;
+    /// ...and create, rename and delete the channel's calendars (tabs).
+    pub const CALENDAR_MANAGE: u64 = 1 << 41;
 
-    pub const ALL: u64 = (1 << 38) - 1;
+    pub const ALL: u64 = (1 << 42) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -137,6 +145,10 @@ pub mod perm {
         (CLIENT_POKE, "Poke clients"),
         (PRIVATE_MESSAGE, "Send private messages"),
         (SERVER_EVENTS, "See server events (the Server tab)"),
+        (CALENDAR_VIEW, "See the channel calendar"),
+        (CALENDAR_RSVP, "Answer calendar invitations"),
+        (CALENDAR_EVENTS, "Create and edit calendar events"),
+        (CALENDAR_MANAGE, "Create, rename and delete calendars"),
         (SERVER_CHAT, "Send server chat messages (no longer used)"),
         (CHANNEL_CHAT, "Send channel chat messages"),
         (CHAT_HISTORY, "Read chat history"),
@@ -153,7 +165,7 @@ pub mod perm {
         (FILE_UPLOAD, "Upload files"),
         (FILE_DOWNLOAD, "Download files"),
         (FILE_DELETE, "Delete files"),
-        (SCREEN_SHARE, "Share screen / applications"),
+        (SCREEN_SHARE, "Share screen / applications and camera"),
         (CHANNEL_COMMANDER, "Use channel commander"),
         (CLIENT_DESCRIPTION_EDIT, "Edit client descriptions"),
         (IGNORE_SERVER_MAXCLIENTS, "Join when server is full"),
@@ -272,6 +284,78 @@ pub struct StreamInfo {
     pub width: u32,
     pub height: u32,
     pub fps: u8,
+}
+
+/// One calendar (a tab) of a channel's calendar (servers 1.21.0+).
+pub type CalendarId = u64;
+pub type EventId = u64;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CalendarInfo {
+    pub id: CalendarId,
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RsvpAnswer {
+    Going,
+    Maybe,
+    NotGoing,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Rsvp {
+    pub uid: String,
+    pub name: String,
+    pub answer: RsvpAnswer,
+}
+
+/// Something arranged in a channel's calendar, e.g. a game on Monday at 8 pm.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CalendarEvent {
+    /// 0 for a new event.
+    pub id: EventId,
+    pub calendar: CalendarId,
+    pub title: String,
+    pub description: String,
+    /// Unix time (UTC seconds).
+    pub start: u64,
+    pub duration_min: u32,
+    /// At most this many people can say they are going (None: no limit).
+    pub max_people: Option<u32>,
+    pub created_by: String,
+    pub created_uid: String,
+    pub rsvps: Vec<Rsvp>,
+}
+
+impl CalendarEvent {
+    pub fn going(&self) -> usize {
+        self.rsvps.iter().filter(|r| r.answer == RsvpAnswer::Going).count()
+    }
+}
+
+/// Limits of a channel's calendar.
+pub const MAX_CALENDARS: usize = 20;
+pub const MAX_EVENTS: usize = 300;
+
+/// A camera that is on (video in a channel, servers 1.21.0+).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CameraInfo {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u8,
+}
+
+impl CameraInfo {
+    /// The largest camera picture servers relay: 720p (landscape or portrait), 30 fps.
+    pub const MAX_LONG: u32 = 1280;
+    pub const MAX_SHORT: u32 = 720;
+    pub const MAX_FPS: u8 = 30;
+
+    pub fn valid(&self) -> bool {
+        let (long, short) = (self.width.max(self.height), self.width.min(self.height));
+        short >= 16 && long <= Self::MAX_LONG && short <= Self::MAX_SHORT && (1..=Self::MAX_FPS).contains(&self.fps)
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

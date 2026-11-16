@@ -71,6 +71,11 @@ pub struct Session {
     pub hardware_due: Option<Instant>,
     /// Online / away / busy / invisible (1.17.0+).
     pub presence: Presence,
+    /// The camera, while it is on (1.21.0+): pictures go to everyone in the channel.
+    pub camera: Option<CameraInfo>,
+    pub last_camera_key_req: Option<Instant>,
+    /// Channels whose calendar this client has open (it gets every change).
+    pub calendar_subs: HashSet<ChannelId>,
 }
 
 /// Chat messages, images and pokes: bursts of this many, then `CHAT_RATE` per second.
@@ -219,10 +224,12 @@ impl PasswordWork {
 /// Largest screen share frame relayed, and how many may wait for one viewer.
 const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const MAX_QUEUED_FRAMES: usize = 8;
+/// A camera picture (at most 720p) is far smaller than a shared screen.
+const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.28.0";
+pub const MIN_CLIENT_VERSION: &str = "1.29.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -256,7 +263,9 @@ fn default_groups() -> Vec<GroupInfo> {
         | SCREEN_SHARE
         | CHANNEL_COMMANDER
         | CHANNEL_JOIN
-        | CHAT_EDIT_OWN;
+        | CHAT_EDIT_OWN
+        | CALENDAR_VIEW
+        | CALENDAR_RSVP;
     // Join power mirrors TeamSpeak: Admin 75, Normal 10, Guest 0. A channel with
     // "needed join power" 10 is therefore members-only, 75 is admins-only.
     let g = |id, kind, name: &str, perms, talk_power, sort, show_name| GroupInfo {
@@ -279,7 +288,7 @@ fn default_groups() -> Vec<GroupInfo> {
     vec![
         g(GROUP_ADMIN, GroupKind::Server, "Server Admin", ALL, 75, 10, true),
         g(GROUP_NORMAL, GroupKind::Server, "Normal", normal, 0, 20, false),
-        g(GROUP_GUEST, GroupKind::Server, "Guest", CHANNEL_JOIN | SERVER_CHAT | CHANNEL_CHAT | CHAT_HISTORY | FILE_BROWSE, 0, 30, false),
+        g(GROUP_GUEST, GroupKind::Server, "Guest", CHANNEL_JOIN | SERVER_CHAT | CHANNEL_CHAT | CHAT_HISTORY | FILE_BROWSE | CALENDAR_VIEW, 0, 30, false),
         g(
             GROUP_CHANNEL_ADMIN,
             GroupKind::Channel,
@@ -295,7 +304,9 @@ fn default_groups() -> Vec<GroupInfo> {
                 | FILE_DOWNLOAD
                 | FILE_DELETE
                 | CHAT_DELETE
-                | CHAT_PIN,
+                | CHAT_PIN
+                | CALENDAR_EVENTS
+                | CALENDAR_MANAGE,
             50,
             10,
             true,
@@ -950,6 +961,11 @@ impl Server {
                 _ => {}
             }
         }
+        // Whose cameras are on (Voxa 1.29.0+).
+        if !voxa_proto::update::is_newer("1.29.0", &info.version) {
+            let cams: Vec<(ClientId, CameraInfo)> = st.sessions.values().filter_map(|x| x.camera.map(|c| (x.info.id, c))).collect();
+            tx.send(Out::Msg(S2C::Cameras(cams)));
+        }
         // Group chats, then the group messages that arrived while this person was offline.
         if !voxa_proto::update::is_newer("1.27.0", &info.version) {
             let chats = self.store.group_chats_of(&uid).unwrap_or_default();
@@ -1005,6 +1021,9 @@ impl Server {
                 bulk_token,
                 bulk_tx: None,
                 bulk_frames: Arc::new(AtomicUsize::new(0)),
+                camera: None,
+                last_camera_key_req: None,
+                calendar_subs: HashSet::new(),
                 viewers: HashSet::new(),
                 last_keyframe_req: None,
                 extra_perms,
@@ -1461,6 +1480,151 @@ impl Server {
                 st.broadcast_client(me);
                 Ok(())
             }
+            C2S::StartCamera(info) => {
+                let s = st.session(me)?;
+                if s.web {
+                    return Err("The web page cannot turn on a camera".into());
+                }
+                if s.info.channel == NO_CHANNEL {
+                    return Err("Join a channel to turn on your camera".into());
+                }
+                self.need(self.perms_in(st, s, s.info.channel), perm::SCREEN_SHARE)?;
+                if !info.valid() {
+                    return Err("Camera pictures can be at most 1280 x 720 (or 720 x 1280) at 30 fps".into());
+                }
+                st.sessions.get_mut(&me).unwrap().camera = Some(info);
+                info!("{} turned their camera on ({}x{} at {} fps)", st.sessions[&me].info.nickname, info.width, info.height, info.fps);
+                self.camera_changed(st, me);
+                Ok(())
+            }
+            C2S::StopCamera => {
+                if st.sessions.get_mut(&me).and_then(|s| s.camera.take()).is_some() {
+                    self.camera_changed(st, me);
+                }
+                Ok(())
+            }
+            C2S::GetCalendar(ch) => {
+                let s = st.session(me)?;
+                if !st.channels.contains_key(&ch) {
+                    return Err("Channel not found".into());
+                }
+                self.need(self.perms_in(st, s, ch), perm::CALENDAR_VIEW)?;
+                // Not (or no longer) in the channel: nothing to send, and no error either (a
+                // request made just before switching channels arrives after the switch).
+                if self.calendar_reach(st, s, ch).is_err() {
+                    return Ok(());
+                }
+                let cal = db(self.store.calendar(ch))?;
+                st.sessions.get_mut(&me).unwrap().calendar_subs.insert(ch);
+                st.send(me, S2C::Calendar { channel: ch, calendars: cal.calendars, events: cal.events });
+                Ok(())
+            }
+            C2S::CreateCalendar { channel, name } => self.calendar_edit(st, me, channel, perm::CALENDAR_MANAGE, |cal, _, _| {
+                let name = clean_line(&name, 40);
+                if name.is_empty() {
+                    return Err("A calendar needs a name".into());
+                }
+                if cal.calendars.len() >= MAX_CALENDARS {
+                    return Err(format!("A channel can have at most {MAX_CALENDARS} calendars"));
+                }
+                cal.next_id += 1;
+                cal.calendars.push(CalendarInfo { id: cal.next_id, name });
+                Ok(())
+            }),
+            C2S::RenameCalendar { channel, id, name } => self.calendar_edit(st, me, channel, perm::CALENDAR_MANAGE, |cal, _, _| {
+                let name = clean_line(&name, 40);
+                if name.is_empty() {
+                    return Err("A calendar needs a name".into());
+                }
+                cal.calendars.iter_mut().find(|c| c.id == id).ok_or("Calendar not found")?.name = name;
+                Ok(())
+            }),
+            C2S::DeleteCalendar { channel, id } => self.calendar_edit(st, me, channel, perm::CALENDAR_MANAGE, |cal, _, _| {
+                let before = cal.calendars.len();
+                cal.calendars.retain(|c| c.id != id);
+                if cal.calendars.len() == before {
+                    return Err("Calendar not found".into());
+                }
+                cal.events.retain(|e| e.calendar != id);
+                Ok(())
+            }),
+            C2S::SaveEvent { channel, event } => self.calendar_edit(st, me, channel, perm::CALENDAR_EVENTS, |cal, uid, name| {
+                let title = clean_line(&event.title, 100);
+                if title.is_empty() {
+                    return Err("An event needs a title".into());
+                }
+                let description = clean_text(&event.description, 2000);
+                let duration_min = if event.duration_min == 0 { 60 } else { event.duration_min.min(7 * 24 * 60) };
+                let max_people = match event.max_people {
+                    Some(n) if !(1..=1000).contains(&n) => return Err("The number of people must be between 1 and 1000".into()),
+                    m => m,
+                };
+                // Calendar 0 (or one that is gone): the first one, made if there is none.
+                let calendar = match cal.calendars.iter().find(|c| c.id == event.calendar) {
+                    Some(c) => c.id,
+                    None => match cal.calendars.first() {
+                        Some(c) => c.id,
+                        None => {
+                            cal.next_id += 1;
+                            cal.calendars.push(CalendarInfo { id: cal.next_id, name: "General".into() });
+                            cal.next_id
+                        }
+                    },
+                };
+                if event.id == 0 {
+                    let now = now_unix();
+                    if event.start + 86_400 < now || event.start > now + 2 * 366 * 86_400 {
+                        return Err("Events can be arranged from today up to two years ahead".into());
+                    }
+                    if cal.events.len() >= MAX_EVENTS {
+                        return Err(format!("A channel can have at most {MAX_EVENTS} events"));
+                    }
+                    cal.next_id += 1;
+                    cal.events.push(CalendarEvent {
+                        id: cal.next_id,
+                        calendar,
+                        title,
+                        description,
+                        start: event.start,
+                        duration_min,
+                        max_people,
+                        created_by: name.to_string(),
+                        created_uid: uid.to_string(),
+                        rsvps: Vec::new(),
+                    });
+                } else {
+                    let e = cal.events.iter_mut().find(|e| e.id == event.id).ok_or("Event not found")?;
+                    e.calendar = calendar;
+                    e.title = title;
+                    e.description = description;
+                    e.start = event.start;
+                    e.duration_min = duration_min;
+                    e.max_people = max_people;
+                }
+                Ok(())
+            }),
+            C2S::DeleteEvent { channel, id } => self.calendar_edit(st, me, channel, perm::CALENDAR_EVENTS, |cal, _, _| {
+                let before = cal.events.len();
+                cal.events.retain(|e| e.id != id);
+                if cal.events.len() == before {
+                    return Err("Event not found".into());
+                }
+                Ok(())
+            }),
+            C2S::AnswerEvent { channel, id, answer } => self.calendar_edit(st, me, channel, perm::CALENDAR_RSVP, |cal, uid, name| {
+                let e = cal.events.iter_mut().find(|e| e.id == id).ok_or("Event not found")?;
+                if e.start + e.duration_min as u64 * 60 < now_unix() {
+                    return Err("This event is over".into());
+                }
+                e.rsvps.retain(|r| r.uid != uid);
+                if let Some(answer) = answer {
+                    if answer == RsvpAnswer::Going && e.max_people.is_some_and(|m| e.going() >= m as usize) {
+                        return Err("This event is full".into());
+                    }
+                    e.rsvps.push(Rsvp { uid: uid.to_string(), name: name.to_string(), answer });
+                }
+                Ok(())
+            }),
             C2S::ClearChat(target) => {
                 let s = st.session(me)?;
                 let ch = match target {
@@ -1725,6 +1889,8 @@ impl Server {
             // Nothing to share outside a channel.
             s.info.streaming = None;
         }
+        // A camera is for the channel you are in: it goes off when you leave it.
+        let camera_off = s.camera.take().is_some();
         s.info.channel = ch;
         s.info.channel_group = cg;
         s.info.is_talker = false;
@@ -1750,6 +1916,9 @@ impl Server {
             }
         }
         st.broadcast_client(id);
+        if camera_off {
+            self.camera_changed(st, id);
+        }
         self.cleanup_temporary(st, old);
     }
 
@@ -3121,6 +3290,105 @@ impl Server {
             if let Some(viewer) = st.sessions.get(v).filter(|x| x.client_at_least("1.8.0")) {
                 if let Some(b) = &viewer.bulk_tx {
                     let _ = b.try_send(BulkS2C::StreamAudio { from, data: data.clone() });
+                }
+            }
+        }
+    }
+
+    /// A channel's calendar is for the people in it (and those who may edit the channel),
+    /// so the calendar of a password or members-only channel stays inside it.
+    fn calendar_reach(&self, st: &State, s: &Session, ch: ChannelId) -> Res {
+        if s.info.channel == ch || self.perms_in(st, s, ch) & perm::CHANNEL_EDIT != 0 {
+            Ok(())
+        } else {
+            Err("Join the channel to see its calendar".into())
+        }
+    }
+
+    /// Changes a channel's calendar (needs `bit` there, and seeing it), saves it and sends
+    /// it to everyone who has it open. Events that ended over 30 days ago are dropped.
+    fn calendar_edit(&self, st: &mut State, me: ClientId, ch: ChannelId, bit: u64, f: impl FnOnce(&mut ChannelCalendar, &str, &str) -> Res) -> Res {
+        let s = st.session(me)?;
+        if ch == NO_CHANNEL || !st.channels.contains_key(&ch) {
+            return Err("Channel not found".into());
+        }
+        let p = self.perms_in(st, s, ch);
+        self.need(p, perm::CALENDAR_VIEW)?;
+        self.need(p, bit)?;
+        self.calendar_reach(st, s, ch)?;
+        let (uid, name) = (s.info.uid.clone(), s.info.nickname.clone());
+        st.spend_chat(me)?;
+        let mut cal = db(self.store.calendar(ch))?;
+        f(&mut cal, &uid, &name)?;
+        let now = now_unix();
+        cal.events.retain(|e| e.start + e.duration_min as u64 * 60 + 30 * 86_400 > now);
+        cal.events.sort_by_key(|e| e.start);
+        db(self.store.save_calendar(ch, &cal))?;
+        let to: Vec<ClientId> = st.sessions.values().filter(|x| x.calendar_subs.contains(&ch) && self.perms_in(st, x, ch) & perm::CALENDAR_VIEW != 0 && self.calendar_reach(st, x, ch).is_ok()).map(|x| x.info.id).collect();
+        for c in to {
+            st.send(c, S2C::Calendar { channel: ch, calendars: cal.calendars.clone(), events: cal.events.clone() });
+        }
+        Ok(())
+    }
+
+    /// Tells everyone (Voxa 1.29.0+) that `id` turned their camera on or off.
+    fn camera_changed(&self, st: &mut State, id: ClientId) {
+        let camera = st.sessions.get(&id).and_then(|s| s.camera);
+        let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.29.0")).map(|x| x.info.id).collect();
+        for c in to {
+            st.send(c, S2C::CameraChanged { client: id, camera });
+        }
+    }
+
+    /// Forwards a camera picture to everyone else in the sender's channel (Voxa 1.29.0+),
+    /// like screen share frames: oversized ones are refused, and a slow receiver skips
+    /// pictures and the camera is asked for a full one.
+    pub fn relay_camera(&self, from: ClientId, frame: StreamFrame) {
+        let mut st = self.state.lock();
+        let Some(s) = st.sessions.get(&from) else { return };
+        let Some(cam) = s.camera else { return };
+        let ch = s.info.channel;
+        if ch == NO_CHANNEL || frame.width > cam.width.max(cam.height) || frame.height > cam.width.max(cam.height) {
+            return;
+        }
+        if frame.tiles.iter().map(|t| t.jpeg.len()).sum::<usize>() > MAX_CAMERA_FRAME_BYTES {
+            return;
+        }
+        let to: Vec<ClientId> = st.sessions.values().filter(|x| x.info.id != from && x.info.channel == ch && !x.web && x.client_at_least("1.29.0")).map(|x| x.info.id).collect();
+        let mut dropped = false;
+        for v in to {
+            let Some(viewer) = st.sessions.get(&v) else { continue };
+            if let Some(b) = &viewer.bulk_tx {
+                let queued = &viewer.bulk_frames;
+                if queued.fetch_add(1, Ordering::Relaxed) >= MAX_QUEUED_FRAMES || b.try_send(BulkS2C::CameraFrame { from, frame: frame.clone() }).is_err() {
+                    queued.fetch_sub(1, Ordering::Relaxed);
+                    dropped = true;
+                }
+            }
+        }
+        if dropped {
+            self.camera_keyframe_locked(&mut st, from);
+        }
+    }
+
+    /// Someone in the same channel needs a full picture of this camera.
+    pub fn request_camera_keyframe(&self, me: ClientId, camera_of: ClientId) {
+        let mut st = self.state.lock();
+        let same = match (st.sessions.get(&me), st.sessions.get(&camera_of)) {
+            (Some(a), Some(b)) => a.info.channel == b.info.channel && b.camera.is_some(),
+            _ => false,
+        };
+        if same {
+            self.camera_keyframe_locked(&mut st, camera_of);
+        }
+    }
+
+    fn camera_keyframe_locked(&self, st: &mut State, id: ClientId) {
+        if let Some(s) = st.sessions.get_mut(&id) {
+            if s.last_camera_key_req.map(|t| t.elapsed().as_millis() > 1000).unwrap_or(true) {
+                s.last_camera_key_req = Some(Instant::now());
+                if let Some(b) = &s.bulk_tx {
+                    let _ = b.try_send(BulkS2C::CameraKeyframeRequested);
                 }
             }
         }

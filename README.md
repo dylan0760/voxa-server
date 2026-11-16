@@ -144,6 +144,8 @@ Obsidian) and the two-tone ones where one colour blends into another.
     channel groups, personal permissions, descriptions;
   * edit the virtual server and the file limits, groups and permissions, the ban list,
     and privilege keys;
+  * set the calendar permissions in the permission editor (the calendar itself is in
+    Voxa);
   * read the Server tab (server events with *See server events*, otherwise the welcome
     message) and read and write channel chat (with history, pins and images), edit your
     own messages, and send direct messages, including to people who are offline;
@@ -301,6 +303,35 @@ their update window by themselves. To allow older clients, set
   * PNG, JPEG, GIF, WebP and BMP, up to 10 MB each.
 * **Server-relayed screen sharing** with sound, up to 60 fps. Only viewers in the same
   channel receive it.
+* **Video calls** (1.21.0, Voxa 1.29.0 on Windows and Android): people turn their camera
+  on in a channel and everyone in that channel sees it, like Discord or Teams.
+  * The server relays camera pictures to the others in the channel only, at most 720p
+    (landscape or portrait) and 30 fps; bigger pictures, or pictures from someone whose
+    camera is off, are dropped.
+  * A camera needs *Share screen / applications and camera* in the channel, and goes off
+    when its owner leaves the channel. The web page can't turn one on.
+  * A slow receiver skips pictures instead of slowing everyone down.
+  * **Calls from group chats and direct messages** use what is already there: Voxa makes
+    a temporary channel with a random password and posts it to the chat. It disappears
+    when everyone has left. Starting one needs *Create temporary channels*.
+* **Channel calendar** (1.21.0, Voxa 1.29.0): each channel can have calendars (tabs) where
+  people arrange things, e.g. a game on Monday at 8 pm for 8 players, and answer going,
+  maybe or can't.
+  * Four permissions, checked in the channel (so channel groups count):
+    * *See the channel calendar*: Normal and Guest by default;
+    * *Answer calendar invitations*: Normal by default;
+    * *Create and edit calendar events*: Channel Admin by default;
+    * *Create, rename and delete calendars*: Channel Admin by default.
+
+    Server Admins have all of them. Existing servers get these defaults when they
+    update.
+  * A calendar is only shown to the people in its channel (and those who may edit the
+    channel), so a password or members-only channel keeps its calendar to itself.
+  * Events with a limit refuse more people going once full. At most 20 calendars and 300
+    events per channel; events that ended over 30 days ago are removed. Changes share the
+    chat rate limit.
+  * Calendars are stored encrypted in the database, are part of backups, and go when
+    their channel is deleted.
 * **File storage per channel:** a **max file size** and **storage per channel**, both
   unlimited if you like.
   * Admins set them in the client: click the server name ▸ **Edit Virtual Server** ▸
@@ -309,8 +340,14 @@ their update window by themselves. To allow older clients, set
     (0 = unlimited).
 
 ## Security
-* **Connections:** Noise `XX_25519_ChaChaPoly_BLAKE2s` with mutual authentication.
-  Voice uses ChaCha20-Poly1305 with a per-session key and replay protection.
+* **Connections:** Noise `XX_25519_ChaChaPoly_BLAKE2s` with mutual authentication,
+  for both of a client's connections (the second one carries files, pictures, screen
+  sharing and video).
+* **Voice** is always encrypted: every UDP packet with ChaCha20-Poly1305 under a fresh
+  random 256-bit key per connection (sent over the encrypted connection), with replay
+  protection, whatever a channel's *Encrypt voice* setting says. The server decrypts and
+  re-encrypts for each listener (it relays, like Discord and Teams); nothing crosses the
+  network in the clear.
 * **Data folder:** the service locks down the permissions of its data folder when it
   starts.
   * Normal users can only read it.
@@ -360,6 +397,8 @@ their update window by themselves. To allow older clients, set
   accepts the files it expects (no paths outside the data folder).
 * **Text:** names, topics and messages are cleaned of control characters and invisible
   direction-changing characters.
+* **Video and calendars:** see [Features](#features); every limit and permission is
+  checked by the server, not just by Voxa.
 
 ## Data & configuration
 Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,

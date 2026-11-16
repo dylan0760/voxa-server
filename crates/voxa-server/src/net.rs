@@ -252,7 +252,7 @@ async fn bulk(
     TRAFFIC.sent(Cat::Chat, writer.last_size);
     tokio::spawn(async move {
         while let Some(m) = brx.recv().await {
-            if matches!(m, BulkS2C::Frame { .. }) {
+            if matches!(m, BulkS2C::Frame { .. } | BulkS2C::CameraFrame { .. }) {
                 frames.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
             if writer.send(&m).await.is_err() {
@@ -283,6 +283,8 @@ async fn bulk(
             BulkC2S::Frame(f) => server.relay_frame(id, f),
             BulkC2S::RequestKeyframe(streamer) => server.request_keyframe(streamer),
             BulkC2S::StreamAudio(data) => server.relay_audio(id, data),
+            BulkC2S::CameraFrame(f) => server.relay_camera(id, f),
+            BulkC2S::RequestCameraKeyframe(of) => server.request_camera_keyframe(id, of),
             BulkC2S::UploadBegin { id: tid, channel, path, size, overwrite } => {
                 let res = if uploads.len() >= MAX_UPLOADS {
                     Err(format!("At most {MAX_UPLOADS} uploads can run at the same time"))

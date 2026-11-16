@@ -132,7 +132,7 @@
     GROUP_ASSIGN_CHANNEL: 20, TALK_POWER_GRANT: 21, PRIVILEGE_KEY_CREATE: 22, FILE_BROWSE: 23, FILE_UPLOAD: 24,
     FILE_DOWNLOAD: 25, FILE_DELETE: 26, SCREEN_SHARE: 27, CHANNEL_COMMANDER: 28, CHAT_HISTORY: 29,
     CLIENT_DESCRIPTION_EDIT: 30, IGNORE_SERVER_MAXCLIENTS: 31, CHANNEL_JOIN: 32, CHANNEL_JOIN_IGNORE_POWER: 33,
-    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37,
+    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37, CALENDAR_VIEW: 38, CALENDAR_RSVP: 39, CALENDAR_EVENTS: 40, CALENDAR_MANAGE: 41,
   };
   const PERM_NAMES = [
     [P.SERVER_EDIT, 'Edit virtual server settings'], [P.CHANNEL_CREATE_PERMANENT, 'Create permanent channels'],
@@ -141,7 +141,7 @@
     [P.CHANNEL_JOIN_IGNORE_POWER, 'Join channels regardless of join power'], [P.CHANNEL_JOIN_IGNORE_PASSWORD, 'Join channels without password'],
     [P.CHANNEL_JOIN_IGNORE_MAXCLIENTS, 'Join full channels'], [P.CLIENT_MOVE, 'Move clients'], [P.CLIENT_KICK_CHANNEL, 'Kick clients from channel'],
     [P.CLIENT_KICK_SERVER, 'Kick clients from server'], [P.CLIENT_BAN, 'Ban clients'], [P.BAN_LIST, 'View and edit ban list'],
-    [P.CLIENT_POKE, 'Poke clients'], [P.PRIVATE_MESSAGE, 'Send private messages'], [P.SERVER_EVENTS, 'See server events (the Server tab)'], [P.SERVER_CHAT, 'Send server chat messages (no longer used)'],
+    [P.CLIENT_POKE, 'Poke clients'], [P.PRIVATE_MESSAGE, 'Send private messages'], [P.SERVER_EVENTS, 'See server events (the Server tab)'], [P.CALENDAR_VIEW, 'See the channel calendar'], [P.CALENDAR_RSVP, 'Answer calendar invitations'], [P.CALENDAR_EVENTS, 'Create and edit calendar events'], [P.CALENDAR_MANAGE, 'Create, rename and delete calendars'], [P.SERVER_CHAT, 'Send server chat messages (no longer used)'],
     [P.CHANNEL_CHAT, 'Send channel chat messages'], [P.CHAT_HISTORY, 'Read chat history'], [P.CHAT_DELETE, "Delete anyone's chat messages (incl. history)"],
     [P.CHAT_CLEAR, 'Clear entire chat history'], [P.CHAT_PIN, 'Pin messages'], [P.CHAT_EDIT_OWN, 'Edit own chat messages'], [P.GROUP_MANAGE, 'Create, edit and delete groups'],
     [P.GROUP_ASSIGN_SERVER, 'Assign server groups'], [P.GROUP_ASSIGN_CHANNEL, 'Assign channel groups'], [P.TALK_POWER_GRANT, 'Grant / revoke talk power'],
@@ -1311,7 +1311,7 @@
       el('div', { class: 'section' }, 'Traffic since the server started'),
       el('div', { class: 'stats' },
         el('div'), el('div', { class: 'k' }, '⬇ Received'), el('div', { class: 'k' }, '⬆ Sent'),
-        row('Voice', t.voice_in, t.voice_out), row('File transfers', t.files_in, t.files_out), row('Screen sharing', t.screen_in, t.screen_out), row('Chat & other', t.chat_in, t.chat_out),
+        row('Voice', t.voice_in, t.voice_out), row('File transfers', t.files_in, t.files_out), row('Screen sharing & video', t.screen_in, t.screen_out), row('Chat & other', t.chat_in, t.chat_out),
         [el('div', { class: 'k strong' }, 'Total'), el('div', { class: 'v strong' }, fmtSize(totalIn)), el('div', { class: 'v strong' }, fmtSize(totalOut))]),
       el('div', { class: 'dim small' }, 'All traffic combined: ' + fmtSize(totalIn + totalOut)),
     ];

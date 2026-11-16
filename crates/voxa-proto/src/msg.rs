@@ -129,6 +129,25 @@ pub enum C2S {
     InviteToGroupChat { id: GroupChatId, uids: Vec<String> },
     RenameGroupChat { id: GroupChatId, name: String },
     LeaveGroupChat(GroupChatId),
+
+    // --- added in 1.21.0; only sent to servers that are 1.21.0 or newer ---
+    /// Turns your camera on (video in your channel, like Discord); the pictures go with
+    /// `BulkC2S::CameraFrame`. Turned off by `StopCamera`, leaving the channel or
+    /// disconnecting.
+    StartCamera(CameraInfo),
+    StopCamera,
+    /// A channel's calendar (answered with `S2C::Calendar`, and again after every change
+    /// while you may see it).
+    GetCalendar(ChannelId),
+    CreateCalendar { channel: ChannelId, name: String },
+    RenameCalendar { channel: ChannelId, id: CalendarId, name: String },
+    /// Deletes a calendar with its events.
+    DeleteCalendar { channel: ChannelId, id: CalendarId },
+    /// Creates (id 0) or changes an event; calendar 0 means the channel's first calendar.
+    SaveEvent { channel: ChannelId, event: CalendarEvent },
+    DeleteEvent { channel: ChannelId, id: EventId },
+    /// Going, maybe, can't, or None to take your answer back.
+    AnswerEvent { channel: ChannelId, id: EventId, answer: Option<RsvpAnswer> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -243,6 +262,14 @@ pub enum S2C {
     GroupChatUpdated(GroupChatInfo),
     /// You are no longer in this group chat (you left it).
     GroupChatLeft(GroupChatId),
+
+    // --- added in 1.21.0; only sent to clients that are 1.29.0 or newer ---
+    /// Whose cameras are on (sent after Welcome).
+    Cameras(Vec<(ClientId, CameraInfo)>),
+    /// Someone turned their camera on (Some) or off (None).
+    CameraChanged { client: ClientId, camera: Option<CameraInfo> },
+    /// A channel's calendars and events (after `GetCalendar` and every change).
+    Calendar { channel: ChannelId, calendars: Vec<CalendarInfo>, events: Vec<CalendarEvent> },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
@@ -267,6 +294,12 @@ pub enum BulkC2S {
     // --- added in 1.6.0; only sent to servers that are 1.6.0 or newer ---
     /// 20 ms of the shared screen / application's sound: one stereo 48 kHz Opus packet.
     StreamAudio(Vec<u8>),
+
+    // --- added in 1.21.0; only sent to servers that are 1.21.0 or newer ---
+    /// A picture of your camera (same encoding as screen sharing).
+    CameraFrame(StreamFrame),
+    /// Asks the camera of this person for a full picture (e.g. after joining).
+    RequestCameraKeyframe(ClientId),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -289,6 +322,12 @@ pub enum BulkS2C {
     // --- added in 1.6.0; only sent to clients that are 1.8.0 or newer ---
     /// Sound of a stream being watched (see `BulkC2S::StreamAudio`).
     StreamAudio { from: ClientId, data: Vec<u8> },
+
+    // --- added in 1.21.0; only sent to clients that are 1.29.0 or newer ---
+    /// A camera picture of someone in your channel.
+    CameraFrame { from: ClientId, frame: StreamFrame },
+    /// Someone needs a full picture of your camera.
+    CameraKeyframeRequested,
 }
 
 pub const FILE_CHUNK: usize = 256 * 1024;
