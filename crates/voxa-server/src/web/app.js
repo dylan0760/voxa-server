@@ -1805,10 +1805,28 @@
     ], { wide: true, onClose: () => { delete S.wait.FileLimits; } });
   }
 
+  // The permission search is kept while switching groups (the list is long).
+  let permQuery = '';
+  const permMatches = (q, label) => q.toLowerCase().split(/\s+/).filter(Boolean).every((w) => label.toLowerCase().includes(w));
   function permChecks(perms, onChange) {
     let p = BigInt(perms);
-    return el('div', { class: 'checks' }, PERM_NAMES.map(([b, label]) => el('label', null,
-      el('input', { type: 'checkbox', checked: (p & bit(b)) !== 0n, onchange: (e) => { p = e.target.checked ? p | bit(b) : p & ~bit(b); onChange(p); } }), label)));
+    const rows = PERM_NAMES.map(([b, label]) => [label, el('label', null,
+      el('input', { type: 'checkbox', checked: (p & bit(b)) !== 0n, onchange: (e) => { p = e.target.checked ? p | bit(b) : p & ~bit(b); onChange(p); } }), label)]);
+    const count = el('span', { class: 'dim small' });
+    const none = el('div', { class: 'dim small' }, 'No permission matches.');
+    const apply = () => {
+      let shown = 0;
+      for (const [label, row] of rows) {
+        const on = permMatches(permQuery, label);
+        row.style.display = on ? '' : 'none';
+        if (on) shown++;
+      }
+      count.textContent = permQuery.trim() ? shown + ' of ' + rows.length : '';
+      none.style.display = shown ? 'none' : '';
+    };
+    const search = el('input', { type: 'search', class: 'perm-search', placeholder: '🔍 Search permissions', value: permQuery, oninput: (e) => { permQuery = e.target.value; apply(); } });
+    apply();
+    return el('div', null, el('div', { class: 'perm-search-row' }, search, count), el('div', { class: 'checks' }, rows.map(([, row]) => row), none));
   }
 
   function groupsDialog() {

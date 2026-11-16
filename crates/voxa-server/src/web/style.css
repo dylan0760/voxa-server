@@ -118,7 +118,7 @@ a { color: var(--accent); }
   border: 0; border-radius: 12px; padding: 3px 12px; cursor: pointer; background: var(--card); color: var(--dim);
 }
 .pill.on { background: var(--accent); color: #fff; }
-input[type=text], input[type=password], input[type=number], select, textarea {
+input[type=text], input[type=password], input[type=number], input[type=search], select, textarea {
   background: var(--field); border: 1px solid var(--control-line); border-radius: 6px; padding: 6px 8px; outline: none;
 }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); }
@@ -303,6 +303,10 @@ input[type=range] { accent-color: var(--accent); }
   width: 520px; max-width: calc(100% - 24px); max-height: calc(100% - 40px); display: flex; flex-direction: column;
 }
 .dialog.wide { width: 860px; }
+/* The search above a permission list. */
+.perm-search-row { display: flex; align-items: center; gap: 10px; margin: 4px 0 8px; }
+.perm-search { flex: 1; max-width: 320px; }
+
 /* The Server tab without "See server events": the welcome message. */
 .welcome-tab { padding: 24px; display: flex; flex-direction: column; gap: 12px; }
 .welcome-tab h2 { margin: 0; color: var(--strong); font-size: 20px; }

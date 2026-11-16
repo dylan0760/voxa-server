@@ -146,6 +146,9 @@ Obsidian) and the two-tone ones where one colour blends into another.
     and privilege keys;
   * set the calendar permissions in the permission editor (the calendar itself is in
     Voxa);
+  * find a permission with the 🔍 search above the permission list (1.22.0): every word
+    you type must appear in the permission's name, in any order; the ticks of hidden
+    permissions are kept;
   * read the Server tab (server events with *See server events*, otherwise the welcome
     message) and read and write channel chat (with history, pins and images), edit your
     own messages, and send direct messages, including to people who are offline;
@@ -218,6 +221,8 @@ their update window by themselves. To allow older clients, set
   * Nobody can hand out permissions they don't have themselves.
 * **Personal permissions:** grant individual permissions to a single user on top of
   their groups (client: right-click user ▸ **Permissions…**).
+* **Permission search:** Voxa 1.30.0 and the web admin page (1.22.0) have a search box
+  above every permission list.
 * **Channel access control:**
   * The **Join / switch channels** permission controls whether a group can change
     channels at all.
