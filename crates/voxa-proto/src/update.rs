@@ -5,6 +5,7 @@
 //! 2. `download` fetches it from github.com over HTTPS (Windows' native TLS) into a new
 //!    private folder and verifies the SHA-256 digest GitHub publishes for the asset
 //!    (an installer without a digest is refused).
+//!    On Android the APK is downloaded the same way and handed to Android's installer.
 //! 3. `install` launches `msiexec` with a progress-only UI; the installer stops the
 //!    running app/service, upgrades it and relaunches it (`AUTOLAUNCH=1`).
 
@@ -197,6 +198,12 @@ pub fn release_history(repo: &str, limit: usize) -> Result<Vec<ReleaseNote>, Str
 
 /// Downloads the release installer, reporting `(downloaded, total)` bytes.
 pub fn download(rel: &Release, progress: impl Fn(u64, u64)) -> Result<PathBuf, String> {
+    download_in(&std::env::temp_dir(), rel, progress)
+}
+
+/// `download` into a new folder inside `base` (Android has no usable temp folder, so
+/// the app passes its own cache folder).
+pub fn download_in(base: &Path, rel: &Release, progress: impl Fn(u64, u64)) -> Result<PathBuf, String> {
     if !rel.asset_url.starts_with("https://github.com/") {
         return Err("Refusing to download an update from outside github.com".into());
     }
@@ -205,10 +212,12 @@ pub fn download(rel: &Release, progress: impl Fn(u64, u64)) -> Result<PathBuf, S
     };
     // A new folder with a random name: nothing can be planted there beforehand.
     let tag = format!("{:016x}", rand::random::<u64>());
-    let dir = std::env::temp_dir().join(format!("voxa-update-{tag}"));
+    let _ = std::fs::create_dir_all(base);
+    let dir = base.join(format!("voxa-update-{tag}"));
     std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
     let safe_name: String = rel.asset_name.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).collect();
-    let path = dir.join(if safe_name.ends_with(".msi") { safe_name } else { "voxa-update.msi".into() });
+    let fallback = if cfg!(target_os = "android") { "voxa-update.apk" } else { "voxa-update.msi" };
+    let path = dir.join(if safe_name.ends_with(".msi") || safe_name.ends_with(".apk") { safe_name } else { fallback.into() });
     let resp = agent().get(&rel.asset_url).call().map_err(|e| format!("Download failed: {e}"))?;
     let mut reader = resp.into_body().into_with_config().limit(1024 * 1024 * 1024).reader();
     let mut file = std::fs::File::create(&path).map_err(|e| e.to_string())?;

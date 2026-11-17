@@ -56,7 +56,7 @@
   --control: rgba(0,0,0,.12); --control-line: rgba(0,0,0,.31); --strong: #000000; --shadow: rgba(0,0,0,.2);
 }
 [data-theme="raincloud"], [data-theme="afterglow"], [data-theme="bloodmoon"], [data-theme="nightshade"], [data-theme="twilight"],
-[data-theme="synthwave"], [data-theme="pinklemonade"], [data-theme="aurora"], [data-theme="woodland"], [data-theme="vicecity"] {
+[data-theme="synthwave"], [data-theme="pinklemonade"], [data-theme="aurora"], [data-theme="woodland"], [data-theme="vicecity"], [data-theme="ownpicture"] {
   --rail: rgba(0,0,0,.7); --side: rgba(0,0,0,.55); --main: rgba(0,0,0,.39); --card: rgba(0,0,0,.27); --hover: rgba(255,255,255,.086);
   --dim: #C9CCD3; --text: #F2F3F5; --field: rgba(0,0,0,.43);
   --control: rgba(255,255,255,.16); --control-line: rgba(255,255,255,.35); --strong: #FFFFFF; --shadow: rgba(0,0,0,.6);
@@ -76,6 +76,13 @@
 [data-theme="aurora"] { --bg: linear-gradient(135deg, #062053, #10B6B6); --accent: #0B8490; --window: #0C2A37; }
 [data-theme="woodland"] { --bg: linear-gradient(135deg, #142215, #5A7C58); --accent: #4A753A; --window: #182419; }
 [data-theme="vicecity"] { --bg: linear-gradient(135deg, #FF8A3D, #8E1E8C); --accent: #FF2E88; --window: #4B2026; }
+/* Your picture (kept in this browser), darkened so text stays readable; a dark blend without one. */
+[data-theme="ownpicture"] {
+  --bg: linear-gradient(rgba(0,0,0,var(--own-dim, .35)), rgba(0,0,0,var(--own-dim, .35))), var(--own-bg, linear-gradient(135deg, #2B2D35, #121317)) center / cover no-repeat;
+  --accent: #5865F2; --window: #1E2026;
+}
+.own-bg-row { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+.own-bg-controls { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 :root { --green: #3BA55D; --red: #ED4245; --yellow: #FAA61A; }
 
 * { box-sizing: border-box; }

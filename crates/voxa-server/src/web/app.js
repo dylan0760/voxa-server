@@ -90,13 +90,24 @@
     ['mustard', 'Mustard'], ['slate', 'Slate'], ['obsidian', 'Obsidian'],
     ['citrus', 'Citrus', 1], ['candyfloss', 'Candyfloss', 1], ['spearmint', 'Spearmint', 1], ['lofi', 'Lo-fi', 1], ['dune', 'Dune', 1],
     ['raincloud', 'Raincloud', 1], ['afterglow', 'Afterglow', 1], ['bloodmoon', 'Blood Moon', 1], ['nightshade', 'Nightshade', 1], ['twilight', 'Twilight', 1],
-    ['synthwave', 'Synthwave', 1], ['pinklemonade', 'Pink Lemonade', 1], ['aurora', 'Aurora', 1], ['woodland', 'Woodland', 1], ['vicecity', 'Vice City', 1]];
+    ['synthwave', 'Synthwave', 1], ['pinklemonade', 'Pink Lemonade', 1], ['aurora', 'Aurora', 1], ['woodland', 'Woodland', 1], ['vicecity', 'Vice City', 1], ['ownpicture', 'Your picture', 2]];
   function applyTheme(t, fromServer) {
     if (!THEMES.some(([k]) => k === t)) t = 'dark';
     document.documentElement.dataset.theme = t;
     try { localStorage.setItem('voxa-theme', t); } catch (_) { /* private mode */ }
     if (!fromServer && typeof savePrefs === 'function') savePrefs({ theme: t });
   }
+  // "Your picture": a picture kept in this browser only (shrunk and re-encoded as JPEG).
+  const OWN_BG = 'voxa-web-background', OWN_DIM = 'voxa-web-background-dim';
+  const safeDataUrl = (u) => (typeof u === 'string' && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(u) ? u : null);
+  function applyBackground() {
+    let u = null, dim = 0.35;
+    try { u = safeDataUrl(localStorage.getItem(OWN_BG)); dim = Math.min(0.8, Math.max(0, Number(localStorage.getItem(OWN_DIM) ?? 0.35) || 0)); } catch (_) { /* private mode */ }
+    const s = document.documentElement.style;
+    if (u) s.setProperty('--own-bg', 'url("' + u + '")'); else s.removeProperty('--own-bg');
+    s.setProperty('--own-dim', String(dim));
+  }
+  applyBackground();
   applyTheme(localStorage.getItem('voxa-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'), true);
   // The theme picker, like the client's Options ▸ Application ▸ Themes: a miniature of each
   // theme (the tile carries data-theme, so it gets that theme's colours). Clicking applies it.
@@ -114,12 +125,46 @@
       return t;
     };
     dialog('Theme', el('div', null,
-      el('div', { class: 'section', style: 'margin-top:0' }, 'Solid'),
+      el('div', { class: 'section', style: 'margin-top:0' }, 'Your picture'),
+      el('div', { class: 'dim small' }, 'Any picture of yours behind see-through panels. It is kept in this browser only.'),
+      el('div', { class: 'own-bg-row' }, THEMES.filter((t) => t[2] === 2).map(tile), ownPictureControls(() => { const t = tiles.find((x) => x.title === 'Your picture'); applyTheme('ownpicture'); for (const x of tiles) x.classList.toggle('on', x === t); })),
+      el('div', { class: 'section' }, 'Solid'),
       el('div', { class: 'dim small' }, 'One colour family per theme.'),
       el('div', { class: 'theme-grid' }, THEMES.filter((t) => !t[2]).map(tile)),
       el('div', { class: 'section' }, 'Two-tone'),
       el('div', { class: 'dim small' }, 'A colour that blends into another, behind see-through panels.'),
-      el('div', { class: 'theme-grid' }, THEMES.filter((t) => t[2]).map(tile))), [{ label: 'Done', primary: true }], { wide: true });
+      el('div', { class: 'theme-grid' }, THEMES.filter((t) => t[2] === 1).map(tile))),
+      [{ label: 'Done', primary: true }], { wide: true });
+  }
+  // Choose / remove the picture and how dark it is.
+  function ownPictureControls(chosen) {
+    const msg = el('div', { class: 'dim small' });
+    const file = el('input', { type: 'file', accept: 'image/*', style: 'display:none', onchange: () => {
+      const f = file.files && file.files[0];
+      if (!f) return;
+      if (f.size > 40 * 1024 * 1024) { msg.textContent = 'That picture is larger than 40 MB.'; return; }
+      const img = new Image();
+      const url = URL.createObjectURL(f);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const k = Math.min(1, 1920 / Math.max(img.width, img.height));
+        const cv = document.createElement('canvas');
+        cv.width = Math.max(1, Math.round(img.width * k)); cv.height = Math.max(1, Math.round(img.height * k));
+        cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
+        try { localStorage.setItem(OWN_BG, cv.toDataURL('image/jpeg', 0.85)); msg.textContent = ''; } catch (_) { msg.textContent = 'The browser has no room to keep that picture.'; return; }
+        applyBackground();
+        chosen();
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); msg.textContent = 'That file is not a picture the browser can show.'; };
+      img.src = url;
+    } });
+    let dim = 0.35;
+    try { dim = Number(localStorage.getItem(OWN_DIM) ?? 0.35) || 0; } catch (_) { /* private mode */ }
+    const range = el('input', { type: 'range', min: '0', max: '0.8', step: '0.05', value: String(dim), oninput: () => { try { localStorage.setItem(OWN_DIM, range.value); } catch (_) { /* */ } applyBackground(); } });
+    return el('div', { class: 'own-bg-controls' },
+      el('button', { onclick: () => file.click() }, '🖼 Choose picture…'),
+      el('button', { onclick: () => { try { localStorage.removeItem(OWN_BG); } catch (_) { /* */ } applyBackground(); } }, 'Remove picture'),
+      el('label', { class: 'small' }, 'Darken ', range), file, msg);
   }
   const themeMenu = () => themeDialog();
 

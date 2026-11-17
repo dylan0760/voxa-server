@@ -148,7 +148,10 @@ Obsidian) and the two-tone ones where one colour blends into another.
     in Voxa);
   * remove someone who is offline from the server: right-click them in 👥 People ▸
     **Remove from Server…** (1.23.0);
-  * use the 🌴 Vice City theme (1.23.0), like Voxa's;
+  * use the 🌴 Vice City theme (1.23.0), like Voxa's, or **Your picture** (1.24.0): a
+    picture of yours behind the see-through panels, kept in that browser only (shrunk
+    to 1920 pixels and stored as JPEG in the browser's storage, never sent to the
+    server);
   * find a permission with the 🔍 search above the permission list (1.22.0): every word
     you type must appear in the permission's name, in any order; the ticks of hidden
     permissions are kept;

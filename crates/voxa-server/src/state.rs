@@ -290,7 +290,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.31.0";
+pub const MIN_CLIENT_VERSION: &str = "1.32.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;

@@ -558,9 +558,10 @@ async fn channels(server: &Server, s: &mut TcpStream) -> std::io::Result<()> {
 }
 
 /// The client's themes (`style.css` has their colours).
-const THEMES: [&str; 24] = [
+const THEMES: [&str; 26] = [
     "dark", "light", "sakura", "layette", "crimson", "midnight", "celadon", "mustard", "slate", "obsidian", "citrus", "candyfloss", "spearmint", "lofi", "dune",
     "raincloud", "afterglow", "bloodmoon", "nightshade", "twilight", "synthwave", "pinklemonade", "aurora", "woodland",
+    "vicecity", "ownpicture",
 ];
 
 /// What this identity's web page remembers (theme, nickname, channel).
