@@ -144,8 +144,11 @@ Obsidian) and the two-tone ones where one colour blends into another.
     channel groups, personal permissions, descriptions;
   * edit the virtual server and the file limits, groups and permissions, the ban list,
     and privilege keys;
-  * set the calendar permissions in the permission editor (the calendar itself is in
-    Voxa);
+  * set the calendar permissions in the permission editor (the calendars themselves are
+    in Voxa);
+  * remove someone who is offline from the server: right-click them in 👥 People ▸
+    **Remove from Server…** (1.23.0);
+  * use the 🌴 Vice City theme (1.23.0), like Voxa's;
   * find a permission with the 🔍 search above the permission list (1.22.0): every word
     you type must appear in the permission's name, in any order; the ticks of hidden
     permissions are kept;
@@ -337,6 +340,25 @@ their update window by themselves. To allow older clients, set
     chat rate limit.
   * Calendars are stored encrypted in the database, are part of backups, and go when
     their channel is deleted.
+* **Server calendar** (1.23.0, Voxa 1.31.0): one calendar for the whole server, in a tab
+  people see whatever channel they are in (or none).
+  * Same calendars, events, answers and limits as a channel's, and events can name a
+    **channel to meet in** (e.g. a game night in *Racing*); Voxa offers a Join button.
+    The channel must exist; when it is deleted, its events simply have no place any more.
+  * The same four calendar permissions, taken from the server groups (and personal
+    permissions) instead of a channel: by default everyone sees it, Normal members
+    answer, and Server Admins arrange events and manage the calendars. Give *Create and
+    edit calendar events* to a server group to let its members arrange game nights.
+  * Stored encrypted like the channel calendars (meeting places too), and in backups.
+* **Remove people** (1.23.0, Voxa 1.31.0 and the web page): administrators can make the
+  server forget someone who is offline. Their record (nickname, server groups, first /
+  last seen), personal permissions, channel groups, picture, web page preferences,
+  waiting messages and their place in group chats are deleted; their chat messages stay.
+  They start fresh if they come back (ban them to keep them out); a picture a moderator
+  removed stays blocked.
+  * Needs *Create, edit and delete groups*, and only works on people without permissions
+    you lack (so a moderator can't remove an admin). Not yourself, and not while they
+    are online.
 * **File storage per channel:** a **max file size** and **storage per channel**, both
   unlimited if you like.
   * Admins set them in the client: click the server name ▸ **Edit Virtual Server** ▸

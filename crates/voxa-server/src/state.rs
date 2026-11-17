@@ -142,6 +142,67 @@ pub struct Server {
 
 pub type Res<T = ()> = Result<T, String>;
 
+/// Creates (id 0) or changes an event of a calendar. Returns its id.
+fn save_event(cal: &mut ChannelCalendar, event: CalendarEvent, uid: &str, name: &str) -> Res<EventId> {
+    let title = clean_line(&event.title, 100);
+    if title.is_empty() {
+        return Err("An event needs a title".into());
+    }
+    let description = clean_text(&event.description, 2000);
+    let duration_min = if event.duration_min == 0 { 60 } else { event.duration_min.min(7 * 24 * 60) };
+    let max_people = match event.max_people {
+        Some(n) if !(1..=1000).contains(&n) => return Err("The number of people must be between 1 and 1000".into()),
+        m => m,
+    };
+    let now = now_unix();
+    if event.start > now + 2 * 366 * 86_400 {
+        return Err("Events can be arranged up to two years ahead".into());
+    }
+    // Calendar 0 (or one that is gone): the first one, made if there is none.
+    let calendar = match cal.calendars.iter().find(|c| c.id == event.calendar) {
+        Some(c) => c.id,
+        None => match cal.calendars.first() {
+            Some(c) => c.id,
+            None => {
+                cal.next_id += 1;
+                cal.calendars.push(CalendarInfo { id: cal.next_id, name: "General".into() });
+                cal.next_id
+            }
+        },
+    };
+    if event.id == 0 {
+        if event.start + 86_400 < now {
+            return Err("Events can be arranged from today up to two years ahead".into());
+        }
+        if cal.events.len() >= MAX_EVENTS {
+            return Err(format!("A calendar can have at most {MAX_EVENTS} events"));
+        }
+        cal.next_id += 1;
+        cal.events.push(CalendarEvent {
+            id: cal.next_id,
+            calendar,
+            title,
+            description,
+            start: event.start,
+            duration_min,
+            max_people,
+            created_by: name.to_string(),
+            created_uid: uid.to_string(),
+            rsvps: Vec::new(),
+        });
+        Ok(cal.next_id)
+    } else {
+        let e = cal.events.iter_mut().find(|e| e.id == event.id).ok_or("Event not found")?;
+        e.calendar = calendar;
+        e.title = title;
+        e.description = description;
+        e.start = event.start;
+        e.duration_min = duration_min;
+        e.max_people = max_people;
+        Ok(e.id)
+    }
+}
+
 fn db<T>(r: anyhow::Result<T>) -> Res<T> {
     r.map_err(|e| {
         warn!("database error: {e:#}");
@@ -229,7 +290,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.30.0";
+pub const MIN_CLIENT_VERSION: &str = "1.31.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -1503,6 +1564,17 @@ impl Server {
                 }
                 Ok(())
             }
+            C2S::GetCalendar(ch) if ch == SERVER_CALENDAR => {
+                let s = st.session(me)?;
+                if !s.client_at_least("1.31.0") {
+                    return Err("Update Voxa to see the server calendar".into());
+                }
+                self.need(st.server_perms(s), perm::CALENDAR_VIEW)?;
+                st.sessions.get_mut(&me).unwrap().calendar_subs.insert(ch);
+                let msg = self.server_calendar_msg(st)?;
+                st.send(me, msg);
+                Ok(())
+            }
             C2S::GetCalendar(ch) => {
                 let s = st.session(me)?;
                 if !st.channels.contains_key(&ch) {
@@ -1548,61 +1620,27 @@ impl Server {
                 cal.events.retain(|e| e.calendar != id);
                 Ok(())
             }),
-            C2S::SaveEvent { channel, event } => self.calendar_edit(st, me, channel, perm::CALENDAR_EVENTS, |cal, uid, name| {
-                let title = clean_line(&event.title, 100);
-                if title.is_empty() {
-                    return Err("An event needs a title".into());
-                }
-                let description = clean_text(&event.description, 2000);
-                let duration_min = if event.duration_min == 0 { 60 } else { event.duration_min.min(7 * 24 * 60) };
-                let max_people = match event.max_people {
-                    Some(n) if !(1..=1000).contains(&n) => return Err("The number of people must be between 1 and 1000".into()),
-                    m => m,
-                };
-                // Calendar 0 (or one that is gone): the first one, made if there is none.
-                let calendar = match cal.calendars.iter().find(|c| c.id == event.calendar) {
-                    Some(c) => c.id,
-                    None => match cal.calendars.first() {
-                        Some(c) => c.id,
-                        None => {
-                            cal.next_id += 1;
-                            cal.calendars.push(CalendarInfo { id: cal.next_id, name: "General".into() });
-                            cal.next_id
-                        }
-                    },
-                };
-                if event.id == 0 {
-                    let now = now_unix();
-                    if event.start + 86_400 < now || event.start > now + 2 * 366 * 86_400 {
-                        return Err("Events can be arranged from today up to two years ahead".into());
+            C2S::SaveEvent { channel, event } => self.calendar_edit(st, me, channel, perm::CALENDAR_EVENTS, |cal, uid, name| save_event(cal, event, uid, name).map(|_| ())),
+            C2S::SaveServerEvent { event, meet } => {
+                // The channel to meet in must exist (and not be a separator).
+                if let Some(m) = meet {
+                    match st.channels.get(&m) {
+                        Some(c) if m != NO_CHANNEL && voxa_proto::spacer(&c.info.name).is_none() => {}
+                        _ => return Err("That channel does not exist".into()),
                     }
-                    if cal.events.len() >= MAX_EVENTS {
-                        return Err(format!("A channel can have at most {MAX_EVENTS} events"));
-                    }
-                    cal.next_id += 1;
-                    cal.events.push(CalendarEvent {
-                        id: cal.next_id,
-                        calendar,
-                        title,
-                        description,
-                        start: event.start,
-                        duration_min,
-                        max_people,
-                        created_by: name.to_string(),
-                        created_uid: uid.to_string(),
-                        rsvps: Vec::new(),
-                    });
-                } else {
-                    let e = cal.events.iter_mut().find(|e| e.id == event.id).ok_or("Event not found")?;
-                    e.calendar = calendar;
-                    e.title = title;
-                    e.description = description;
-                    e.start = event.start;
-                    e.duration_min = duration_min;
-                    e.max_people = max_people;
                 }
-                Ok(())
-            }),
+                let store = &self.store;
+                self.calendar_edit(st, me, SERVER_CALENDAR, perm::CALENDAR_EVENTS, move |cal, uid, name| {
+                    let id = save_event(cal, event, uid, name)?;
+                    let mut places = db(store.calendar_meet())?;
+                    // Also drops places of events that are gone (deleted or long over).
+                    places.retain(|(e, _)| *e != id && cal.events.iter().any(|x| x.id == *e));
+                    if let Some(m) = meet {
+                        places.push((id, m));
+                    }
+                    db(store.save_calendar_meet(&places))
+                })
+            }
             C2S::DeleteEvent { channel, id } => self.calendar_edit(st, me, channel, perm::CALENDAR_EVENTS, |cal, _, _| {
                 let before = cal.events.len();
                 cal.events.retain(|e| e.id != id);
@@ -1625,6 +1663,7 @@ impl Server {
                 }
                 Ok(())
             }),
+            C2S::ForgetClient(uid) => self.forget_client(st, me, uid),
             C2S::ClearChat(target) => {
                 let s = st.session(me)?;
                 let ch = match target {
@@ -3307,15 +3346,23 @@ impl Server {
 
     /// Changes a channel's calendar (needs `bit` there, and seeing it), saves it and sends
     /// it to everyone who has it open. Events that ended over 30 days ago are dropped.
+    /// SERVER_CALENDAR is the server calendar: the permissions of the server groups (and
+    /// personal ones) count, wherever one is.
     fn calendar_edit(&self, st: &mut State, me: ClientId, ch: ChannelId, bit: u64, f: impl FnOnce(&mut ChannelCalendar, &str, &str) -> Res) -> Res {
         let s = st.session(me)?;
-        if ch == NO_CHANNEL || !st.channels.contains_key(&ch) {
+        let server = ch == SERVER_CALENDAR;
+        if server && !s.client_at_least("1.31.0") {
+            return Err("Update Voxa to use the server calendar".into());
+        }
+        if !server && !st.channels.contains_key(&ch) {
             return Err("Channel not found".into());
         }
-        let p = self.perms_in(st, s, ch);
+        let p = if server { st.server_perms(s) } else { self.perms_in(st, s, ch) };
         self.need(p, perm::CALENDAR_VIEW)?;
         self.need(p, bit)?;
-        self.calendar_reach(st, s, ch)?;
+        if !server {
+            self.calendar_reach(st, s, ch)?;
+        }
         let (uid, name) = (s.info.uid.clone(), s.info.nickname.clone());
         st.spend_chat(me)?;
         let mut cal = db(self.store.calendar(ch))?;
@@ -3324,10 +3371,51 @@ impl Server {
         cal.events.retain(|e| e.start + e.duration_min as u64 * 60 + 30 * 86_400 > now);
         cal.events.sort_by_key(|e| e.start);
         db(self.store.save_calendar(ch, &cal))?;
+        if server {
+            let to: Vec<ClientId> = st.sessions.values().filter(|x| x.calendar_subs.contains(&ch) && st.server_perms(x) & perm::CALENDAR_VIEW != 0).map(|x| x.info.id).collect();
+            let msg = self.server_calendar_msg(st)?;
+            for c in to {
+                st.send(c, msg.clone());
+            }
+            return Ok(());
+        }
         let to: Vec<ClientId> = st.sessions.values().filter(|x| x.calendar_subs.contains(&ch) && self.perms_in(st, x, ch) & perm::CALENDAR_VIEW != 0 && self.calendar_reach(st, x, ch).is_ok()).map(|x| x.info.id).collect();
         for c in to {
             st.send(c, S2C::Calendar { channel: ch, calendars: cal.calendars.clone(), events: cal.events.clone() });
         }
+        Ok(())
+    }
+
+    /// The server calendar for a client: meeting places of events that still exist, in
+    /// channels that still exist.
+    fn server_calendar_msg(&self, st: &State) -> Res<S2C> {
+        let cal = db(self.store.calendar(SERVER_CALENDAR))?;
+        let meet = db(self.store.calendar_meet())?.into_iter().filter(|(e, ch)| cal.events.iter().any(|x| x.id == *e) && st.channels.contains_key(ch)).collect();
+        Ok(S2C::ServerCalendar { calendars: cal.calendars, events: cal.events, meet })
+    }
+
+    /// Forgets someone who is offline (see C2S::ForgetClient).
+    fn forget_client(&self, st: &mut State, me: ClientId, uid: String) -> Res {
+        let s = st.session(me)?;
+        let mine = st.server_perms(s);
+        self.need(mine, perm::GROUP_MANAGE)?;
+        if uid == s.info.uid {
+            return Err("You cannot remove yourself".into());
+        }
+        if st.sessions.values().any(|x| x.info.uid == uid) {
+            return Err("They are online: they can only be removed while offline (kick them first)".into());
+        }
+        // Nobody can take away permissions (groups) they do not have themselves.
+        Self::outranks(mine, self.perms_of_uid(st, &uid))?;
+        let by = s.info.nickname.clone();
+        let name = db(self.store.get_client(&uid))?.map(|c| c.nickname);
+        if !db(self.store.delete_client(&uid))? {
+            return Err("Unknown user".into());
+        }
+        info!("{by} removed {} ({uid}) from the server", name.as_deref().unwrap_or("?"));
+        st.send(me, S2C::Notice(format!("Removed {} from the server", name.as_deref().unwrap_or("them"))));
+        let people = db(self.store.all_clients())?.into_iter().map(|c| Person { uid: c.uid, nickname: c.nickname, last_seen: c.last_seen }).collect();
+        st.send(me, S2C::People(people));
         Ok(())
     }
 

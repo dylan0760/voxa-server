@@ -44,6 +44,11 @@ const GROUP_QUEUE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("g
 /// Channel id -> the channel's calendars and events (encrypted).
 const CALENDARS: TableDefinition<u64, &[u8]> = TableDefinition::new("calendars");
 
+/// Where the server calendar's meeting places are kept in `CALENDARS` (no channel has
+/// this id).
+const MEET_KEY: u64 = u64::MAX;
+const MEET_AAD: &[u8] = b"voxa-calendar-meet";
+
 /// A channel's calendar: its calendars (tabs) and events.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ChannelCalendar {
@@ -580,6 +585,57 @@ impl Store {
         Ok(out)
     }
 
+    /// Forgets an identity (1.23.0): its record (nickname, server groups, first / last
+    /// seen), personal permissions, channel groups, picture, web page preferences, waiting
+    /// direct and group messages, and its place in group chats. A moderator-removed picture
+    /// stays blocked. Its chat messages stay (like a message of someone who left). Returns
+    /// whether there was a record.
+    pub fn delete_client(&self, uid: &str) -> R<bool> {
+        let w = self.db.begin_write()?;
+        let existed;
+        {
+            existed = w.open_table(CLIENTS)?.remove(uid)?.is_some();
+            w.open_table(CLIENT_PERMS)?.remove(uid)?;
+            w.open_table(WEB_PREFS)?.remove(uid)?;
+            let mut cg = w.open_table(CHANNEL_GROUPS)?;
+            let keys: Vec<u64> = cg.range((uid, 0)..=(uid, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, _)| k.value().1).collect();
+            for ch in keys {
+                cg.remove((uid, ch))?;
+            }
+            let mut off = w.open_table(OFFLINE)?;
+            let keys: Vec<u64> = off.range((uid, 0)..=(uid, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, _)| k.value().1).collect();
+            for id in keys {
+                off.remove((uid, id))?;
+            }
+            let mut gq = w.open_table(GROUP_QUEUE)?;
+            let keys: Vec<u64> = gq.range((uid, 0)..=(uid, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, _)| k.value().1).collect();
+            for id in keys {
+                gq.remove((uid, id))?;
+            }
+            let mut av = w.open_table(AVATARS)?;
+            let removed = av.get(uid)?.and_then(|v| dec::<AvatarRecord>(v.value())).map(|a| a.removed).unwrap_or(0);
+            if removed == 0 {
+                av.remove(uid)?;
+            } else {
+                av.insert(uid, enc(&AvatarRecord { removed, ..Default::default() }).as_slice())?;
+            }
+        }
+        w.commit()?;
+        // Group chats: out of every one (one left empty is deleted).
+        for (id, mut rec) in self.group_chats_of(uid)? {
+            rec.members.retain(|m| m != uid);
+            if rec.members.is_empty() {
+                self.delete_group_chat(id)?;
+            } else {
+                if rec.owner == uid {
+                    rec.owner = rec.members[0].clone();
+                }
+                self.save_group_chat(id, &rec)?;
+            }
+        }
+        Ok(existed)
+    }
+
     pub fn channel_group(&self, uid: &str, ch: ChannelId) -> R<Option<GroupId>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(CHANNEL_GROUPS)?;
@@ -864,6 +920,23 @@ impl Store {
         Ok(t.get(ch)?.and_then(|v| self.unseal_raw(&Self::calendar_aad(ch), v.value())).and_then(|p| dec(&p)).unwrap_or_default())
     }
 
+    /// The server calendar's meeting places: event -> channel (1.23.0; the server calendar
+    /// itself is `calendar(SERVER_CALENDAR)`). Kept apart so calendars stay readable by
+    /// older versions after a downgrade.
+    pub fn calendar_meet(&self) -> R<Vec<(u64, u64)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(CALENDARS)?;
+        Ok(t.get(MEET_KEY)?.and_then(|v| self.unseal_raw(MEET_AAD, v.value())).and_then(|p| dec(&p)).unwrap_or_default())
+    }
+
+    pub fn save_calendar_meet(&self, meet: &[(u64, u64)]) -> R<()> {
+        let blob = self.seal_raw(MEET_AAD, &enc(&meet.to_vec()));
+        let w = self.db.begin_write()?;
+        w.open_table(CALENDARS)?.insert(MEET_KEY, blob.as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn save_calendar(&self, ch: u64, cal: &ChannelCalendar) -> R<()> {
         let blob = self.seal_raw(&Self::calendar_aad(ch), &enc(cal));
         let w = self.db.begin_write()?;
@@ -1131,12 +1204,13 @@ impl Store {
         Ok(t.get(uid)?.and_then(|v| dec(v.value())))
     }
 
-    /// Saves (or, when it has neither a colour nor a picture, removes) an avatar.
+    /// Saves (or, when it has neither a colour nor a picture nor a removed picture to keep
+    /// out, removes) an avatar.
     pub fn save_avatar(&self, uid: &str, a: &AvatarRecord) -> R<()> {
         let w = self.db.begin_write()?;
         {
             let mut t = w.open_table(AVATARS)?;
-            if a.color.is_none() && a.image.is_empty() {
+            if a.color.is_none() && a.image.is_empty() && a.removed == 0 {
                 t.remove(uid)?;
             } else {
                 t.insert(uid, enc(a).as_slice())?;

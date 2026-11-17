@@ -334,6 +334,12 @@ impl CalendarEvent {
     }
 }
 
+/// The server calendar (servers 1.23.0+): a calendar everyone on the server can see
+/// whatever channel they are in (with "See the channel calendar" in their server groups).
+/// Its events can name a channel to meet in. The calendar messages take it as channel 0;
+/// new events go with `C2S::SaveServerEvent`.
+pub const SERVER_CALENDAR: ChannelId = 0;
+
 /// Limits of a channel's calendar.
 pub const MAX_CALENDARS: usize = 20;
 pub const MAX_EVENTS: usize = 300;

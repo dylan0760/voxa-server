@@ -148,6 +148,16 @@ pub enum C2S {
     DeleteEvent { channel: ChannelId, id: EventId },
     /// Going, maybe, can't, or None to take your answer back.
     AnswerEvent { channel: ChannelId, id: EventId, answer: Option<RsvpAnswer> },
+
+    // --- added in 1.23.0; only sent to servers that are 1.23.0 or newer ---
+    /// Forgets someone who is offline: their record, server groups, personal
+    /// permissions, channel groups, picture and waiting messages (they start fresh if they
+    /// come back). Needs "Create, edit and delete groups", and no permission they have
+    /// that you lack. Answered with an updated `People` list.
+    ForgetClient(String),
+    /// Creates (id 0) or changes an event of the server calendar (`SERVER_CALENDAR`),
+    /// with the channel to meet in (None: no channel).
+    SaveServerEvent { event: CalendarEvent, meet: Option<ChannelId> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -270,6 +280,11 @@ pub enum S2C {
     CameraChanged { client: ClientId, camera: Option<CameraInfo> },
     /// A channel's calendars and events (after `GetCalendar` and every change).
     Calendar { channel: ChannelId, calendars: Vec<CalendarInfo>, events: Vec<CalendarEvent> },
+
+    // --- added in 1.23.0; only sent to clients that are 1.31.0 or newer ---
+    /// The server calendar (after `GetCalendar(SERVER_CALENDAR)` and every change): its
+    /// calendars, events, and the channel each event meets in.
+    ServerCalendar { calendars: Vec<CalendarInfo>, events: Vec<CalendarEvent>, meet: Vec<(EventId, ChannelId)> },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file

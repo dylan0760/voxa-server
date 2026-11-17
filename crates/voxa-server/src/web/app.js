@@ -90,7 +90,7 @@
     ['mustard', 'Mustard'], ['slate', 'Slate'], ['obsidian', 'Obsidian'],
     ['citrus', 'Citrus', 1], ['candyfloss', 'Candyfloss', 1], ['spearmint', 'Spearmint', 1], ['lofi', 'Lo-fi', 1], ['dune', 'Dune', 1],
     ['raincloud', 'Raincloud', 1], ['afterglow', 'Afterglow', 1], ['bloodmoon', 'Blood Moon', 1], ['nightshade', 'Nightshade', 1], ['twilight', 'Twilight', 1],
-    ['synthwave', 'Synthwave', 1], ['pinklemonade', 'Pink Lemonade', 1], ['aurora', 'Aurora', 1], ['woodland', 'Woodland', 1]];
+    ['synthwave', 'Synthwave', 1], ['pinklemonade', 'Pink Lemonade', 1], ['aurora', 'Aurora', 1], ['woodland', 'Woodland', 1], ['vicecity', 'Vice City', 1]];
   function applyTheme(t, fromServer) {
     if (!THEMES.some(([k]) => k === t)) t = 'dark';
     document.documentElement.dataset.theme = t;
@@ -1383,7 +1383,13 @@
     const online = [...S.clients.values()].filter((c) => c.uid !== S.uid && match(c.nickname)).sort((a, b) => a.nickname.localeCompare(b.nickname)).filter((c) => (seen.has(c.uid) ? false : seen.add(c.uid)));
     const onlineUids = new Set([...S.clients.values()].map((c) => c.uid));
     const offline = S.people.filter((p) => !onlineUids.has(p.uid) && p.uid !== S.uid && match(p.nickname)).sort((a, b) => b.last_seen - a.last_seen);
-    const row = (uid, name, sub, dot) => el('div', { class: 'person' + (dot ? '' : ' off'), title: dot ? 'Send a direct message' : 'Send a message: it is delivered when they come online', onclick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
+    // Right-click: message, or (offline, with "Create, edit and delete groups") forget them.
+    const personMenu = (uid, name, online, x, y) => menu(x, y, [
+      { head: name },
+      { label: '💬  Send Message', onClick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
+      !online && can(P.GROUP_MANAGE) ? { label: '🗑  Remove from Server…', onClick: () => forgetPerson(uid, name) } : null,
+    ]);
+    const row = (uid, name, sub, dot) => el('div', { class: 'person' + (dot ? '' : ' off'), title: dot ? 'Send a direct message' : 'Send a message: it is delivered when they come online (right-click for more)', onclick: () => { openDm(uid, name); activateTab('dm:' + uid); }, oncontextmenu: (e) => { e.preventDefault(); personMenu(uid, name, !!dot, e.clientX, e.clientY); } },
       avatar(name, uid, 30, dot),
       el('div', { style: 'min-width:0' }, el('div', { class: 'n' }, name), el('div', { class: 'dim small' }, sub)));
     // Where they are (a channel, or just on the server like Discord) and their status.
@@ -1534,6 +1540,13 @@
   function closeDialogs(all) {
     for (const d of [...$('#modals').children]) if (all) d.__close ? d.__close() : d.remove();
   }
+  // Forgets someone who is offline (servers 1.23.0+): the server answers with the People list.
+  async function forgetPerson(uid, name) {
+    const text = 'The server forgets ' + name + ': their server groups, personal permissions, channel groups, picture and messages waiting for them. ' +
+      'Their chat messages stay. If they connect again they start fresh, like someone new (to keep them out, ban them instead).';
+    if (await confirmDialog('Remove from server', text, 'Remove', true)) send({ ForgetClient: uid });
+  }
+
   function confirmDialog(title, text, ok, danger) {
     return new Promise((res) => {
       let done = false;
