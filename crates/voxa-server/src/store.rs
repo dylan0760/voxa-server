@@ -63,17 +63,55 @@ pub struct AccountRec {
     pub totp_last_step: u64,
     /// SHA-256 (hex) of the unused recovery codes.
     pub recovery: Vec<String>,
-    pub email: Option<String>,
-    /// An emailed reset code: (SHA-256 hex, valid until, wrong tries).
-    pub reset: Option<(String, u64, u32)>,
-    /// Reset emails sent: (count, since) for a limit per hour.
-    pub reset_sent: (u32, u64),
+    /// Unused: email resets were in the 1.25.0 test build only. The slots stay so its
+    /// records keep their layout; they are always empty now.
+    pub legacy_email: Option<String>,
+    pub legacy_reset: Option<(String, u64, u32)>,
+    pub legacy_reset_sent: (u32, u64),
     /// Remembered devices: (SHA-256 hex of the token, valid until).
     pub tokens: Vec<(String, u64)>,
     /// Wrong passwords / codes in a row, and the lock that follows too many.
     pub failures: u32,
     pub locked_until: u64,
     pub created: u64,
+    /// An administrator reset the password (1.25.1+): it must be changed after signing in.
+    pub must_change: bool,
+}
+
+/// An account as the 1.25.0 test build stored it (no `must_change`).
+#[derive(Deserialize)]
+struct AccountRecV0 {
+    username: String,
+    password_hash: String,
+    totp: Option<Vec<u8>>,
+    totp_pending: Option<Vec<u8>>,
+    totp_last_step: u64,
+    recovery: Vec<String>,
+    _email: Option<String>,
+    _reset: Option<(String, u64, u32)>,
+    _reset_sent: (u32, u64),
+    tokens: Vec<(String, u64)>,
+    failures: u32,
+    locked_until: u64,
+    created: u64,
+}
+
+impl From<AccountRecV0> for AccountRec {
+    fn from(a: AccountRecV0) -> Self {
+        AccountRec {
+            username: a.username,
+            password_hash: a.password_hash,
+            totp: a.totp,
+            totp_pending: a.totp_pending,
+            totp_last_step: a.totp_last_step,
+            recovery: a.recovery,
+            tokens: a.tokens,
+            failures: a.failures,
+            locked_until: a.locked_until,
+            created: a.created,
+            ..Default::default()
+        }
+    }
 }
 
 /// Where the server calendar's meeting places are kept in `CALENDARS` (no channel has
@@ -695,7 +733,9 @@ impl Store {
     pub fn account(&self, uid: &str) -> R<Option<AccountRec>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(ACCOUNTS)?;
-        Ok(t.get(uid)?.and_then(|v| self.unseal_raw(&Self::account_aad(uid), v.value())).and_then(|p| dec(&p)))
+        Ok(t.get(uid)?
+            .and_then(|v| self.unseal_raw(&Self::account_aad(uid), v.value()))
+            .and_then(|p| dec::<AccountRec>(&p).or_else(|| dec::<AccountRecV0>(&p).map(AccountRec::from))))
     }
 
     /// The identity a username belongs to.
@@ -1443,5 +1483,37 @@ impl Store {
         }
         w.commit()?;
         Ok(doomed.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Accounts saved by the 1.25.0 test build (no `must_change`) still load.
+    #[test]
+    fn old_account_records_load() {
+        let old = (
+            "alice".to_string(),
+            "hash".to_string(),
+            Some(vec![1u8; 20]),
+            None::<Vec<u8>>,
+            7u64,
+            vec!["code".to_string()],
+            Some("a@b.c".to_string()),
+            None::<(String, u64, u32)>,
+            (0u32, 0u64),
+            vec![("t".to_string(), 9u64)],
+            2u32,
+            0u64,
+            5u64,
+        );
+        let b = enc(&old);
+        assert!(dec::<AccountRec>(&b).is_none());
+        let a: AccountRec = dec::<AccountRecV0>(&b).map(AccountRec::from).unwrap();
+        assert_eq!((a.username.as_str(), a.totp_last_step, a.failures, a.created), ("alice", 7, 2, 5));
+        assert!(a.legacy_email.is_none() && !a.must_change);
+        let new = AccountRec { must_change: true, ..a };
+        assert!(dec::<AccountRec>(&enc(&new)).unwrap().must_change);
     }
 }

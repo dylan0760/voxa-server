@@ -369,7 +369,7 @@ their update window by themselves. To allow older clients, set
     **File transfers**.
   * `max_upload_mb` / `channel_quota_mb` in `server.toml` are only the initial defaults
     (0 = unlimited).
-* **Accounts** (1.25.0, Voxa 1.33.0 and the web page): a username and password on top of
+* **Accounts** (1.25.1, Voxa 1.33.1 and the web page): a username and password on top of
   each identity, so a copied identity key alone isn't enough. Accounts are per server.
   * **Edit Virtual Server → Accounts & security:** **Off** (the default), **Optional**,
     **Required for staff** (everyone whose groups give more than the default server group)
@@ -381,12 +381,16 @@ their update window by themselves. To allow older clients, set
     Aegis, 2FAS, Yubico Authenticator with a YubiKey), with 10 one-time recovery codes.
   * **Remembered devices:** a token that signs a device in for 30 days (at most 10 per
     account). Changing or resetting the password, or turning MFA on, signs them all out.
-  * **Forgotten passwords:** a recovery code, or an 8-digit code by email (valid 15
-    minutes, 5 tries, at most 3 emails an hour) when email is set up (see `smtp_*` in
-    [Data & configuration](#data--configuration)). The answer to "email me a code" is the
-    same whether or not the account exists.
+  * **Forgotten passwords:** a recovery code, or an administrator resets it.
+  * **Administrator resets** (*Edit virtual server*): right-click someone (or someone
+    offline in People) ▸ **Reset Account Password…**. The server makes a temporary
+    password, shows it to that administrator once, signs the account out everywhere and,
+    if ticked, turns off its authenticator app. After signing in with it, they must choose
+    a new password; until then they only get Guest permissions where accounts are
+    required. Not for people with permissions you lack, and not yourself. There is no
+    email: the server never sends any.
   * Removing someone from the server deletes their account too.
-* **Hidden channels** (1.25.0, Voxa 1.33.0 and the web page): **Edit Channel → Hidden
+* **Hidden channels** (1.25.1, Voxa 1.33.1 and the web page): **Edit Channel → Hidden
   from** picks server groups that don't see a channel. For them the channel, its
   sub-channels, the people in it and its chat don't exist. Everything about it is left
   out of what they are sent, and asking for it by number gets "Channel not found".
@@ -420,22 +424,23 @@ their update window by themselves. To allow older clients, set
   and that file is removed once an administrator exists.
 * **Passwords:** hashed with Argon2id, and checked without blocking the server. After 10
   wrong passwords from one address in a minute, further tries are refused for a minute.
-* **Accounts** (1.25.0):
+* **Accounts** (1.25.1):
   * Account records are stored encrypted, each bound to its identity. Recovery codes,
-    reset codes and device tokens are kept only as SHA-256 hashes and compared in
+    device tokens are kept only as SHA-256 hashes and compared in
     constant time.
   * Ten wrong passwords or codes in a row lock an account for 15 minutes. Only the
     identity that owns an account can try to sign in to it. Without an account, the
     password is checked against a dummy hash, so the answer takes just as long.
-  * Password resets can be tried by anyone for any username, so wrong reset codes are
+  * Recovery-code resets can be tried by anyone for any username, so wrong codes are
     rate limited but never lock the account (strangers can't lock its owner out).
+  * An administrator's reset makes a random 75-bit temporary password, shown only to
+    them (never logged). The account can't get its permissions back until the owner
+    chooses a new password, so the administrator doesn't keep a working password.
   * Authenticator codes work once. A device is only remembered after a full sign-in
     (with MFA if the account has it).
-  * Changing an account (password, email, MFA, new recovery codes) needs a full sign-in
+  * Changing an account (password, MFA, new recovery codes) needs a full sign-in
     on that connection, with the authenticator app if the account has one. A stolen
     password alone can't make new recovery codes to get around MFA.
-  * Reset emails go over TLS only (STARTTLS or implicit TLS, never in the clear). The
-    only user text in their headers is the checked address.
   * Messages carrying passwords are never logged.
 * **Limits against overload:**
   * at most 64 connections per address;
@@ -502,11 +507,6 @@ Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
 | `web_bind` | `0.0.0.0` | Address the web admin page listens on |
 | `web_port` | `9980` | TCP port of the web admin page |
 | `web_allowed_origins` | `[]` | Web addresses the page may be signed in from (empty = any) |
-| `smtp_host` | `""` | Mail server for password reset emails (empty = no emails; recovery codes still work) |
-| `smtp_port` | `587` | Its port: 587 with `starttls`, 465 with `tls` |
-| `smtp_security` | `starttls` | `starttls` or `tls` (never unencrypted) |
-| `smtp_user` / `smtp_password` | `""` | Sign-in for the mail server (empty user = none) |
-| `smtp_from` | `""` | The sender, e.g. `Voxa Server <voxa@example.org>` (needed for emails) |
 
 Restart the server after editing.
 

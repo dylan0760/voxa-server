@@ -28,16 +28,6 @@ pub struct Config {
     /// Web addresses the page may be signed in from, e.g. `["https://voxa.example.org"]`.
     /// Empty: whatever address the page was opened with (as the browser / proxy reports it).
     pub web_allowed_origins: Vec<String>,
-    /// Email for password resets (accounts, 1.25.0+). Empty host: no email (people reset
-    /// with their recovery codes instead).
-    pub smtp_host: String,
-    /// 587 with `smtp_security = "starttls"`, or 465 with `smtp_security = "tls"`.
-    pub smtp_port: u16,
-    pub smtp_security: String,
-    pub smtp_user: String,
-    pub smtp_password: String,
-    /// The sender, e.g. `Voxa Server <voxa@example.org>`.
-    pub smtp_from: String,
 }
 
 impl Default for Config {
@@ -53,12 +43,6 @@ impl Default for Config {
             web_bind: "0.0.0.0".into(),
             web_port: 9980,
             web_allowed_origins: Vec::new(),
-            smtp_host: String::new(),
-            smtp_port: 587,
-            smtp_security: "starttls".into(),
-            smtp_user: String::new(),
-            smtp_password: String::new(),
-            smtp_from: String::new(),
         }
     }
 }

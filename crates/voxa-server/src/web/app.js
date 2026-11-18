@@ -200,7 +200,9 @@
     const me = S.clients.get(S.me);
     if (!me) return 0n;
     // Until signing in to the account (when the server wants it): only Guest's.
-    if (S.account && S.account.limited) return BigInt(S.groups.get(GUEST_GROUP)?.perms ?? 0);
+    // Until the account state arrives (right after Welcome), Guest's: nothing is asked for
+    // that the server would refuse while a remembered browser is still signing in.
+    if (!S.account || S.account.limited) return BigInt(S.groups.get(GUEST_GROUP)?.perms ?? 0);
     let p = BigInt(S.extra || 0);
     for (const g of me.server_groups) p |= BigInt(S.groups.get(g)?.perms ?? 0);
     p |= BigInt(S.groups.get(me.channel_group)?.perms ?? 0);
@@ -612,6 +614,8 @@
         S.presences = new Map();
         S.editing = null;
         S.account = null; S.accountPolicy = null; S.hidden = new Map(); S.accountResumed = false; S.accountPrompted = false;
+        // A remembered browser signs in before anything else is asked for.
+        { const tok = localStorage.getItem(accountKey()); if (tok) { S.accountResumed = true; send({ ResumeAccount: tok }); } }
         avatars.clear();
         S.connected = true;
         S.msgDirty = true;
@@ -798,12 +802,21 @@
         if (!v.signed_in && v.username && !S.accountResumed && tok) { S.accountResumed = true; send({ ResumeAccount: tok }); }
         else if (v.limited && !S.accountPrompted) { S.accountPrompted = true; accountDialog(); }
         if (v.signed_in) S.accountPrompted = true;
+        // Signed in with an administrator's temporary password: choose a new one.
+        if (v.signed_in && v.must_change && !S.accountDlg) accountDialog();
         if (S.accountDlg) S.accountDlg.redraw();
         S.msgDirty = true;
         break;
       }
       case 'AccountToken':
         localStorage.setItem(accountKey(), v);
+        break;
+      case 'AccountReset':
+        dialog('Temporary password', el('div', null,
+          el('p', null, 'The password of the account "' + v.username + '" was reset. Give them this temporary password (it is not shown again):'),
+          el('p', null, el('code', { style: 'font-size:18px;user-select:all' }, v.password)),
+          el('p', { class: 'dim small' }, 'They sign in with their username and this password, then choose a new password.')),
+          [{ label: 'Copy', onClick: () => { if (navigator.clipboard) navigator.clipboard.writeText(v.password); return false; } }, { label: 'Done', primary: true }]);
         break;
       case 'MfaSetup':
         S.mfaSetup = v;
@@ -1477,6 +1490,7 @@
       { head: name },
       { label: '💬  Send Message', onClick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
       !online && can(P.GROUP_MANAGE) ? { label: '🗑  Remove from Server…', onClick: () => forgetPerson(uid, name) } : null,
+      S.accountPolicy && can(P.SERVER_EDIT) && uid !== S.uid ? { label: '🔑  Reset Account Password…', onClick: () => resetAccount(uid, name) } : null,
     ]);
     const row = (uid, name, sub, dot) => el('div', { class: 'person' + (dot ? '' : ' off'), title: dot ? 'Send a direct message' : 'Send a message: it is delivered when they come online (right-click for more)', onclick: () => { openDm(uid, name); activateTab('dm:' + uid); }, oncontextmenu: (e) => { e.preventDefault(); personMenu(uid, name, !!dot, e.clientX, e.clientY); } },
       avatar(name, uid, 30, dot),
@@ -1595,6 +1609,7 @@
       can(P.GROUP_ASSIGN_SERVER) ? { label: '👥  Server Groups…', onClick: () => serverGroupsDialog(c) } : null,
       can(P.GROUP_ASSIGN_CHANNEL) ? { label: '👥  Channel Group…', onClick: () => channelGroupDialog(c) } : null,
       can(P.GROUP_MANAGE) ? { label: '🔐  Permissions…', onClick: () => clientPermsDialog(c) } : null,
+      S.accountPolicy && can(P.SERVER_EDIT) && c.id !== S.me ? { label: '🔑  Reset Account Password…', onClick: () => resetAccount(c.uid, c.nickname) } : null,
       can(P.CLIENT_DESCRIPTION_EDIT) ? { label: '📝  Edit Description…', onClick: () => editDescription(c) } : null,
       can(P.CLIENT_DESCRIPTION_EDIT) && avatars.get(c.uid)?.image ? { label: '🖼  Remove Avatar Picture…', danger: true, onClick: () => confirmDialog('Remove avatar picture', 'Remove the avatar picture of ' + c.nickname + '? They cannot use the same picture again on this server.', 'Remove', true).then((ok) => ok && send({ ClearAvatar: c.uid })) } : null,
       { label: '📋  Copy Unique ID', onClick: () => copy(c.uid) },
@@ -1631,6 +1646,17 @@
     for (const d of [...$('#modals').children]) if (all) d.__close ? d.__close() : d.remove();
   }
   // Forgets someone who is offline (servers 1.23.0+): the server answers with the People list.
+  // Resets someone's account password (servers 1.25.1+): the server answers with AccountReset.
+  function resetAccount(uid, name) {
+    const mfa = el('input', { type: 'checkbox' });
+    dialog('Reset account password: ' + name, el('div', null,
+      el('p', { style: 'margin-top:0' }, 'The server makes a temporary password for their account and shows it to you once. Give it to them: they sign in with it and must then choose a new password. Their remembered devices are signed out.'),
+      el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, mfa, 'Also turn off their authenticator app (they lost their phone or key)'),
+      el('p', { class: 'dim small' }, 'Make sure it really is them asking: whoever has the temporary password gets the account.')), [
+      { label: 'Cancel' },
+      { label: 'Reset password', danger: true, onClick: () => send({ ResetAccount: { uid, remove_mfa: mfa.checked } }) },
+    ]);
+  }
   async function forgetPerson(uid, name) {
     const text = 'The server forgets ' + name + ': their server groups, personal permissions, channel groups, picture and messages waiting for them. ' +
       'Their chat messages stay. If they connect again they start fresh, like someone new (to keep them out, ban them instead).';
@@ -1875,7 +1901,7 @@
     let err = '';
     const body = el('div');
     const inp = (type, ph) => el('input', { type, placeholder: ph || '', autocomplete: type === 'password' ? 'current-password' : 'off' });
-    const user = inp('text'), pw = inp('password'), pw2 = inp('password'), npw = inp('password'), email = inp('text', 'you@example.com'), code = inp('text', '123456');
+    const user = inp('text'), pw = inp('password'), pw2 = inp('password'), npw = inp('password'), code = inp('text', '123456');
     const remember = el('input', { type: 'checkbox', checked: true });
     const btn = (label, onClick, kind) => el('button', { class: 'btn' + (kind ? ' ' + kind : ''), onclick: onClick }, label);
     const go = (p) => { page = p; err = ''; draw(); };
@@ -1886,7 +1912,7 @@
       const a = S.account, pol = S.accountPolicy || { mode: 'Off' };
       if (!a) return;
       const has = !!a.username;
-      let p = page === 'main' && !a.signed_in && has ? 'signin' : page;
+      let p = a.signed_in && a.must_change ? 'password' : page === 'main' && !a.signed_in && has ? 'signin' : page;
       const rows = [];
       if (a.limited && a.reason) rows.push(el('div', { class: 'note full', style: 'color:var(--warn,#e0b040)' }, '⚠ ' + a.reason + ' Until then you only have Guest permissions here.'));
       if (err) rows.push(el('div', { class: 'note full', style: 'color:var(--bad,#e05050)' }, err));
@@ -1905,14 +1931,14 @@
         if (pol.mode === 'Off') rows.push(el('p', { class: 'full' }, 'This server does not use accounts.'));
         else {
           rows.push(...field('Username', user, '3-32 letters, digits, . - _'), ...field('Password', pw, 'At least 10 characters.'), ...field('Again', pw2),
-            ...field('Email', email, pol.email_reset ? 'Optional: to reset a forgotten password.' : 'Optional. This server cannot send email: use recovery codes (add an authenticator app).'),
+            el('div', { class: 'note full' }, 'Forgot it later? Use a recovery code (you get them with an authenticator app), or ask a server administrator to reset it.'),
             ...field('', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, remember, 'Remember this browser for 30 days')),
             actions(btn('Make account', () => {
               const u = user.value.trim();
               if (!/^[\p{L}\p{N}._-]{3,32}$/u.test(u)) return fail('A username has 3 to 32 letters, digits, dots, dashes or underscores.');
               if (!goodPw(pw.value)) return fail('A password needs at least 10 characters.');
               if (pw.value !== pw2.value) return fail('The two passwords are different.');
-              send({ CreateAccount: { username: u, password: pw.value, email: email.value.trim() || null } });
+              send({ CreateAccount: { username: u, password: pw.value } });
               if (remember.checked) S.afterCreate = { username: u, password: pw.value };
               clear();
             }, 'primary'), btn('I already have an account', () => go('signin'))));
@@ -1928,25 +1954,24 @@
           }, 'primary'), btn('Forgot password?', () => go('forgot')), has ? null : btn('Back', () => go('main'))));
       } else if (p === 'forgot') {
         rows.push(...field('Username', user));
-        if (pol.email_reset) rows.push(actions(btn('📧 Email me a reset code', () => user.value.trim() && send({ RequestReset: { username: user.value.trim() } }))));
-        rows.push(...field(pol.email_reset ? 'Code' : 'Recovery code', code, pol.email_reset ? 'The reset code from the email, or a recovery code.' : null), ...field('New password', npw, 'At least 10 characters.'),
+        rows.push(...field('Recovery code', code), ...field('New password', npw, 'At least 10 characters.'),
           actions(btn('Reset password', () => {
             if (!goodPw(npw.value)) return fail('A password needs at least 10 characters.');
             if (!code.value.trim()) return;
             send({ ResetPassword: { username: user.value.trim(), code: code.value.trim(), password: npw.value } });
             clear(); go('signin');
-          }, 'primary'), btn('Back', () => go('signin'))));
+          }, 'primary'), btn('Back', () => go('signin'))),
+          el('div', { class: 'note full' }, 'No recovery code? Ask a server administrator to reset your password: they give you a temporary one, and you choose a new password after signing in.'));
       } else if (p === 'password') {
-        rows.push(...field('Current password', pw), ...field('New password', npw, 'At least 10 characters.'), ...field('Again', pw2),
+        const forced = a.must_change;
+        if (forced) rows.push(el('div', { class: 'full', style: 'color:var(--warn,#e0b040);font-weight:600' }, 'An administrator reset your password: choose a new one.'));
+        rows.push(...field(forced ? 'Temporary password' : 'Current password', pw), ...field('New password', npw, 'At least 10 characters.'), ...field('Again', pw2),
           actions(btn('Change', () => {
             if (!goodPw(npw.value)) return fail('A password needs at least 10 characters.');
             if (npw.value !== pw2.value) return fail('The two new passwords are different.');
             send({ ChangePassword: { old: pw.value, new: npw.value } });
             clear(); go('main');
-          }, 'primary'), btn('Back', () => go('main'))));
-      } else if (p === 'email') {
-        rows.push(...field('Email', email, 'Empty: none.'), ...field('Your password', pw),
-          actions(btn('Save', () => { if (pw.value) { send({ SetEmail: { password: pw.value, email: email.value.trim() || null } }); clear(); go('main'); } }, 'primary'), btn('Back', () => go('main'))));
+          }, 'primary'), forced ? null : btn('Back', () => go('main'))));
       } else if (p === 'nomfa') {
         rows.push(...field('Your password', pw), ...field('Code', code, 'From the app, or a recovery code.'),
           actions(btn('Turn off', () => { if (pw.value) { send({ DisableMfa: { password: pw.value, code: code.value.trim() } }); clear(); go('main'); } }, 'danger'), btn('Back', () => go('main'))));
@@ -1958,13 +1983,11 @@
         rows.push(el('div', { class: 'full', style: 'color:var(--good,#40c070);font-weight:600' }, '✔ Signed in as ' + a.username),
           ...field('Authenticator app', el('span', null, a.mfa ? 'On' : 'Off')),
           ...field('Recovery codes left', el('span', null, a.mfa ? String(a.recovery_left) : '-')),
-          ...field('Recovery email', el('span', null, a.email || 'none')),
           ...field('This browser', el('span', null, tok ? 'remembered' : 'not remembered')),
           actions(
             a.mfa ? btn('Turn off the authenticator app…', () => go('nomfa')) : btn('🔑 Add an authenticator app (MFA)', () => send('StartMfa'), 'primary'),
             a.mfa ? btn('New recovery codes…', () => go('codes')) : null,
             btn('Change password…', () => go('password')),
-            btn('Recovery email…', () => go('email')),
             btn('Sign out', () => { send({ SignOut: tok }); localStorage.removeItem(accountKey()); })));
       }
       put(body, el('div', null, el('p', { class: 'dim small', style: 'margin-top:0' }, 'Each server has its own accounts. The password protects your identity here: someone with a copy of your identity key still needs it.'),
@@ -2020,7 +2043,7 @@
       S.accountPolicy ? [el('div', { class: 'section full' }, 'Accounts & security'),
         field('Accounts', accMode, 'Accounts add a username and password (and optionally an authenticator app) on top of each identity. People who must sign in only get Guest permissions until they do.'),
         field('MFA', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, accMfa, 'Staff must also use an authenticator app'),
-          S.accountPolicy.email_reset ? null : 'Password reset by email is off: set smtp_host and smtp_from in server.toml. Recovery codes always work.')] : null,
+          'Forgotten passwords: a recovery code, or right-click the person ▸ Reset Account Password.')] : null,
       el('div', { class: 'section full' }, 'File browser'),
       field('Largest upload (MB)', upload, '0 = unlimited'),
       field('Storage per channel (MB)', quota, '0 = unlimited')), [
@@ -2033,7 +2056,7 @@
           default_server_group: Number(dsg.value), default_channel_group: Number(dcg.value), channel_admin_group: Number(cag.value),
           chat_retention_days: Math.max(0, Number(retention.value) || 0),
         } });
-        if (S.accountPolicy && (accMode.value !== pol.mode || accMfa.checked !== pol.mfa_for_staff)) send({ SetAccountPolicy: { mode: accMode.value, mfa_for_staff: accMfa.checked, email_reset: false } });
+        if (S.accountPolicy && (accMode.value !== pol.mode || accMfa.checked !== pol.mfa_for_staff)) send({ SetAccountPolicy: { mode: accMode.value, mfa_for_staff: accMfa.checked } });
         const mins = Math.min(30, Math.max(0, Math.round(Number(away.value) || 0)));
         if (!S.options || mins !== S.options.auto_away_minutes) send({ SetServerOptions: { auto_away_minutes: mins } });
         if (limits && upload.value !== '' && quota.value !== '') {

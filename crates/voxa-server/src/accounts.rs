@@ -1,16 +1,11 @@
 //! Accounts (1.25.0+): the pieces that do not need the server state. Authenticator app
 //! codes (TOTP, RFC 6238: SHA-1, 6 digits, 30 seconds, like Google Authenticator and
-//! Yubico Authenticator), recovery codes, remembered-device tokens and reset emails.
-
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::time::Duration;
+//! Yubico Authenticator), recovery codes, remembered-device tokens and the temporary
+//! passwords of an administrator's reset.
 
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-
-use crate::config::Config;
 
 const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
@@ -100,107 +95,13 @@ pub fn new_token() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// An 8-digit code for a reset email.
-pub fn new_reset_code() -> String {
-    format!("{:08}", rand::rngs::OsRng.next_u64() % 100_000_000)
-}
-
-/// `d***@example.com`
-pub fn mask_email(e: &str) -> String {
-    match e.split_once('@') {
-        Some((user, domain)) => format!("{}***@{domain}", user.chars().next().unwrap_or('*')),
-        None => "***".into(),
-    }
-}
-
-/// A plausible email address (one @, a dot after it, no spaces or line breaks).
-pub fn valid_email(e: &str) -> bool {
-    let e = e.trim();
-    e.len() <= 254
-        && !e.chars().any(|c| c.is_whitespace() || c.is_control() || c == '<' || c == '>' || c == ',')
-        && e.split_once('@').is_some_and(|(u, d)| !u.is_empty() && d.contains('.') && !d.starts_with('.') && !d.ends_with('.') && !d.contains('@'))
-}
-
-pub fn smtp_configured(cfg: &Config) -> bool {
-    !cfg.smtp_host.trim().is_empty() && !cfg.smtp_from.trim().is_empty()
-}
-
-/// Sends a plain-text email over SMTP with TLS (STARTTLS or implicit TLS; never in the
-/// clear). Blocking: run it on a blocking thread.
-pub fn send_mail(cfg: &Config, to: &str, subject: &str, body: &str) -> Result<(), String> {
-    if !valid_email(to) {
-        return Err("bad address".into());
-    }
-    let host = cfg.smtp_host.trim();
-    let tcp = TcpStream::connect((host, cfg.smtp_port)).map_err(|e| format!("connect: {e}"))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
-    let tls = native_tls::TlsConnector::new().map_err(|e| e.to_string())?;
-    let implicit = cfg.smtp_security.eq_ignore_ascii_case("tls");
-    let mut s: Box<dyn RW> = if implicit {
-        Box::new(tls.connect(host, tcp).map_err(|e| format!("TLS: {e}"))?)
-    } else {
-        let mut plain = BufReader::new(tcp);
-        expect(&mut plain, 220)?;
-        let ehlo = "EHLO voxa-server\r\n";
-        plain.get_mut().write_all(ehlo.as_bytes()).map_err(|e| e.to_string())?;
-        expect(&mut plain, 250)?;
-        plain.get_mut().write_all(b"STARTTLS\r\n").map_err(|e| e.to_string())?;
-        expect(&mut plain, 220)?;
-        Box::new(tls.connect(host, plain.into_inner()).map_err(|e| format!("TLS: {e}"))?)
-    };
-    let mut r = BufReader::new(&mut s);
-    if implicit {
-        expect(&mut r, 220)?;
-    }
-    cmd(&mut r, "EHLO voxa-server", 250)?;
-    if !cfg.smtp_user.is_empty() {
-        use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let auth = b64.encode(format!("\0{}\0{}", cfg.smtp_user, cfg.smtp_password));
-        cmd(&mut r, &format!("AUTH PLAIN {auth}"), 235)?;
-    }
-    let from_addr = cfg.smtp_from.rsplit_once('<').map(|(_, a)| a.trim_end_matches('>').trim()).unwrap_or(cfg.smtp_from.trim());
-    cmd(&mut r, &format!("MAIL FROM:<{from_addr}>"), 250)?;
-    cmd(&mut r, &format!("RCPT TO:<{}>", to.trim()), 250)?;
-    cmd(&mut r, "DATA", 354)?;
-    // No user text in headers except the checked address; the body has no lone dots.
-    let clean = |t: &str| t.replace(['\r', '\n'], " ");
-    let body = body.replace("\r\n", "\n").lines().map(|l| if l.starts_with('.') { format!(".{l}") } else { l.to_string() }).collect::<Vec<_>>().join("\r\n");
-    let msg = format!(
-        "From: {}\r\nTo: <{}>\r\nSubject: {}\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{}\r\n.",
-        clean(&cfg.smtp_from),
-        to.trim(),
-        clean(subject),
-        body
-    );
-    cmd(&mut r, &msg, 250)?;
-    let _ = cmd(&mut r, "QUIT", 221);
-    Ok(())
-}
-
-trait RW: Read + Write {}
-impl<T: Read + Write> RW for T {}
-
-fn expect(r: &mut impl BufRead, code: u16) -> Result<(), String> {
-    loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-            return Err("the mail server closed the connection".into());
-        }
-        let got: u16 = line.get(..3).and_then(|c| c.parse().ok()).unwrap_or(0);
-        // "250-..." continues, "250 ..." ends.
-        if line.as_bytes().get(3) == Some(&b'-') {
-            continue;
-        }
-        return if got == code { Ok(()) } else { Err(format!("the mail server said: {}", line.trim())) };
-    }
-}
-
-fn cmd<S: Read + Write>(r: &mut BufReader<S>, line: &str, code: u16) -> Result<(), String> {
-    r.get_mut().write_all(format!("{line}\r\n").as_bytes()).map_err(|e| e.to_string())?;
-    r.get_mut().flush().map_err(|e| e.to_string())?;
-    expect(r, code)
+/// A temporary password for an administrator's reset, like `K7Q2M-XW4PA-M3D8Q` (75
+/// random bits; letters and digits that are easy to read out).
+pub fn new_temp_password() -> String {
+    let mut b = [0u8; 10];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    let s = base32(&b);
+    format!("{}-{}-{}", &s[..5], &s[5..10], &s[10..15])
 }
 
 #[cfg(test)]
@@ -227,12 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn emails() {
-        assert!(valid_email("dylan@example.com"));
-        assert!(!valid_email("a@b"));
-        assert!(!valid_email("a@b.com\r\nBcc: x@y.z"));
-        assert!(!valid_email("<a@b.com>"));
-        assert_eq!(mask_email("dylan@example.com"), "d***@example.com");
+    fn temp_passwords() {
+        let p = new_temp_password();
+        assert_eq!(p.len(), 17);
+        assert!(voxa_proto::valid_account_password(&p));
     }
 
     #[test]

@@ -24,6 +24,7 @@ struct User {
     id: ClientId,
     /// What arrived while logging in.
     welcome: Vec<S2C>,
+    uid: String,
     channels: Vec<ChannelId>,
 }
 
@@ -43,13 +44,13 @@ async fn login(addr: &str, kp: &KeyPair, nick: &str) -> User {
     })
     .await
     .unwrap();
-    let S2C::Welcome { your_id, channels, .. } = r.recv::<S2C>().await.unwrap() else { panic!("refused") };
+    let S2C::Welcome { your_id, your_uid, channels, .. } = r.recv::<S2C>().await.unwrap() else { panic!("refused") };
     w.send(&C2S::Hardware(vec![hardware_token("x", nick)])).await.unwrap();
     let mut welcome = Vec::new();
     while let Ok(Ok(m)) = timeout(Duration::from_millis(400), r.recv::<S2C>()).await {
         welcome.push(m);
     }
-    User { r, w, id: your_id, welcome, channels: channels.iter().map(|c| c.id).collect() }
+    User { r, w, id: your_id, uid: your_uid, welcome, channels: channels.iter().map(|c| c.id).collect() }
 }
 
 async fn wait<T>(u: &mut User, secs: u64, mut f: impl FnMut(S2C) -> Option<T>) -> Option<T> {
@@ -120,31 +121,30 @@ async fn main() {
     println!("1. accounts are off by default: nobody is limited");
 
     // Accounts off: none can be made.
-    bob.w.send(&C2S::CreateAccount { username: "bob".into(), password: "0123456789".into(), email: None }).await.unwrap();
+    bob.w.send(&C2S::CreateAccount { username: "bob".into(), password: "0123456789".into() }).await.unwrap();
     println!("2. making an account while they are off: \"{}\"", error(&mut bob).await);
 
     // An admin cannot require accounts for staff without one (they would lose their rights).
-    let staff = AccountPolicy { mode: AccountMode::RequiredForStaff, mfa_for_staff: false, email_reset: false };
+    let staff = AccountPolicy { mode: AccountMode::RequiredForStaff, mfa_for_staff: false };
     alice.w.send(&C2S::SetAccountPolicy(staff)).await.unwrap();
     println!("3. requiring accounts without one: \"{}\"", error(&mut alice).await);
 
     alice.w.send(&C2S::SetAccountPolicy(AccountPolicy { mode: AccountMode::Optional, ..staff })).await.unwrap();
     let p = wait(&mut bob, 5, |m| if let S2C::AccountPolicy(p) = m { Some(p) } else { None }).await.expect("no policy");
     assert_eq!(p.mode, AccountMode::Optional);
-    assert!(!p.email_reset, "no SMTP in the test server");
 
     // Weak passwords and bad names are refused.
-    alice.w.send(&C2S::CreateAccount { username: "alice".into(), password: "short".into(), email: None }).await.unwrap();
+    alice.w.send(&C2S::CreateAccount { username: "alice".into(), password: "short".into() }).await.unwrap();
     println!("4. a short password: \"{}\"", error(&mut alice).await);
-    alice.w.send(&C2S::CreateAccount { username: "a l".into(), password: "0123456789".into(), email: None }).await.unwrap();
+    alice.w.send(&C2S::CreateAccount { username: "a l".into(), password: "0123456789".into() }).await.unwrap();
     println!("4. a bad username: \"{}\"", error(&mut alice).await);
-    alice.w.send(&C2S::CreateAccount { username: "alice".into(), password: "correct horse 1".into(), email: Some("alice@example.com".into()) }).await.unwrap();
+    alice.w.send(&C2S::CreateAccount { username: "alice".into(), password: "correct horse 1".into() }).await.unwrap();
     let st = state(&mut alice).await;
-    assert!(st.signed_in && st.username.as_deref() == Some("alice") && st.email.as_deref() == Some("a***@example.com"));
-    println!("4. made an account, signed in; email shown as {}", st.email.unwrap());
+    assert!(st.signed_in && st.username.as_deref() == Some("alice") && !st.must_change);
+    println!("4. made an account, signed in");
 
     // Usernames are unique (any case).
-    bob.w.send(&C2S::CreateAccount { username: "ALICE".into(), password: "0123456789x".into(), email: None }).await.unwrap();
+    bob.w.send(&C2S::CreateAccount { username: "ALICE".into(), password: "0123456789x".into() }).await.unwrap();
     println!("5. a taken username: \"{}\"", error(&mut bob).await);
 
     // Requiring MFA for staff needs it first.
@@ -233,15 +233,23 @@ async fn main() {
     let mut alice = login(&addr, &alice_key, "Alice").await;
     alice.w.send(&C2S::ResumeAccount("not a token".into())).await.unwrap();
     println!("11. a bad token: \"{}\"", error(&mut alice).await);
+    // As Voxa does: the token first, then what needs the permissions (the Server tab's
+    // history needs "See server events", which Guests lack). No "Insufficient permissions".
     alice.w.send(&C2S::ResumeAccount(token.clone())).await.unwrap();
-    let st = wait(&mut alice, 5, |m| match m {
-        S2C::AccountState(a) if a.signed_in => Some(a),
-        _ => None,
+    alice.w.send(&C2S::FetchHistory { target: TextTarget::Server, before: None, limit: 10 }).await.unwrap();
+    let (mut signed, mut history) = (false, false);
+    wait(&mut alice, 5, |m| {
+        match m {
+            S2C::AccountState(a) if a.signed_in && !a.limited => signed = true,
+            S2C::History { target: TextTarget::Server, .. } => history = true,
+            S2C::Error(e) => panic!("error after signing in by token: {e}"),
+            _ => {}
+        }
+        (signed && history).then_some(())
     })
     .await
-    .expect("not signed in by token");
-    assert!(!st.limited);
-    println!("11. the remembered device signed in by itself");
+    .expect("not signed in by token, or no history");
+    println!("11. the remembered device signed in by itself, before its first request");
 
     // Showing the channel again: Bob gets it back.
     alice.w.send(&C2S::SetChannelHidden { channel: secret_ch, groups: vec![] }).await.unwrap();
@@ -264,6 +272,47 @@ async fn main() {
     .await
     .expect("could not sign in with the new password");
     assert!(st.recovery_left == 8);
+
+    // An administrator resets a forgotten password (accounts required for everyone now).
+    alice.w.send(&C2S::SetAccountPolicy(AccountPolicy { mode: AccountMode::Required, mfa_for_staff: true })).await.unwrap();
+    bob.w.send(&C2S::CreateAccount { username: "bobby".into(), password: "bob password 1".into() }).await.unwrap();
+    wait(&mut bob, 5, |m| matches!(m, S2C::AccountState(a) if a.signed_in && !a.limited).then_some(())).await.expect("Bob could not make an account");
+    bob.w.send(&C2S::ResetAccount { uid: alice.uid.clone(), remove_mfa: true }).await.unwrap();
+    println!("14. a member resetting an admin: \"{}\"", error(&mut bob).await);
+    alice.w.send(&C2S::ResetAccount { uid: alice.uid.clone(), remove_mfa: false }).await.unwrap();
+    println!("14. resetting yourself: \"{}\"", error(&mut alice).await);
+    alice.w.send(&C2S::ResetAccount { uid: bob.uid.clone(), remove_mfa: false }).await.unwrap();
+    let (user, temp) = wait(&mut alice, 5, |m| if let S2C::AccountReset { username, password, .. } = m { Some((username, password)) } else { None }).await.expect("no temporary password");
+    assert_eq!(user, "bobby");
+    let st = wait(&mut bob, 5, |m| match m {
+        S2C::AccountState(a) if !a.signed_in => Some(a),
+        _ => None,
+    })
+    .await
+    .expect("Bob was not signed out");
+    assert!(st.limited);
+    bob.w.send(&C2S::SignIn { username: "bobby".into(), password: "bob password 1".into(), code: None, remember: false }).await.unwrap();
+    println!("14. reset by an admin; the old password: \"{}\"", error(&mut bob).await);
+    bob.w.send(&C2S::SignIn { username: "bobby".into(), password: temp.clone(), code: None, remember: true }).await.unwrap();
+    let st = wait(&mut bob, 5, |m| match m {
+        S2C::AccountState(a) if a.signed_in => Some(a),
+        _ => None,
+    })
+    .await
+    .expect("could not sign in with the temporary password");
+    assert!(st.must_change && st.limited, "the temporary password must be changed first");
+    println!("14. signed in with the temporary password: still limited (\"{}\")", st.reason);
+    bob.w.send(&C2S::ChangePassword { old: temp.clone(), new: temp.clone() }).await.unwrap();
+    println!("14. keeping the temporary password: \"{}\"", error(&mut bob).await);
+    bob.w.send(&C2S::ChangePassword { old: temp, new: "bob new password".into() }).await.unwrap();
+    let st = wait(&mut bob, 5, |m| match m {
+        S2C::AccountState(a) if !a.must_change => Some(a),
+        _ => None,
+    })
+    .await
+    .expect("the password was not changed");
+    assert!(st.signed_in && !st.limited);
+    println!("14. new password chosen: Bob has his permissions again");
 
     // Turning accounts off again: nobody is limited.
     alice.w.send(&C2S::SetAccountPolicy(AccountPolicy::default())).await.unwrap();

@@ -80,6 +80,8 @@ pub struct Session {
     /// remembered device that was).
     pub signed_in: bool,
     pub mfa_ok: bool,
+    /// Signed in with a temporary password from an administrator's reset (1.25.1+).
+    pub must_change: bool,
     /// Whether the client was last told it is limited to Guest permissions.
     pub told_limited: bool,
 }
@@ -300,7 +302,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.33.0";
+pub const MIN_CLIENT_VERSION: &str = "1.33.1";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -512,7 +514,13 @@ impl State {
 
     /// Why the account rules limit someone to Guest permissions (None: they are not).
     pub fn limit_reason(&self, s: &Session, raw: u64) -> Option<&'static str> {
-        self.limit_reason_for(s.signed_in, s.mfa_ok, raw)
+        // After an administrator's reset, signing in with the temporary password is not
+        // enough: the password must be changed first.
+        let r = self.limit_reason_for(s.signed_in && !s.must_change, s.mfa_ok, raw);
+        if r.is_some() && s.signed_in && s.must_change {
+            return Some("An administrator reset your password: choose a new one to get your permissions.");
+        }
+        r
     }
 
     pub fn limit_reason_for(&self, signed_in: bool, mfa_ok: bool, raw: u64) -> Option<&'static str> {
@@ -656,7 +664,7 @@ impl State {
             }
             if limited != old_limited || s.told_limited != *limited {
                 told.push((*id, *limited));
-                if s.client_at_least("1.33.0") {
+                if s.client_at_least("1.33.1") {
                     s.tx.send(Out::Msg(account_state(self, s)));
                 }
             }
@@ -1060,7 +1068,7 @@ impl Server {
             C2S::CreateChannel(e) | C2S::EditChannel { edit: e, .. } => self.hash_ahead(&e.password).await,
             C2S::EditServer(e) => self.hash_ahead(&e.password).await,
             // Accounts (1.25.0+): the password checks and new hashes, before the lock.
-            C2S::SignIn { password, .. } | C2S::SetEmail { password, .. } | C2S::DisableMfa { password, .. } | C2S::NewRecoveryCodes { password } => {
+            C2S::SignIn { password, .. } | C2S::DisableMfa { password, .. } | C2S::NewRecoveryCodes { password } => {
                 self.verify_account_ahead(me, password).await
             }
             C2S::ChangePassword { old, new } => {
@@ -1324,6 +1332,7 @@ impl Server {
                 calendar_subs: HashSet::new(),
                 signed_in: false,
                 mfa_ok: false,
+                must_change: false,
                 told_limited: limited_now,
                 viewers: HashSet::new(),
                 last_keyframe_req: None,
@@ -1335,8 +1344,8 @@ impl Server {
                 presence,
             },
         );
-        // Account rules and state, and hidden channels for those who edit channels (1.33.0+).
-        if st.sessions[&id].client_at_least("1.33.0") {
+        // Account rules and state, and hidden channels for those who edit channels (1.33.1+).
+        if st.sessions[&id].client_at_least("1.33.1") {
             let s = &st.sessions[&id];
             s.tx.send(Out::Msg(S2C::AccountPolicy(self.policy_for_clients(&st))));
             s.tx.send(Out::Msg(self.account_state(&st, s)));
@@ -1938,13 +1947,12 @@ impl Server {
             | C2S::ResumeAccount(_)
             | C2S::SignOut(_)
             | C2S::ChangePassword { .. }
-            | C2S::SetEmail { .. }
             | C2S::StartMfa
             | C2S::ConfirmMfa(_)
             | C2S::DisableMfa { .. }
             | C2S::NewRecoveryCodes { .. }
-            | C2S::RequestReset { .. }
-            | C2S::ResetPassword { .. }) => self.dispatch_accounts(st, me, msg),
+            | C2S::ResetPassword { .. }
+            | C2S::ResetAccount { .. }) => self.dispatch_accounts(st, me, msg),
             C2S::ClearChat(target) => {
                 let s = st.session(me)?;
                 let ch = match target {
@@ -3871,6 +3879,8 @@ fn affects_visibility(msg: &C2S) -> bool {
             | C2S::ConfirmMfa(_)
             | C2S::DisableMfa { .. }
             | C2S::ResetPassword { .. }
+            | C2S::ChangePassword { .. }
+            | C2S::ResetAccount { .. }
     )
 }
 
@@ -3883,9 +3893,9 @@ const ACCOUNT_LOCK_SECS: u64 = 15 * 60;
 // ---------------------------------------------------------------------- accounts, hidden channels
 
 impl Server {
-    /// The account rules as clients see them (whether email resets work).
+    /// The account rules as clients see them.
     pub fn policy_for_clients(&self, st: &State) -> AccountPolicy {
-        AccountPolicy { email_reset: crate::accounts::smtp_configured(&self.cfg), ..st.account_policy }
+        st.account_policy
     }
 
     /// Someone's account here, for their client.
@@ -3896,7 +3906,7 @@ impl Server {
             username: rec.as_ref().map(|a| a.username.clone()),
             signed_in: s.signed_in,
             mfa: rec.as_ref().is_some_and(|a| a.totp.is_some()),
-            email: rec.as_ref().and_then(|a| a.email.as_deref()).map(crate::accounts::mask_email),
+            must_change: s.signed_in && s.must_change,
             recovery_left: rec.as_ref().map(|a| a.recovery.len() as u32).unwrap_or(0),
             limited: st.limit_reason(s, raw).is_some(),
             reason: st.limit_reason(s, raw).unwrap_or_default().to_string(),
@@ -3969,10 +3979,11 @@ impl Server {
     }
 
     /// Signs a session in (after the checks) and tells its client.
-    fn signed_in(&self, st: &mut State, me: ClientId, mfa: bool) {
+    fn signed_in(&self, st: &mut State, me: ClientId, mfa: bool, must_change: bool) {
         if let Some(s) = st.sessions.get_mut(&me) {
             s.signed_in = true;
             s.mfa_ok = mfa;
+            s.must_change = must_change;
             info!("{} signed in to their account{}", s.info.nickname, if mfa { " (with MFA)" } else { "" });
         }
         self.send_account_state(st, me);
@@ -3980,7 +3991,7 @@ impl Server {
 
     fn send_account_state(&self, st: &State, me: ClientId) {
         if let Some(s) = st.sessions.get(&me) {
-            if s.client_at_least("1.33.0") {
+            if s.client_at_least("1.33.1") {
                 s.tx.send(Out::Msg(self.account_state(st, s)));
             }
         }
@@ -4020,7 +4031,7 @@ impl Server {
                 let list: Vec<(ChannelId, Vec<GroupId>)> = st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect();
                 db(self.store.save_hidden_channels(&list))?;
                 info!("{by} changed who does not see channel {channel}");
-                let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.33.0") && st.server_perms(x) & perm::CHANNEL_EDIT != 0).map(|x| x.info.id).collect();
+                let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.33.1") && st.server_perms(x) & perm::CHANNEL_EDIT != 0).map(|x| x.info.id).collect();
                 for c in to {
                     st.send(c, S2C::HiddenChannels(list.clone()));
                 }
@@ -4039,19 +4050,18 @@ impl Server {
                 if requires && staff && p.mfa_for_staff && !s.mfa_ok {
                     return Err("Set up an authenticator app (MFA) and sign in with it first (you would lose your own permissions)".into());
                 }
-                let p = AccountPolicy { email_reset: false, ..p };
                 db(self.store.save_account_policy(&p))?;
                 info!("{} set the account rules to {:?} (MFA for staff: {})", s.info.nickname, p.mode, p.mfa_for_staff);
                 st.account_policy = p;
                 let policy = self.policy_for_clients(st);
-                let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.33.0")).map(|x| x.info.id).collect();
+                let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.33.1")).map(|x| x.info.id).collect();
                 for c in to {
                     st.send(c, S2C::AccountPolicy(policy));
                     self.send_account_state(st, c);
                 }
                 Ok(())
             }
-            C2S::CreateAccount { username, password, email } => {
+            C2S::CreateAccount { username, password } => {
                 if st.account_policy.mode == AccountMode::Off {
                     return Err("This server does not use accounts".into());
                 }
@@ -4066,14 +4076,10 @@ impl Server {
                 if !valid_account_password(&password) {
                     return Err("A password needs at least 10 characters".into());
                 }
-                let email = email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
-                if email.as_deref().is_some_and(|e| !acc::valid_email(e)) {
-                    return Err("That email address does not look right".into());
-                }
-                let rec = AccountRec { username: username.clone(), password_hash: self.pw_hash(&password), email, created: now, ..Default::default() };
+                let rec = AccountRec { username: username.clone(), password_hash: self.pw_hash(&password), created: now, ..Default::default() };
                 self.save_account(&uid, &rec)?;
                 info!("{uid} made the account {username}");
-                self.signed_in(st, me, false);
+                self.signed_in(st, me, false, false);
                 Ok(())
             }
             C2S::SignIn { username, password, code, remember } => {
@@ -4109,7 +4115,7 @@ impl Server {
                     st.send(me, S2C::AccountToken(token));
                 }
                 self.save_account(&uid, &rec)?;
-                self.signed_in(st, me, mfa);
+                self.signed_in(st, me, mfa, rec.must_change);
                 Ok(())
             }
             C2S::ResumeAccount(token) => {
@@ -4124,7 +4130,7 @@ impl Server {
                 self.save_account(&uid, &rec)?;
                 // A device is only remembered after a full sign-in (with MFA if it is on).
                 let mfa = rec.totp.is_some();
-                self.signed_in(st, me, mfa);
+                self.signed_in(st, me, mfa, rec.must_change);
                 Ok(())
             }
             C2S::SignOut(token) => {
@@ -4136,6 +4142,7 @@ impl Server {
                 if let Some(s) = st.sessions.get_mut(&me) {
                     s.signed_in = false;
                     s.mfa_ok = false;
+                    s.must_change = false;
                 }
                 self.send_account_state(st, me);
                 Ok(())
@@ -4150,29 +4157,19 @@ impl Server {
                 if !valid_account_password(&new) {
                     return Err("A password needs at least 10 characters".into());
                 }
+                if new == old {
+                    return Err("Choose a different password".into());
+                }
                 rec.password_hash = self.pw_hash(&new);
                 // Other remembered devices must sign in again.
                 rec.tokens.clear();
                 rec.failures = 0;
+                rec.must_change = false;
                 self.save_account(&uid, &rec)?;
+                if let Some(s) = st.sessions.get_mut(&me) {
+                    s.must_change = false;
+                }
                 st.send(me, S2C::Notice("Your password was changed. Other devices must sign in again.".into()));
-                self.send_account_state(st, me);
-                Ok(())
-            }
-            C2S::SetEmail { password, email } => {
-                let (uid, mut rec) = self.my_account(st, me)?;
-                Self::check_full_sign_in(st, me, &rec)?;
-                Self::check_lock(&rec)?;
-                if !self.pw_verified(&password, &rec.password_hash) {
-                    return self.account_failed(&uid, rec, "Your password is not right");
-                }
-                let email = email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
-                if email.as_deref().is_some_and(|e| !acc::valid_email(e)) {
-                    return Err("That email address does not look right".into());
-                }
-                rec.email = email;
-                rec.failures = 0;
-                self.save_account(&uid, &rec)?;
                 self.send_account_state(st, me);
                 Ok(())
             }
@@ -4252,49 +4249,47 @@ impl Server {
                 self.send_account_state(st, me);
                 Ok(())
             }
-            C2S::RequestReset { username } => {
-                let answer = "If that account has an email address, a reset code is on its way (it works for 15 minutes).";
-                if !acc::smtp_configured(&self.cfg) {
-                    return Err("This server cannot send email: use one of your recovery codes instead".into());
+            C2S::ResetAccount { uid, remove_mfa } => {
+                let s = st.session(me)?;
+                let mine = st.server_perms(s);
+                self.need(mine, perm::SERVER_EDIT)?;
+                if uid == s.info.uid {
+                    return Err("Change your own password under Account & Security".into());
                 }
-                st.spend_chat(me)?;
-                let Some(uid) = db(self.store.account_uid(username.trim()))? else {
-                    st.send(me, S2C::Notice(answer.into()));
-                    return Ok(());
-                };
-                let Some(mut rec) = db(self.store.account(&uid))? else { return Ok(()) };
-                let Some(to) = rec.email.clone() else {
-                    st.send(me, S2C::Notice(answer.into()));
-                    return Ok(());
-                };
-                // At most 3 emails an hour per account.
-                if now.saturating_sub(rec.reset_sent.1) > 3600 {
-                    rec.reset_sent = (0, now);
+                // Nobody can take over the account of someone with permissions they lack.
+                Self::outranks(mine, self.perms_of_uid(st, &uid))?;
+                let by = s.info.nickname.clone();
+                let mut rec = db(self.store.account(&uid))?.ok_or("They have no account on this server")?;
+                let temp = acc::new_temp_password();
+                rec.password_hash = self.pw_hash(&temp);
+                rec.must_change = true;
+                rec.tokens.clear();
+                rec.failures = 0;
+                rec.locked_until = 0;
+                if remove_mfa {
+                    rec.totp = None;
+                    rec.totp_pending = None;
+                    rec.totp_last_step = 0;
+                    rec.recovery.clear();
                 }
-                if rec.reset_sent.0 >= 3 {
-                    st.send(me, S2C::Notice(answer.into()));
-                    return Ok(());
-                }
-                rec.reset_sent.0 += 1;
-                let code = acc::new_reset_code();
-                rec.reset = Some((acc::sha256_hex(&code), now + 15 * 60, 0));
                 self.save_account(&uid, &rec)?;
-                let cfg = self.cfg.clone();
-                let server = st.settings.name.clone();
-                let user = rec.username.clone();
-                tokio::task::spawn_blocking(move || {
-                    let body = format!(
-                        "Someone asked to reset the password of the account {user} on the Voxa server {server}.\n\nYour reset code: {code}\n\nIt works for 15 minutes. If this was not you, you can ignore this email: your password has not changed.\n"
-                    );
-                    if let Err(e) = acc::send_mail(&cfg, &to, &format!("Voxa password reset for {server}"), &body) {
-                        warn!("could not send the reset email: {e}");
+                info!("{by} reset the password of account {}{}", rec.username, if remove_mfa { " and turned off its authenticator app" } else { "" });
+                // Their connections are signed out: they sign in again with the new password.
+                let theirs: Vec<ClientId> = st.sessions.values().filter(|x| x.info.uid == uid).map(|x| x.info.id).collect();
+                for id in theirs {
+                    if let Some(x) = st.sessions.get_mut(&id) {
+                        x.signed_in = false;
+                        x.mfa_ok = false;
+                        x.must_change = false;
                     }
-                });
-                st.send(me, S2C::Notice(answer.into()));
+                    st.send(id, S2C::Notice(format!("{by} reset your account's password: sign in with the temporary password they give you.")));
+                    self.send_account_state(st, id);
+                }
+                st.send(me, S2C::AccountReset { uid, username: rec.username, password: temp });
                 Ok(())
             }
             C2S::ResetPassword { username, code, password } => {
-                let wrong = "That reset code or recovery code is not right";
+                let wrong = "That recovery code is not right";
                 // Anyone may try this for any username: wrong codes are rate limited but do not
                 // lock the account (that would let strangers lock its owner out).
                 st.spend_chat(me)?;
@@ -4304,25 +4299,17 @@ impl Server {
                     return Err("A password needs at least 10 characters".into());
                 }
                 let digest = acc::sha256_hex(&acc::normalize_code(&code));
-                let by_email = match &mut rec.reset {
-                    Some((h, until, tries)) if *until > now && *tries < 5 => {
-                        *tries += 1;
-                        acc::same(h, &acc::sha256_hex(code.trim()))
-                    }
-                    _ => false,
-                };
-                let by_recovery = !by_email && rec.recovery.iter().position(|r| acc::same(r, &digest)).map(|i| rec.recovery.remove(i)).is_some();
-                if !by_email && !by_recovery {
-                    let _ = self.save_account(&uid, &rec);
+                let Some(i) = rec.recovery.iter().position(|r| acc::same(r, &digest)) else {
                     return Err(wrong.into());
-                }
+                };
+                rec.recovery.remove(i);
                 rec.password_hash = self.pw_hash(&password);
-                rec.reset = None;
+                rec.must_change = false;
                 rec.tokens.clear();
                 rec.failures = 0;
                 rec.locked_until = 0;
                 self.save_account(&uid, &rec)?;
-                info!("the password of account {} was reset ({})", rec.username, if by_email { "email" } else { "recovery code" });
+                info!("the password of account {} was reset with a recovery code", rec.username);
                 st.send(me, S2C::Notice("Your password was reset. Sign in with the new one.".into()));
                 self.send_account_state(st, me);
                 Ok(())

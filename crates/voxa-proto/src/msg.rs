@@ -159,13 +159,13 @@ pub enum C2S {
     /// with the channel to meet in (None: no channel).
     SaveServerEvent { event: CalendarEvent, meet: Option<ChannelId> },
 
-    // --- added in 1.25.0; only sent to servers that are 1.25.0 or newer ---
+    // --- added in 1.25.1; only sent to servers that are 1.25.1 or newer ---
     /// Which server groups do not see a channel (needs "Edit channels").
     SetChannelHidden { channel: ChannelId, groups: Vec<GroupId> },
-    /// Who must sign in (needs "Edit virtual server"; `email_reset` is ignored).
+    /// Who must sign in (needs "Edit virtual server").
     SetAccountPolicy(AccountPolicy),
     /// Makes an account for your identity on this server (and signs you in).
-    CreateAccount { username: String, password: String, email: Option<String> },
+    CreateAccount { username: String, password: String },
     /// Signs in. `code`: from the authenticator app, or a recovery code. `remember`: the
     /// server answers with `AccountToken` so this device signs in by itself next time.
     SignIn { username: String, password: String, code: Option<String>, remember: bool },
@@ -174,8 +174,6 @@ pub enum C2S {
     /// Signs out (and forgets this device's token).
     SignOut(Option<String>),
     ChangePassword { old: String, new: String },
-    /// Sets or removes the recovery email.
-    SetEmail { password: String, email: Option<String> },
     /// Starts adding an authenticator app (answered with `MfaSetup`).
     StartMfa,
     /// Finishes it with a code from the app (answered with `RecoveryCodes`).
@@ -183,10 +181,13 @@ pub enum C2S {
     DisableMfa { password: String, code: String },
     /// New recovery codes (the old ones stop working).
     NewRecoveryCodes { password: String },
-    /// Emails a reset code if the account has an email (the answer is the same either way).
-    RequestReset { username: String },
-    /// A new password with a reset code from the email, or a recovery code.
+    /// A new password with a recovery code.
     ResetPassword { username: String, code: String, password: String },
+    /// An administrator resets someone's password (needs "Edit virtual server", and
+    /// nobody with permissions you lack). The server answers with `AccountReset` holding a
+    /// temporary password, which they must change after signing in. `remove_mfa`: also
+    /// turns off their authenticator app (e.g. a lost phone).
+    ResetAccount { uid: String, remove_mfa: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -315,7 +316,7 @@ pub enum S2C {
     /// calendars, events, and the channel each event meets in.
     ServerCalendar { calendars: Vec<CalendarInfo>, events: Vec<CalendarEvent>, meet: Vec<(EventId, ChannelId)> },
 
-    // --- added in 1.25.0; only sent to clients that are 1.33.0 or newer ---
+    // --- added in 1.25.1; only sent to clients that are 1.33.1 or newer ---
     /// The server's account rules (after Welcome and when they change).
     AccountPolicy(AccountPolicy),
     /// Your account here (after Welcome and every change).
@@ -331,6 +332,9 @@ pub enum S2C {
     /// Channels you now see (parents first) or no longer see (sub-channels first), after a
     /// change of groups, hidden lists, your channel or signing in. Not created or deleted.
     ChannelsVisible { shown: Vec<ChannelInfo>, hidden: Vec<ChannelId> },
+    /// To the administrator who reset someone's password: the temporary password to give
+    /// them (shown once; they must change it after signing in).
+    AccountReset { uid: String, username: String, password: String },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file

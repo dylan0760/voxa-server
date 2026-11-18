@@ -747,8 +747,6 @@ pub struct AccountPolicy {
     /// Staff must also use an authenticator app (when
     /// accounts are required).
     pub mfa_for_staff: bool,
-    /// The server can email password reset codes (set by the server: it has SMTP settings).
-    pub email_reset: bool,
 }
 
 /// Your account on this server.
@@ -758,8 +756,9 @@ pub struct AccountState {
     pub username: Option<String>,
     pub signed_in: bool,
     pub mfa: bool,
-    /// The recovery email, partly hidden (e.g. `d***@example.com`).
-    pub email: Option<String>,
+    /// An administrator reset the password: choose a new one (until then you only have
+    /// Guest permissions where the server asks for accounts).
+    pub must_change: bool,
     /// Unused recovery codes.
     pub recovery_left: u32,
     /// You only have Guest permissions until you sign in (or set up MFA).
