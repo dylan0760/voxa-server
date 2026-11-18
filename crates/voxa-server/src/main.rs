@@ -1,6 +1,7 @@
 //! Voxa Server - free and open source voice, chat and screen sharing server.
 
 #[cfg(windows)]
+mod accounts;
 mod acl;
 mod backup;
 mod config;

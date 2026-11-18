@@ -43,6 +43,38 @@ const GROUP_CHATS: TableDefinition<u64, &[u8]> = TableDefinition::new("group_cha
 const GROUP_QUEUE: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("group_queue");
 /// Channel id -> the channel's calendars and events (encrypted).
 const CALENDARS: TableDefinition<u64, &[u8]> = TableDefinition::new("calendars");
+/// Accounts (1.25.0+): identity uid -> sealed AccountRec.
+const ACCOUNTS: TableDefinition<&str, &[u8]> = TableDefinition::new("accounts");
+/// Lower-case username -> identity uid (usernames are unique on a server).
+const USERNAMES: TableDefinition<&str, &str> = TableDefinition::new("usernames");
+
+/// An account (1.25.0+): a username and password on top of an identity, optionally an
+/// authenticator app. Stored encrypted.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AccountRec {
+    pub username: String,
+    /// Argon2id.
+    pub password_hash: String,
+    /// The authenticator app's secret (20 bytes) once confirmed.
+    pub totp: Option<Vec<u8>>,
+    /// A secret being set up (until a code from the app confirms it).
+    pub totp_pending: Option<Vec<u8>>,
+    /// The last time step a code was accepted for (a code works once).
+    pub totp_last_step: u64,
+    /// SHA-256 (hex) of the unused recovery codes.
+    pub recovery: Vec<String>,
+    pub email: Option<String>,
+    /// An emailed reset code: (SHA-256 hex, valid until, wrong tries).
+    pub reset: Option<(String, u64, u32)>,
+    /// Reset emails sent: (count, since) for a limit per hour.
+    pub reset_sent: (u32, u64),
+    /// Remembered devices: (SHA-256 hex of the token, valid until).
+    pub tokens: Vec<(String, u64)>,
+    /// Wrong passwords / codes in a row, and the lock that follows too many.
+    pub failures: u32,
+    pub locked_until: u64,
+    pub created: u64,
+}
 
 /// Where the server calendar's meeting places are kept in `CALENDARS` (no channel has
 /// this id).
@@ -205,6 +237,8 @@ impl Store {
             w.open_table(GROUP_CHATS)?;
             w.open_table(GROUP_QUEUE)?;
             w.open_table(CALENDARS)?;
+            w.open_table(ACCOUNTS)?;
+            w.open_table(USERNAMES)?;
             w.commit()?;
         }
         let cipher = XChaCha20Poly1305::new_from_slice(master_key).map_err(|_| anyhow::anyhow!("bad master key"))?;
@@ -242,6 +276,8 @@ impl Store {
             GROUP_CHATS.name(),
             GROUP_QUEUE.name(),
             CALENDARS.name(),
+            ACCOUNTS.name(),
+            USERNAMES.name(),
         ];
         for t in r.list_tables()? {
             if !known.contains(&t.name()) {
@@ -262,7 +298,7 @@ impl Store {
                 }
             })*};
         }
-        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS, GROUP_CHATS, GROUP_QUEUE, CALENDARS);
+        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS, GROUP_CHATS, GROUP_QUEUE, CALENDARS, ACCOUNTS, USERNAMES);
         w.commit()?;
         Ok(())
     }
@@ -272,7 +308,7 @@ impl Store {
     /// (before 1.8.0) had no "pin messages" permission; schema 3 (before 1.15.0) had no
     /// "edit own chat messages" permission; schema 4 (before 1.21.0) had no calendar.
     fn migrate(&self) -> R<()> {
-        const SCHEMA: u64 = 5;
+        const SCHEMA: u64 = 6;
         let current = {
             let r = self.db.begin_read()?;
             let t = r.open_table(META)?;
@@ -400,6 +436,19 @@ impl Store {
                 };
                 if add != 0 && g.perms & add != add {
                     g.perms |= add;
+                    self.save_group(&g)?;
+                }
+            }
+            let w = self.db.begin_write()?;
+            w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
+            w.commit()?;
+            tracing::info!("database migrated to schema {SCHEMA}");
+        }
+        if current < 6 {
+            // 1.25.0: "See channels". Everyone saw every channel before; keep it that way.
+            for mut g in self.load_groups()? {
+                if g.kind == GroupKind::Server && g.perms & perm::CHANNEL_VIEW == 0 {
+                    g.perms |= perm::CHANNEL_VIEW;
                     self.save_group(&g)?;
                 }
             }
@@ -591,6 +640,7 @@ impl Store {
     /// stays blocked. Its chat messages stay (like a message of someone who left). Returns
     /// whether there was a record.
     pub fn delete_client(&self, uid: &str) -> R<bool> {
+        self.delete_account(uid)?;
         let w = self.db.begin_write()?;
         let existed;
         {
@@ -634,6 +684,82 @@ impl Store {
             }
         }
         Ok(existed)
+    }
+
+    // ---------- accounts (1.25.0+, encrypted at rest) ----------
+
+    fn account_aad(uid: &str) -> Vec<u8> {
+        [b"voxa-account".as_slice(), uid.as_bytes()].concat()
+    }
+
+    pub fn account(&self, uid: &str) -> R<Option<AccountRec>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(ACCOUNTS)?;
+        Ok(t.get(uid)?.and_then(|v| self.unseal_raw(&Self::account_aad(uid), v.value())).and_then(|p| dec(&p)))
+    }
+
+    /// The identity a username belongs to.
+    pub fn account_uid(&self, username: &str) -> R<Option<String>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(USERNAMES)?;
+        Ok(t.get(username.to_lowercase().as_str())?.map(|v| v.value().to_string()))
+    }
+
+    /// Saves an account; false if its username belongs to another identity.
+    pub fn save_account(&self, uid: &str, a: &AccountRec) -> R<bool> {
+        let key = a.username.to_lowercase();
+        let blob = self.seal_raw(&Self::account_aad(uid), &enc(a));
+        let w = self.db.begin_write()?;
+        {
+            let mut names = w.open_table(USERNAMES)?;
+            if let Some(owner) = names.get(key.as_str())?.map(|v| v.value().to_string()) {
+                if owner != uid {
+                    return Ok(false);
+                }
+            }
+            names.insert(key.as_str(), uid)?;
+            w.open_table(ACCOUNTS)?.insert(uid, blob.as_slice())?;
+        }
+        w.commit()?;
+        Ok(true)
+    }
+
+    pub fn delete_account(&self, uid: &str) -> R<()> {
+        let Some(a) = self.account(uid)? else { return Ok(()) };
+        let w = self.db.begin_write()?;
+        {
+            w.open_table(USERNAMES)?.remove(a.username.to_lowercase().as_str())?;
+            w.open_table(ACCOUNTS)?.remove(uid)?;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn account_policy(&self) -> R<AccountPolicy> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(META)?;
+        Ok(t.get("account_policy")?.and_then(|v| dec(v.value())).unwrap_or_default())
+    }
+
+    pub fn save_account_policy(&self, p: &AccountPolicy) -> R<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(META)?.insert("account_policy", enc(p).as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
+    /// Channels hidden from server groups (1.25.0+).
+    pub fn hidden_channels(&self) -> R<Vec<(ChannelId, Vec<GroupId>)>> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(META)?;
+        Ok(t.get("hidden_channels")?.and_then(|v| dec(v.value())).unwrap_or_default())
+    }
+
+    pub fn save_hidden_channels(&self, h: &[(ChannelId, Vec<GroupId>)]) -> R<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(META)?.insert("hidden_channels", enc(&h.to_vec()).as_slice())?;
+        w.commit()?;
+        Ok(())
     }
 
     pub fn channel_group(&self, uid: &str, ch: ChannelId) -> R<Option<GroupId>> {

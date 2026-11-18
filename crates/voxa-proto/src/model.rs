@@ -123,8 +123,12 @@ pub mod perm {
     pub const CALENDAR_EVENTS: u64 = 1 << 40;
     /// ...and create, rename and delete the channel's calendars (tabs).
     pub const CALENDAR_MANAGE: u64 = 1 << 41;
+    /// See channels (servers 1.25.0+). Without it a group sees no channel but the one it is
+    /// in; a channel's "Hidden from" groups do not see that channel (and its sub-channels,
+    /// people and chat).
+    pub const CHANNEL_VIEW: u64 = 1 << 42;
 
-    pub const ALL: u64 = (1 << 42) - 1;
+    pub const ALL: u64 = (1 << 43) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -133,6 +137,7 @@ pub mod perm {
         (CHANNEL_CREATE_TEMPORARY, "Create temporary channels"),
         (CHANNEL_EDIT, "Edit channels"),
         (CHANNEL_DELETE, "Delete channels"),
+        (CHANNEL_VIEW, "See channels"),
         (CHANNEL_JOIN, "Join / switch channels"),
         (CHANNEL_JOIN_IGNORE_POWER, "Join channels regardless of join power"),
         (CHANNEL_JOIN_IGNORE_PASSWORD, "Join channels without password"),
@@ -718,6 +723,59 @@ mod avatar_tests {
 pub struct ServerOptions {
     /// Minutes without input before people are set away automatically (0 = never).
     pub auto_away_minutes: u32,
+}
+
+/// Who must sign in to an account on a server (servers 1.25.0+). Accounts are per server:
+/// a username and password (optionally an authenticator app) on top of the identity key.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AccountMode {
+    /// No accounts (the identity key alone).
+    #[default]
+    Off,
+    /// People may make an account (and add MFA) to protect their identity.
+    Optional,
+    /// Everyone must sign in; until then they only have Guest permissions.
+    Required,
+    /// Staff (whose groups give more than the default server group, e.g. moderators and
+    /// admins) must sign in; until then they only have Guest permissions.
+    RequiredForStaff,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct AccountPolicy {
+    pub mode: AccountMode,
+    /// Staff must also use an authenticator app (when
+    /// accounts are required).
+    pub mfa_for_staff: bool,
+    /// The server can email password reset codes (set by the server: it has SMTP settings).
+    pub email_reset: bool,
+}
+
+/// Your account on this server.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct AccountState {
+    /// None: this identity has no account here.
+    pub username: Option<String>,
+    pub signed_in: bool,
+    pub mfa: bool,
+    /// The recovery email, partly hidden (e.g. `d***@example.com`).
+    pub email: Option<String>,
+    /// Unused recovery codes.
+    pub recovery_left: u32,
+    /// You only have Guest permissions until you sign in (or set up MFA).
+    pub limited: bool,
+    /// Why you are limited, for the sign-in page.
+    pub reason: String,
+}
+
+/// Usernames: 3 to 32 letters, digits, `.`, `_` or `-`.
+pub fn valid_username(u: &str) -> bool {
+    (3..=32).contains(&u.chars().count()) && u.chars().all(|c| c.is_alphanumeric() || ".-_".contains(c))
+}
+
+/// Passwords: at least 10 characters, at most 200.
+pub fn valid_account_password(p: &str) -> bool {
+    (10..=200).contains(&p.chars().count())
 }
 
 /// Longest auto-away time an administrator can choose.

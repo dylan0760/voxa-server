@@ -547,7 +547,8 @@ async fn channels(server: &Server, s: &mut TcpStream) -> std::io::Result<()> {
             let mut v: Vec<(i64, String, bool, bool)> = st
                 .channels
                 .values()
-                .filter(|c| !is_spacer(&c.info.name))
+                // Anyone can read this list: only channels a Guest may see (1.25.0+).
+                .filter(|c| !is_spacer(&c.info.name) && st.channel_visible_to(&[crate::state::GROUP_GUEST], st.groups.get(&crate::state::GROUP_GUEST).map(|g| g.perms).unwrap_or(0), c.info.id))
                 .map(|c| (c.info.sort, path(c.info.id), c.info.has_password, c.info.is_default))
                 .collect();
             v.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));

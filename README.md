@@ -1,8 +1,9 @@
 # Voxa Server
 
 Voxa is free, open source voice chat with persistent encrypted text chat and screen
-sharing. It is written in Rust for Windows. There are no license keys, accounts,
-registrations or fees.
+sharing. It is written in Rust for Windows. There are no license keys, registrations or
+fees. Servers can optionally ask for per-server accounts (username, password and an
+authenticator app) on top of each identity.
 
 This repository contains the **server**:
 * `voxa-server.exe`: runs as the Windows service **VoxaServer**.
@@ -368,6 +369,37 @@ their update window by themselves. To allow older clients, set
     **File transfers**.
   * `max_upload_mb` / `channel_quota_mb` in `server.toml` are only the initial defaults
     (0 = unlimited).
+* **Accounts** (1.25.0, Voxa 1.33.0 and the web page): a username and password on top of
+  each identity, so a copied identity key alone isn't enough. Accounts are per server.
+  * **Edit Virtual Server → Accounts & security:** **Off** (the default), **Optional**,
+    **Required for staff** (everyone whose groups give more than the default server group)
+    or **Required for everyone**, plus **Staff must also use an authenticator app**.
+  * Until someone the rules apply to signs in, they get only **Guest** permissions, talk
+    power and join power, and see only what Guests see. The server refuses a change that
+    would lock out the admin making it.
+  * **MFA:** authenticator apps (TOTP, RFC 6238: Microsoft / Google Authenticator,
+    Aegis, 2FAS, Yubico Authenticator with a YubiKey), with 10 one-time recovery codes.
+  * **Remembered devices:** a token that signs a device in for 30 days (at most 10 per
+    account). Changing or resetting the password, or turning MFA on, signs them all out.
+  * **Forgotten passwords:** a recovery code, or an 8-digit code by email (valid 15
+    minutes, 5 tries, at most 3 emails an hour) when email is set up (see `smtp_*` in
+    [Data & configuration](#data--configuration)). The answer to "email me a code" is the
+    same whether or not the account exists.
+  * Removing someone from the server deletes their account too.
+* **Hidden channels** (1.25.0, Voxa 1.33.0 and the web page): **Edit Channel → Hidden
+  from** picks server groups that don't see a channel. For them the channel, its
+  sub-channels, the people in it and its chat don't exist. Everything about it is left
+  out of what they are sent, and asking for it by number gets "Channel not found".
+  * A new permission, **See channels**: a group without it only sees the channel it is
+    in. Every server group gets it when the server updates, so nothing changes until you
+    change it.
+  * Administrators (*Edit virtual server*) always see everything. The default channel
+    can't be hidden.
+  * You can't hide a channel from a group you are in, or from a group with permissions
+    you lack. The web page's public channel list (for "join channel") only shows channels
+    Guests can see.
+  * When groups, hidden lists, channels or sign-ins change, everyone is told what
+    appeared or disappeared for them right away.
 
 ## Security
 * **Connections:** Noise `XX_25519_ChaChaPoly_BLAKE2s` with mutual authentication,
@@ -388,6 +420,23 @@ their update window by themselves. To allow older clients, set
   and that file is removed once an administrator exists.
 * **Passwords:** hashed with Argon2id, and checked without blocking the server. After 10
   wrong passwords from one address in a minute, further tries are refused for a minute.
+* **Accounts** (1.25.0):
+  * Account records are stored encrypted, each bound to its identity. Recovery codes,
+    reset codes and device tokens are kept only as SHA-256 hashes and compared in
+    constant time.
+  * Ten wrong passwords or codes in a row lock an account for 15 minutes. Only the
+    identity that owns an account can try to sign in to it. Without an account, the
+    password is checked against a dummy hash, so the answer takes just as long.
+  * Password resets can be tried by anyone for any username, so wrong reset codes are
+    rate limited but never lock the account (strangers can't lock its owner out).
+  * Authenticator codes work once. A device is only remembered after a full sign-in
+    (with MFA if the account has it).
+  * Changing an account (password, email, MFA, new recovery codes) needs a full sign-in
+    on that connection, with the authenticator app if the account has one. A stolen
+    password alone can't make new recovery codes to get around MFA.
+  * Reset emails go over TLS only (STARTTLS or implicit TLS, never in the clear). The
+    only user text in their headers is the checked address.
+  * Messages carrying passwords are never logged.
 * **Limits against overload:**
   * at most 64 connections per address;
   * small messages until a client has logged in;
@@ -453,6 +502,11 @@ Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
 | `web_bind` | `0.0.0.0` | Address the web admin page listens on |
 | `web_port` | `9980` | TCP port of the web admin page |
 | `web_allowed_origins` | `[]` | Web addresses the page may be signed in from (empty = any) |
+| `smtp_host` | `""` | Mail server for password reset emails (empty = no emails; recovery codes still work) |
+| `smtp_port` | `587` | Its port: 587 with `starttls`, 465 with `tls` |
+| `smtp_security` | `starttls` | `starttls` or `tls` (never unencrypted) |
+| `smtp_user` / `smtp_password` | `""` | Sign-in for the mail server (empty user = none) |
+| `smtp_from` | `""` | The sender, e.g. `Voxa Server <voxa@example.org>` (needed for emails) |
 
 Restart the server after editing.
 

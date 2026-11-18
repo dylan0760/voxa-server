@@ -177,12 +177,12 @@
     GROUP_ASSIGN_CHANNEL: 20, TALK_POWER_GRANT: 21, PRIVILEGE_KEY_CREATE: 22, FILE_BROWSE: 23, FILE_UPLOAD: 24,
     FILE_DOWNLOAD: 25, FILE_DELETE: 26, SCREEN_SHARE: 27, CHANNEL_COMMANDER: 28, CHAT_HISTORY: 29,
     CLIENT_DESCRIPTION_EDIT: 30, IGNORE_SERVER_MAXCLIENTS: 31, CHANNEL_JOIN: 32, CHANNEL_JOIN_IGNORE_POWER: 33,
-    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37, CALENDAR_VIEW: 38, CALENDAR_RSVP: 39, CALENDAR_EVENTS: 40, CALENDAR_MANAGE: 41,
+    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37, CALENDAR_VIEW: 38, CALENDAR_RSVP: 39, CALENDAR_EVENTS: 40, CALENDAR_MANAGE: 41, CHANNEL_VIEW: 42,
   };
   const PERM_NAMES = [
     [P.SERVER_EDIT, 'Edit virtual server settings'], [P.CHANNEL_CREATE_PERMANENT, 'Create permanent channels'],
     [P.CHANNEL_CREATE_SEMI_PERMANENT, 'Create semi-permanent channels'], [P.CHANNEL_CREATE_TEMPORARY, 'Create temporary channels'],
-    [P.CHANNEL_EDIT, 'Edit channels'], [P.CHANNEL_DELETE, 'Delete channels'], [P.CHANNEL_JOIN, 'Join / switch channels'],
+    [P.CHANNEL_EDIT, 'Edit channels'], [P.CHANNEL_DELETE, 'Delete channels'], [P.CHANNEL_VIEW, 'See channels'], [P.CHANNEL_JOIN, 'Join / switch channels'],
     [P.CHANNEL_JOIN_IGNORE_POWER, 'Join channels regardless of join power'], [P.CHANNEL_JOIN_IGNORE_PASSWORD, 'Join channels without password'],
     [P.CHANNEL_JOIN_IGNORE_MAXCLIENTS, 'Join full channels'], [P.CLIENT_MOVE, 'Move clients'], [P.CLIENT_KICK_CHANNEL, 'Kick clients from channel'],
     [P.CLIENT_KICK_SERVER, 'Kick clients from server'], [P.CLIENT_BAN, 'Ban clients'], [P.BAN_LIST, 'View and edit ban list'],
@@ -195,9 +195,12 @@
     [P.CHANNEL_COMMANDER, 'Use channel commander'], [P.CLIENT_DESCRIPTION_EDIT, 'Edit client descriptions'], [P.IGNORE_SERVER_MAXCLIENTS, 'Join when server is full'],
   ];
   const bit = (n) => 1n << BigInt(n);
+  const GUEST_GROUP = 3;
   function myPerms() {
     const me = S.clients.get(S.me);
     if (!me) return 0n;
+    // Until signing in to the account (when the server wants it): only Guest's.
+    if (S.account && S.account.limited) return BigInt(S.groups.get(GUEST_GROUP)?.perms ?? 0);
     let p = BigInt(S.extra || 0);
     for (const g of me.server_groups) p |= BigInt(S.groups.get(g)?.perms ?? 0);
     p |= BigInt(S.groups.get(me.channel_group)?.perms ?? 0);
@@ -608,6 +611,7 @@
         S.logs = new Map();
         S.presences = new Map();
         S.editing = null;
+        S.account = null; S.accountPolicy = null; S.hidden = new Map(); S.accountResumed = false; S.accountPrompted = false;
         avatars.clear();
         S.connected = true;
         S.msgDirty = true;
@@ -630,6 +634,8 @@
         stopped('Disconnected', 'You ' + leaveText(v) + '.');
         break;
       case 'Error':
+        if (/sign-in has expired/.test(v)) { localStorage.removeItem(accountKey()); if (S.account && S.account.limited && !S.accountDlg) accountDialog(); }
+        if (S.accountDlg) S.accountDlg.error(v);
         toast(v, 'bad');
         break;
       case 'Notice':
@@ -779,6 +785,44 @@
           pushMsg('dm:' + m.from_uid, { id: 0, target: { Private: 0 }, from: null, from_uid: m.from_uid, from_name: m.from_name, ts: m.ts, text: m.text });
         }
         toast(v.length + ' direct message(s) arrived while you were away');
+        break;
+      case 'AccountPolicy':
+        S.accountPolicy = v;
+        break;
+      case 'AccountState': {
+        // Turning MFA on signs remembered devices out (they must sign in with it).
+        if (S.account && !S.account.mfa && v.mfa) localStorage.removeItem(accountKey());
+        S.account = v;
+        const tok = localStorage.getItem(accountKey());
+        // A remembered browser signs in by itself (once per connection).
+        if (!v.signed_in && v.username && !S.accountResumed && tok) { S.accountResumed = true; send({ ResumeAccount: tok }); }
+        else if (v.limited && !S.accountPrompted) { S.accountPrompted = true; accountDialog(); }
+        if (v.signed_in) S.accountPrompted = true;
+        if (S.accountDlg) S.accountDlg.redraw();
+        S.msgDirty = true;
+        break;
+      }
+      case 'AccountToken':
+        localStorage.setItem(accountKey(), v);
+        break;
+      case 'MfaSetup':
+        S.mfaSetup = v;
+        if (S.accountDlg) S.accountDlg.redraw(); else accountDialog();
+        break;
+      case 'RecoveryCodes':
+        S.mfaSetup = null;
+        S.recoveryCodes = v;
+        if (S.accountDlg) S.accountDlg.redraw(); else accountDialog();
+        break;
+      case 'ChannelsVisible':
+        for (const id of v.hidden) {
+          S.channels.delete(id);
+          if (S.selected.kind === 'channel' && S.selected.id === id) S.selected = { kind: 'server' };
+        }
+        for (const c of v.shown) S.channels.set(c.id, c);
+        break;
+      case 'HiddenChannels':
+        S.hidden = new Map(v);
         break;
       case 'OfflineQueued':
         pushEvent('dm:' + v.to_uid, personName(v.to_uid) + ' is offline: the message will be delivered when they come online');
@@ -1474,6 +1518,7 @@
   function serverMenu(x, y) {
     menu(x, y, [
       { head: S.server ? S.server.name : 'Server' },
+      S.account ? { label: '🔐  Account & Security…', onClick: accountDialog } : null,
       can(P.SERVER_EDIT) ? { label: '⚙  Edit Virtual Server…', onClick: editServer } : null,
       can(P.GROUP_MANAGE) ? { label: '👥  Groups & Permissions…', onClick: groupsDialog } : null,
       can(P.BAN_LIST) ? { label: '⛔  Ban List…', onClick: banListDialog } : null,
@@ -1745,6 +1790,14 @@
     const talk = el('input', { type: 'number', value: String(e.needed_talk_power) });
     const join = el('input', { type: 'number', value: String(e.needed_join_power) });
     const enc = el('input', { type: 'checkbox', checked: e.voice_encrypted });
+    // Servers 1.25.0+: server groups that do not see this channel.
+    let hidden = editing && S.accountPolicy && can(P.CHANNEL_EDIT) ? [...(S.hidden.get(ch.id) || [])] : null;
+    const myGroups = (S.clients.get(S.me) || {}).server_groups || [];
+    const hiddenBox = hidden && el('div', { style: 'display:flex;flex-direction:column;gap:4px' }, [...S.groups.values()].filter((g) => g.kind === 'Server').sort((a, b) => a.sort - b.sort || a.id - b.id).map((g) => {
+      const own = myGroups.includes(g.id);
+      const box = el('input', { type: 'checkbox', checked: hidden.includes(g.id), disabled: own && !hidden.includes(g.id), onchange: () => { hidden = hidden.filter((x) => x !== g.id); if (box.checked) hidden.push(g.id); } });
+      return el('label', { style: 'display:flex;gap:6px;color:var(--text)', title: own ? 'You are in this group' : '' }, box, g.name);
+    }));
     const parentSel = el('select', null, el('option', { value: '' }, '(top level)'),
       [...S.channels.values()].filter((c) => !spacer(c.name) && !(editing && subtree(ch.id).includes(c.id))).sort((a, b) => a.name.localeCompare(b.name))
         .map((c) => el('option', { value: String(c.id), selected: c.id === e.parent }, c.name)));
@@ -1774,6 +1827,7 @@
           field('Needed talk power', talk),
           field('Needed join power', join),
           field('Voice encryption', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, enc, 'Encrypt voice in this channel')),
+          hiddenBox ? field('Hidden from', hiddenBox, 'People in these groups do not see this channel, its sub-channels, people or chat. Administrators always see it.') : null,
         ]));
     };
     draw();
@@ -1802,10 +1856,129 @@
           out.needed_join_power = Number(join.value) || 0;
           out.voice_encrypted = enc.checked;
         }
+        if (editing && hidden) {
+          const a = [...hidden].sort((x, y) => x - y), b = [...(S.hidden.get(ch.id) || [])].sort((x, y) => x - y);
+          if (a.join() !== b.join()) send({ SetChannelHidden: { channel: ch.id, groups: a } });
+        }
         if (editing) send({ EditChannel: { id: ch.id, edit: out } });
         else send({ CreateChannel: out });
       } },
     ]);
+  }
+
+  // ---------------------------------------------------------------- accounts (servers 1.25.0+)
+  // This page's origin is the server, so the remembered sign-in is per identity.
+  const accountKey = () => 'voxa-web-account-' + (S.uid || '');
+  function accountDialog() {
+    if (S.accountDlg || !S.account) return;
+    let page = 'main';
+    let err = '';
+    const body = el('div');
+    const inp = (type, ph) => el('input', { type, placeholder: ph || '', autocomplete: type === 'password' ? 'current-password' : 'off' });
+    const user = inp('text'), pw = inp('password'), pw2 = inp('password'), npw = inp('password'), email = inp('text', 'you@example.com'), code = inp('text', '123456');
+    const remember = el('input', { type: 'checkbox', checked: true });
+    const btn = (label, onClick, kind) => el('button', { class: 'btn' + (kind ? ' ' + kind : ''), onclick: onClick }, label);
+    const go = (p) => { page = p; err = ''; draw(); };
+    const clear = () => { for (const i of [pw, pw2, npw, code]) i.value = ''; };
+    const goodPw = (p) => p.length >= 10 && p.length <= 200;
+    const fail = (t) => { err = t; draw(); };
+    const draw = () => {
+      const a = S.account, pol = S.accountPolicy || { mode: 'Off' };
+      if (!a) return;
+      const has = !!a.username;
+      let p = page === 'main' && !a.signed_in && has ? 'signin' : page;
+      const rows = [];
+      if (a.limited && a.reason) rows.push(el('div', { class: 'note full', style: 'color:var(--warn,#e0b040)' }, '⚠ ' + a.reason + ' Until then you only have Guest permissions here.'));
+      if (err) rows.push(el('div', { class: 'note full', style: 'color:var(--bad,#e05050)' }, err));
+      const actions = (...b) => el('div', { class: 'actions-row full', style: 'display:flex;gap:8px;flex-wrap:wrap' }, b);
+      if (S.recoveryCodes) {
+        rows.push(el('div', { class: 'full' }, el('p', null, 'Your recovery codes. Each works once, instead of your authenticator app or to reset your password. Keep them somewhere safe: they are not shown again.'),
+          el('pre', { style: 'font-size:15px;user-select:all' }, S.recoveryCodes.join('\n'))),
+          actions(btn('Copy', () => navigator.clipboard && navigator.clipboard.writeText(S.recoveryCodes.join('\n'))), btn('I have saved them', () => { S.recoveryCodes = null; draw(); }, 'primary')));
+      } else if (S.mfaSetup) {
+        rows.push(el('div', { class: 'full' }, el('p', null, 'Add this account to an authenticator app (Microsoft or Google Authenticator, Aegis, 2FAS, Yubico Authenticator…): on a phone tap the link, otherwise type the key into the app. Then enter the 6-digit code it shows.'),
+          el('p', null, 'Key: ', el('code', { style: 'user-select:all' }, S.mfaSetup.secret)),
+          el('p', null, el('a', { href: S.mfaSetup.uri }, 'Open in an authenticator app'))),
+          ...field('Code', code),
+          actions(btn('Turn on', () => { if (code.value.trim()) send({ ConfirmMfa: code.value.trim() }); code.value = ''; }, 'primary'), btn('Cancel', () => { S.mfaSetup = null; draw(); })));
+      } else if (p === 'main' && !has) {
+        if (pol.mode === 'Off') rows.push(el('p', { class: 'full' }, 'This server does not use accounts.'));
+        else {
+          rows.push(...field('Username', user, '3-32 letters, digits, . - _'), ...field('Password', pw, 'At least 10 characters.'), ...field('Again', pw2),
+            ...field('Email', email, pol.email_reset ? 'Optional: to reset a forgotten password.' : 'Optional. This server cannot send email: use recovery codes (add an authenticator app).'),
+            ...field('', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, remember, 'Remember this browser for 30 days')),
+            actions(btn('Make account', () => {
+              const u = user.value.trim();
+              if (!/^[\p{L}\p{N}._-]{3,32}$/u.test(u)) return fail('A username has 3 to 32 letters, digits, dots, dashes or underscores.');
+              if (!goodPw(pw.value)) return fail('A password needs at least 10 characters.');
+              if (pw.value !== pw2.value) return fail('The two passwords are different.');
+              send({ CreateAccount: { username: u, password: pw.value, email: email.value.trim() || null } });
+              if (remember.checked) S.afterCreate = { username: u, password: pw.value };
+              clear();
+            }, 'primary'), btn('I already have an account', () => go('signin'))));
+        }
+      } else if (p === 'signin') {
+        if (!user.value && a.username) user.value = a.username;
+        rows.push(...field('Username', user), ...field('Password', pw), ...field('Code', code, 'From your authenticator app (or a recovery code), if you use one.'),
+          ...field('', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, remember, 'Remember this browser for 30 days')),
+          actions(btn('Sign in', () => {
+            if (!pw.value) return;
+            send({ SignIn: { username: user.value.trim(), password: pw.value, code: code.value.trim() || null, remember: remember.checked } });
+            clear(); err = '';
+          }, 'primary'), btn('Forgot password?', () => go('forgot')), has ? null : btn('Back', () => go('main'))));
+      } else if (p === 'forgot') {
+        rows.push(...field('Username', user));
+        if (pol.email_reset) rows.push(actions(btn('📧 Email me a reset code', () => user.value.trim() && send({ RequestReset: { username: user.value.trim() } }))));
+        rows.push(...field(pol.email_reset ? 'Code' : 'Recovery code', code, pol.email_reset ? 'The reset code from the email, or a recovery code.' : null), ...field('New password', npw, 'At least 10 characters.'),
+          actions(btn('Reset password', () => {
+            if (!goodPw(npw.value)) return fail('A password needs at least 10 characters.');
+            if (!code.value.trim()) return;
+            send({ ResetPassword: { username: user.value.trim(), code: code.value.trim(), password: npw.value } });
+            clear(); go('signin');
+          }, 'primary'), btn('Back', () => go('signin'))));
+      } else if (p === 'password') {
+        rows.push(...field('Current password', pw), ...field('New password', npw, 'At least 10 characters.'), ...field('Again', pw2),
+          actions(btn('Change', () => {
+            if (!goodPw(npw.value)) return fail('A password needs at least 10 characters.');
+            if (npw.value !== pw2.value) return fail('The two new passwords are different.');
+            send({ ChangePassword: { old: pw.value, new: npw.value } });
+            clear(); go('main');
+          }, 'primary'), btn('Back', () => go('main'))));
+      } else if (p === 'email') {
+        rows.push(...field('Email', email, 'Empty: none.'), ...field('Your password', pw),
+          actions(btn('Save', () => { if (pw.value) { send({ SetEmail: { password: pw.value, email: email.value.trim() || null } }); clear(); go('main'); } }, 'primary'), btn('Back', () => go('main'))));
+      } else if (p === 'nomfa') {
+        rows.push(...field('Your password', pw), ...field('Code', code, 'From the app, or a recovery code.'),
+          actions(btn('Turn off', () => { if (pw.value) { send({ DisableMfa: { password: pw.value, code: code.value.trim() } }); clear(); go('main'); } }, 'danger'), btn('Back', () => go('main'))));
+      } else if (p === 'codes') {
+        rows.push(el('p', { class: 'full' }, 'The old codes stop working.'), ...field('Your password', pw),
+          actions(btn('Make new codes', () => { if (pw.value) { send({ NewRecoveryCodes: { password: pw.value } }); clear(); go('main'); } }, 'primary'), btn('Back', () => go('main'))));
+      } else {
+        const tok = localStorage.getItem(accountKey());
+        rows.push(el('div', { class: 'full', style: 'color:var(--good,#40c070);font-weight:600' }, '✔ Signed in as ' + a.username),
+          ...field('Authenticator app', el('span', null, a.mfa ? 'On' : 'Off')),
+          ...field('Recovery codes left', el('span', null, a.mfa ? String(a.recovery_left) : '-')),
+          ...field('Recovery email', el('span', null, a.email || 'none')),
+          ...field('This browser', el('span', null, tok ? 'remembered' : 'not remembered')),
+          actions(
+            a.mfa ? btn('Turn off the authenticator app…', () => go('nomfa')) : btn('🔑 Add an authenticator app (MFA)', () => send('StartMfa'), 'primary'),
+            a.mfa ? btn('New recovery codes…', () => go('codes')) : null,
+            btn('Change password…', () => go('password')),
+            btn('Recovery email…', () => go('email')),
+            btn('Sign out', () => { send({ SignOut: tok }); localStorage.removeItem(accountKey()); })));
+      }
+      put(body, el('div', null, el('p', { class: 'dim small', style: 'margin-top:0' }, 'Each server has its own accounts. The password protects your identity here: someone with a copy of your identity key still needs it.'),
+        el('div', { class: 'form' }, rows)));
+      // Made an account and asked to be remembered: sign in once to get this browser's token.
+      if (S.afterCreate && a.signed_in) {
+        send({ SignIn: { username: S.afterCreate.username, password: S.afterCreate.password, code: null, remember: true } });
+        S.afterCreate = null;
+      }
+      if (a.signed_in && page === 'signin') page = 'main';
+    };
+    S.accountDlg = { redraw: draw, error: fail };
+    draw();
+    dialog('🔐 Account & security', body, [{ label: 'Close' }], { wide: true, onClose: () => { S.accountDlg = null; S.afterCreate = null; } });
   }
 
   function groupSelect(kind, value) {
@@ -1827,6 +2000,9 @@
     const away = el('input', { type: 'number', min: '0', max: '30', value: String(S.options ? S.options.auto_away_minutes : 10) });
     const upload = el('input', { type: 'number', min: '0', placeholder: 'loading…' });
     const quota = el('input', { type: 'number', min: '0', placeholder: 'loading…' });
+    const pol = S.accountPolicy || { mode: 'Off', mfa_for_staff: false };
+    const accMode = el('select', null, [['Off', 'Off'], ['Optional', 'Optional'], ['RequiredForStaff', 'Required for staff'], ['Required', 'Required for everyone']].map(([v, l]) => el('option', { value: v, selected: v === pol.mode }, l)));
+    const accMfa = el('input', { type: 'checkbox', checked: pol.mfa_for_staff });
     let limits = null;
     S.wait.FileLimits = (v) => { limits = v; upload.value = String(v.max_upload_mb); quota.value = String(v.channel_quota_mb); };
     send('GetFileLimits');
@@ -1841,6 +2017,10 @@
       field('Channel admin group', cag),
       field('Keep chat history', retention, 'Days; 0 keeps messages forever.'),
       field('Auto away after', away, 'Minutes without input before people are set away (0 = never, at most 30).'),
+      S.accountPolicy ? [el('div', { class: 'section full' }, 'Accounts & security'),
+        field('Accounts', accMode, 'Accounts add a username and password (and optionally an authenticator app) on top of each identity. People who must sign in only get Guest permissions until they do.'),
+        field('MFA', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, accMfa, 'Staff must also use an authenticator app'),
+          S.accountPolicy.email_reset ? null : 'Password reset by email is off: set smtp_host and smtp_from in server.toml. Recovery codes always work.')] : null,
       el('div', { class: 'section full' }, 'File browser'),
       field('Largest upload (MB)', upload, '0 = unlimited'),
       field('Storage per channel (MB)', quota, '0 = unlimited')), [
@@ -1853,6 +2033,7 @@
           default_server_group: Number(dsg.value), default_channel_group: Number(dcg.value), channel_admin_group: Number(cag.value),
           chat_retention_days: Math.max(0, Number(retention.value) || 0),
         } });
+        if (S.accountPolicy && (accMode.value !== pol.mode || accMfa.checked !== pol.mfa_for_staff)) send({ SetAccountPolicy: { mode: accMode.value, mfa_for_staff: accMfa.checked, email_reset: false } });
         const mins = Math.min(30, Math.max(0, Math.round(Number(away.value) || 0)));
         if (!S.options || mins !== S.options.auto_away_minutes) send({ SetServerOptions: { auto_away_minutes: mins } });
         if (limits && upload.value !== '' && quota.value !== '') {

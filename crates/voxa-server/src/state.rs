@@ -76,6 +76,12 @@ pub struct Session {
     pub last_camera_key_req: Option<Instant>,
     /// Channels whose calendar this client has open (it gets every change).
     pub calendar_subs: HashSet<ChannelId>,
+    /// Signed in to the identity's account (1.25.0+), and with the authenticator app (or a
+    /// remembered device that was).
+    pub signed_in: bool,
+    pub mfa_ok: bool,
+    /// Whether the client was last told it is limited to Guest permissions.
+    pub told_limited: bool,
 }
 
 /// Chat messages, images and pokes: bursts of this many, then `CHAT_RATE` per second.
@@ -121,6 +127,10 @@ pub struct State {
     pub file_limits: FileLimits,
     /// Server-wide options (auto-away), editable by admins.
     pub options: ServerOptions,
+    /// Who must sign in to an account (1.25.0+).
+    pub account_policy: AccountPolicy,
+    /// Channels hidden from server groups (1.25.0+).
+    pub hidden: HashMap<ChannelId, Vec<GroupId>>,
 }
 
 pub struct Server {
@@ -290,7 +300,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.32.0";
+pub const MIN_CLIENT_VERSION: &str = "1.33.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -326,7 +336,8 @@ fn default_groups() -> Vec<GroupInfo> {
         | CHANNEL_JOIN
         | CHAT_EDIT_OWN
         | CALENDAR_VIEW
-        | CALENDAR_RSVP;
+        | CALENDAR_RSVP
+        | CHANNEL_VIEW;
     // Join power mirrors TeamSpeak: Admin 75, Normal 10, Guest 0. A channel with
     // "needed join power" 10 is therefore members-only, 75 is admins-only.
     let g = |id, kind, name: &str, perms, talk_power, sort, show_name| GroupInfo {
@@ -349,7 +360,7 @@ fn default_groups() -> Vec<GroupInfo> {
     vec![
         g(GROUP_ADMIN, GroupKind::Server, "Server Admin", ALL, 75, 10, true),
         g(GROUP_NORMAL, GroupKind::Server, "Normal", normal, 0, 20, false),
-        g(GROUP_GUEST, GroupKind::Server, "Guest", CHANNEL_JOIN | SERVER_CHAT | CHANNEL_CHAT | CHAT_HISTORY | FILE_BROWSE | CALENDAR_VIEW, 0, 30, false),
+        g(GROUP_GUEST, GroupKind::Server, "Guest", CHANNEL_JOIN | CHANNEL_VIEW | SERVER_CHAT | CHANNEL_CHAT | CHAT_HISTORY | FILE_BROWSE | CALENDAR_VIEW, 0, 30, false),
         g(
             GROUP_CHANNEL_ADMIN,
             GroupKind::Channel,
@@ -412,7 +423,12 @@ impl State {
 
     /// Administrators see invisible people (to moderate); everyone sees themselves.
     fn sees(&self, viewer: &Session, subject: &Session) -> bool {
-        viewer.info.id == subject.info.id || !subject.hidden() || self.server_perms(viewer) & perm::SERVER_EDIT != 0
+        if viewer.info.id == subject.info.id {
+            return true;
+        }
+        let admin = self.server_perms(viewer) & perm::SERVER_EDIT != 0;
+        // Nobody in a channel one cannot see (1.25.0+).
+        (!subject.hidden() || admin) && (admin || self.sees_channel(viewer, subject.info.channel))
     }
 
     /// Sends a message about someone to everyone who can see them.
@@ -478,9 +494,185 @@ impl State {
         self.groups.get(&g).map(|g| g.perms).unwrap_or(0)
     }
 
-    /// Server-wide permissions: all server groups plus the user's own permissions.
+    /// Server-wide permissions: all server groups plus the user's own permissions, or only
+    /// Guest's while the account rules want them to sign in (see `limited`).
     pub fn server_perms(&self, s: &Session) -> u64 {
+        let raw = self.raw_server_perms(s);
+        if self.limit_reason(s, raw).is_some() {
+            self.group_perms(GROUP_GUEST)
+        } else {
+            raw
+        }
+    }
+
+    /// Server-wide permissions from the groups, whatever the account rules say.
+    pub fn raw_server_perms(&self, s: &Session) -> u64 {
         s.info.server_groups.iter().fold(s.extra_perms, |acc, g| acc | self.group_perms(*g))
+    }
+
+    /// Why the account rules limit someone to Guest permissions (None: they are not).
+    pub fn limit_reason(&self, s: &Session, raw: u64) -> Option<&'static str> {
+        self.limit_reason_for(s.signed_in, s.mfa_ok, raw)
+    }
+
+    pub fn limit_reason_for(&self, signed_in: bool, mfa_ok: bool, raw: u64) -> Option<&'static str> {
+        let staff = self.is_staff(raw);
+        let required = match self.account_policy.mode {
+            AccountMode::Off | AccountMode::Optional => return None,
+            AccountMode::Required => true,
+            AccountMode::RequiredForStaff => staff,
+        };
+        if required && !signed_in {
+            return Some("This server asks you to sign in to your account (or make one) before you get your permissions.");
+        }
+        if staff && self.account_policy.mfa_for_staff && !mfa_ok {
+            return Some("Your permissions need an authenticator app (MFA) on your account: set it up, or sign in with your code.");
+        }
+        None
+    }
+
+    /// "Staff": permissions beyond what the default server group (members) and Guest give.
+    pub fn is_staff(&self, raw: u64) -> bool {
+        let base = self.group_perms(self.settings.default_server_group) | self.group_perms(GROUP_GUEST);
+        raw & !base != 0
+    }
+
+    pub fn limited(&self, s: &Session) -> bool {
+        self.limit_reason(s, self.raw_server_perms(s)).is_some()
+    }
+
+    /// The server groups that count for hiding channels: only Guest while limited.
+    fn view_groups<'a>(&self, s: &'a Session) -> std::borrow::Cow<'a, [GroupId]> {
+        if self.limited(s) {
+            std::borrow::Cow::Owned(vec![GROUP_GUEST])
+        } else {
+            std::borrow::Cow::Borrowed(&s.info.server_groups)
+        }
+    }
+
+    /// Whether someone sees a channel (1.25.0+): always the one they are in; administrators
+    /// (`Edit virtual server`) all; others need "See channels" and none of their server
+    /// groups in the channel's (or a parent's) "Hidden from" list.
+    pub fn sees_channel(&self, s: &Session, ch: ChannelId) -> bool {
+        if ch == NO_CHANNEL || s.info.channel == ch {
+            return true;
+        }
+        let perms = self.server_perms(s);
+        self.channel_visible_to(&self.view_groups(s), perms, ch)
+    }
+
+    /// `sees_channel` for given server groups and permissions (also before a session exists).
+    pub fn channel_visible_to(&self, groups: &[GroupId], perms: u64, ch: ChannelId) -> bool {
+        // Administrators see everything; everyone the default channel (newcomers land there).
+        if perms & perm::SERVER_EDIT != 0 || self.channels.get(&ch).is_some_and(|c| c.info.is_default) {
+            return true;
+        }
+        if perms & perm::CHANNEL_VIEW == 0 {
+            return false;
+        }
+        let mut cur = Some(ch);
+        let mut depth = 0;
+        while let Some(c) = cur {
+            if self.hidden.get(&c).is_some_and(|h| h.iter().any(|g| groups.contains(g))) {
+                return false;
+            }
+            cur = self.channels.get(&c).and_then(|r| r.info.parent);
+            depth += 1;
+            if depth > MAX_CHANNEL_DEPTH + 1 {
+                break;
+            }
+        }
+        true
+    }
+
+    /// What each session sees right now: (channels, people). Taken before a change, then
+    /// `apply_visibility` tells everyone what appeared or disappeared.
+    pub fn visibility(&self) -> Visibility {
+        let per = self
+            .sessions
+            .values()
+            .map(|v| {
+                // The same as `sees_channel` / `sees`, with the viewer's rights worked out once.
+                let limited = self.limited(v);
+                let perms = self.server_perms(v);
+                let admin = perms & perm::SERVER_EDIT != 0;
+                let groups = self.view_groups(v);
+                let chans: HashSet<ChannelId> =
+                    self.channels.keys().copied().filter(|c| v.info.channel == *c || self.channel_visible_to(&groups, perms, *c)).collect();
+                let people = self
+                    .sessions
+                    .values()
+                    .filter(|x| x.info.id == v.info.id || admin || (!x.hidden() && (x.info.channel == NO_CHANNEL || chans.contains(&x.info.channel))))
+                    .map(|x| x.info.id)
+                    .collect();
+                (v.info.id, (chans, people, limited))
+            })
+            .collect();
+        Visibility { channels: self.channels.keys().copied().collect(), per }
+    }
+
+    /// After a change: channels and people that appeared for someone are sent as created /
+    /// joined (parents first), those that disappeared as left / deleted (children first).
+    pub fn apply_visibility(&mut self, before: Visibility, account_state: impl Fn(&State, &Session) -> S2C) {
+        let after = self.visibility();
+        // Channels made or deleted by the change were already announced to those who see them.
+        let kept = |c: &ChannelId| before.channels.contains(c) && after.channels.contains(c);
+        let (before, after) = (before.per, after.per);
+        let depth = |st: &State, c: ChannelId| {
+            let mut d = 0;
+            let mut cur = st.channels.get(&c).and_then(|r| r.info.parent);
+            while let Some(p) = cur {
+                d += 1;
+                if d > MAX_CHANNEL_DEPTH + 1 {
+                    break;
+                }
+                cur = st.channels.get(&p).and_then(|r| r.info.parent);
+            }
+            d
+        };
+        let mut told = Vec::new();
+        for (id, (chans, people, limited)) in &after {
+            let Some((old_chans, old_people, old_limited)) = before.get(id) else { continue };
+            let Some(s) = self.sessions.get(id) else { continue };
+            let mut gone_people: Vec<ClientId> = old_people.difference(people).copied().collect();
+            gone_people.sort();
+            for p in gone_people {
+                s.tx.send(Out::Msg(S2C::ClientLeft { id: p, reason: LeaveReason::Disconnected(String::new()) }));
+            }
+            let mut gone: Vec<ChannelId> = old_chans.difference(chans).copied().filter(|c| kept(c)).collect();
+            gone.sort_by_key(|c| std::cmp::Reverse(depth(self, *c)));
+            let mut new: Vec<ChannelId> = chans.difference(old_chans).copied().filter(|c| kept(c)).collect();
+            new.sort_by_key(|c| (depth(self, *c), self.channels.get(c).map(|r| r.info.sort).unwrap_or(0)));
+            let shown: Vec<ChannelInfo> = new.iter().filter_map(|c| self.channels.get(c)).map(|r| r.info.clone()).collect();
+            if !gone.is_empty() || !shown.is_empty() {
+                s.tx.send(Out::Msg(S2C::ChannelsVisible { shown, hidden: gone }));
+            }
+            let mut came: Vec<ClientId> = people.difference(old_people).copied().collect();
+            came.sort();
+            for p in came {
+                if let Some(x) = self.sessions.get(&p) {
+                    s.tx.send(Out::Msg(S2C::ClientJoined(x.info.clone())));
+                }
+            }
+            if limited != old_limited || s.told_limited != *limited {
+                told.push((*id, *limited));
+                if s.client_at_least("1.33.0") {
+                    s.tx.send(Out::Msg(account_state(self, s)));
+                }
+            }
+        }
+        for (id, l) in told {
+            if let Some(s) = self.sessions.get_mut(&id) {
+                s.told_limited = l;
+            }
+        }
+    }
+
+    /// Sends a channel change to the people who see that channel.
+    pub fn broadcast_seen(&self, ch: ChannelId, msg: S2C) {
+        for s in self.sessions.values().filter(|s| self.sees_channel(s, ch)) {
+            s.tx.send(Out::Msg(msg.clone()));
+        }
     }
 
     /// Sends a message only to clients new enough to understand it.
@@ -493,6 +685,10 @@ impl State {
     }
 
     pub fn talk_power(&self, s: &Session) -> i32 {
+        // Limited to Guest until signing in (accounts): Guest's talk power too.
+        if self.limited(s) {
+            return self.groups.get(&GROUP_GUEST).map(|g| g.talk_power).unwrap_or(0);
+        }
         s.info
             .server_groups
             .iter()
@@ -648,6 +844,8 @@ impl Server {
                 sessions: HashMap::new(),
                 // Values saved from the client win; server.toml only provides the default.
                 options: store.server_options()?.unwrap_or_default(),
+                account_policy: store.account_policy()?,
+                hidden: store.hidden_channels()?.into_iter().collect(),
             file_limits: store.load_file_limits()?.unwrap_or(FileLimits {
                     max_upload_mb: cfg.max_upload_mb,
                     channel_quota_mb: cfg.channel_quota_mb,
@@ -738,6 +936,13 @@ impl Server {
 
     /// Effective permissions of a session for an action scoped to channel `ch`.
     fn perms_in(&self, st: &State, s: &Session, ch: ChannelId) -> u64 {
+        // A channel one cannot see gives nothing there; limited people only have Guest's.
+        if !st.sees_channel(s, ch) {
+            return 0;
+        }
+        if st.limited(s) {
+            return st.server_perms(s);
+        }
         let cg = if s.info.channel == ch { s.info.channel_group } else { self.channel_group_for(st, &s.info.uid, ch) };
         st.server_perms(s) | st.group_perms(cg)
     }
@@ -854,8 +1059,34 @@ impl Server {
             }
             C2S::CreateChannel(e) | C2S::EditChannel { edit: e, .. } => self.hash_ahead(&e.password).await,
             C2S::EditServer(e) => self.hash_ahead(&e.password).await,
+            // Accounts (1.25.0+): the password checks and new hashes, before the lock.
+            C2S::SignIn { password, .. } | C2S::SetEmail { password, .. } | C2S::DisableMfa { password, .. } | C2S::NewRecoveryCodes { password } => {
+                self.verify_account_ahead(me, password).await
+            }
+            C2S::ChangePassword { old, new } => {
+                self.verify_account_ahead(me, old).await?;
+                self.hash_ahead(&PasswordChange::Set(new.clone())).await
+            }
+            C2S::CreateAccount { password, .. } | C2S::ResetPassword { password, .. } => self.hash_ahead(&PasswordChange::Set(password.clone())).await,
             _ => Ok(()),
         }
+    }
+
+    /// Checks a password against the account of the session's identity ahead of the
+    /// handler. Without an account, a dummy hash is checked, so the answer takes as long
+    /// (and counts as a wrong try) either way.
+    async fn verify_account_ahead(&self, me: ClientId, pw: &str) -> Res {
+        static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let (ip, uid) = {
+            let st = self.state.lock();
+            let Some(s) = st.sessions.get(&me) else { return Ok(()) };
+            (s.ip, s.info.uid.clone())
+        };
+        let hash = match db(self.store.account(&uid))? {
+            Some(a) => a.password_hash,
+            None => DUMMY.get_or_init(|| hash_password("voxa-no-account")).clone(),
+        };
+        self.verify_ahead(ip, pw, &hash).await
     }
 
     // ------------------------------------------------------------------ login
@@ -911,6 +1142,10 @@ impl Server {
             record.server_groups.push(st.settings.default_server_group);
         }
         let group_perms = record.server_groups.iter().fold(0, |a, g| a | st.group_perms(*g));
+        // Not signed in yet: what the account rules allow (Guest's, if they want a sign-in).
+        let raw_perms = group_perms | self.store.client_perms(&uid).unwrap_or(0);
+        let limited_now = st.limit_reason_for(false, false, raw_perms).is_some();
+        let (view_groups, view_perms) = if limited_now { (vec![GROUP_GUEST], st.group_perms(GROUP_GUEST)) } else { (record.server_groups.clone(), raw_perms) };
         // Server administrators cannot be locked out by a ban (e.g. on a shared address).
         if let Some(ban) = ban.filter(|_| group_perms & perm::SERVER_EDIT == 0) {
             let until = ban.expires.map(|e| format!(" (expires in {} min)", (e.saturating_sub(now_unix())) / 60 + 1)).unwrap_or_default();
@@ -942,16 +1177,16 @@ impl Server {
                 let pw_ok = match &c.password_hash {
                     None => true,
                     Some(h) => default_channel_password.as_deref().map(|p| self.pw_verified(p, h)).unwrap_or(false)
-                        || group_perms & perm::CHANNEL_JOIN_IGNORE_PASSWORD != 0,
+                        || view_perms & perm::CHANNEL_JOIN_IGNORE_PASSWORD != 0,
                 };
                 let full = c.info.max_clients.map(|m| st.clients_in(ch) as u32 >= m).unwrap_or(false)
-                    && group_perms & perm::CHANNEL_JOIN_IGNORE_MAXCLIENTS == 0;
+                    && view_perms & perm::CHANNEL_JOIN_IGNORE_MAXCLIENTS == 0;
                 let cg = self.channel_group_for(&st, &uid, ch);
-                let perms_there = group_perms | st.group_perms(cg);
+                let perms_there = view_perms | if limited_now { 0 } else { st.group_perms(cg) };
                 let may_join = perms_there & perm::CHANNEL_JOIN != 0
                     && (perms_there & perm::CHANNEL_JOIN_IGNORE_POWER != 0
-                        || st.join_power(&record.server_groups, cg) >= c.info.needed_join_power);
-                if pw_ok && !full && may_join && !voxa_proto::is_spacer(&c.info.name) {
+                        || if limited_now { st.join_power(&[GROUP_GUEST], GROUP_GUEST) } else { st.join_power(&record.server_groups, cg) } >= c.info.needed_join_power);
+                if pw_ok && !full && may_join && !voxa_proto::is_spacer(&c.info.name) && st.channel_visible_to(&view_groups, view_perms, ch) {
                     channel = ch;
                 }
             }
@@ -988,17 +1223,19 @@ impl Server {
         };
         let voice_key: [u8; 32] = crate::secrets::random_bytes();
         let bulk_token: [u8; 32] = crate::secrets::random_bytes();
-        let viewer_admin = (group_perms | self.store.client_perms(&uid).unwrap_or(0)) & perm::SERVER_EDIT != 0;
+        let viewer_admin = view_perms & perm::SERVER_EDIT != 0;
+        // Channels this person may see (1.25.0+), and the people in them.
+        let visible = |c: ChannelId| c == NO_CHANNEL || c == channel || st.channel_visible_to(&view_groups, view_perms, c);
         let welcome = S2C::Welcome {
             your_id: id,
             your_uid: uid.clone(),
             server: st.server_info(self),
-            channels: st.channels.values().map(|c| c.info.clone()).collect(),
+            channels: st.channels.values().filter(|c| visible(c.info.id)).map(|c| c.info.clone()).collect(),
             // Invisible people are left out, except for administrators.
             clients: st
                 .sessions
                 .values()
-                .filter(|s| !s.hidden() || viewer_admin)
+                .filter(|s| (!s.hidden() || viewer_admin) && visible(s.info.channel))
                 .map(|s| s.info.clone())
                 .chain(std::iter::once(info.clone()))
                 .collect(),
@@ -1044,7 +1281,7 @@ impl Server {
         }
         // Presences of the people the newcomer can see (busy, and invisible for administrators).
         if !voxa_proto::update::is_newer("1.22.0", &info.version) {
-            for s in st.sessions.values().filter(|s| s.presence != Presence::Online && (!s.hidden() || viewer_admin)) {
+            for s in st.sessions.values().filter(|s| s.presence != Presence::Online && (!s.hidden() || viewer_admin) && visible(s.info.channel)) {
                 tx.send(Out::Msg(S2C::ClientPresence { id: s.info.id, presence: s.presence }));
             }
         }
@@ -1059,7 +1296,7 @@ impl Server {
             let metas = st
                 .sessions
                 .values()
-                .filter(|s| !s.hidden() || viewer_admin)
+                .filter(|s| (!s.hidden() || viewer_admin) && visible(s.info.channel))
                 .map(|s| s.info.uid.as_str())
                 .chain(std::iter::once(uid.as_str()))
                 .filter_map(|u| self.avatar_meta(u))
@@ -1085,6 +1322,9 @@ impl Server {
                 camera: None,
                 last_camera_key_req: None,
                 calendar_subs: HashSet::new(),
+                signed_in: false,
+                mfa_ok: false,
+                told_limited: limited_now,
                 viewers: HashSet::new(),
                 last_keyframe_req: None,
                 extra_perms,
@@ -1095,6 +1335,15 @@ impl Server {
                 presence,
             },
         );
+        // Account rules and state, and hidden channels for those who edit channels (1.33.0+).
+        if st.sessions[&id].client_at_least("1.33.0") {
+            let s = &st.sessions[&id];
+            s.tx.send(Out::Msg(S2C::AccountPolicy(self.policy_for_clients(&st))));
+            s.tx.send(Out::Msg(self.account_state(&st, s)));
+            if st.server_perms(s) & perm::CHANNEL_EDIT != 0 {
+                s.tx.send(Out::Msg(S2C::HiddenChannels(st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect())));
+            }
+        }
         // Everyone who can see the newcomer is told (invisible people stay unseen).
         let joined = st.sessions[&id].info.clone();
         let sub = &st.sessions[&id];
@@ -1222,6 +1471,10 @@ impl Server {
             let _ = self.store.delete_channel(ch);
             crate::files::delete_channel_files(&self.data_dir, ch);
             st.broadcast(S2C::ChannelDeleted(ch));
+        if st.hidden.remove(&ch).is_some() {
+            let list: Vec<(ChannelId, Vec<GroupId>)> = st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect();
+            let _ = self.store.save_hidden_channels(&list);
+        }
         }
     }
 
@@ -1233,8 +1486,14 @@ impl Server {
             return;
         }
         let mut kicks = Vec::new();
+        // Changes that can show or hide channels and people (1.25.0+): everyone is told what
+        // appeared or disappeared for them.
+        let before = affects_visibility(&msg).then(|| st.visibility());
         if let Err(e) = self.dispatch(&mut st, me, msg, &mut kicks) {
             st.send(me, S2C::Error(e));
+        }
+        if let Some(b) = before {
+            st.apply_visibility(b, |st, s| self.account_state(st, s));
         }
         drop(st);
         for (id, reason) in kicks {
@@ -1247,6 +1506,14 @@ impl Server {
         // server chat's storage slot), so nothing may be read from or written to it.
         if names_no_channel(&msg) {
             return Err("You are not in a channel: join one first".into());
+        }
+        // A channel one cannot see (1.25.0+) looks like one that does not exist.
+        if let Some(ch) = named_channel(&msg).filter(|c| *c != NO_CHANNEL) {
+            if let Some(s) = st.sessions.get(&me) {
+                if !st.sees_channel(s, ch) {
+                    return Err("Channel not found".into());
+                }
+            }
         }
         // Invisible people look offline: acting on them must look the same as on nobody.
         if let Some(t) = names_client(&msg) {
@@ -1664,6 +1931,20 @@ impl Server {
                 Ok(())
             }),
             C2S::ForgetClient(uid) => self.forget_client(st, me, uid),
+            msg @ (C2S::SetChannelHidden { .. }
+            | C2S::SetAccountPolicy(_)
+            | C2S::CreateAccount { .. }
+            | C2S::SignIn { .. }
+            | C2S::ResumeAccount(_)
+            | C2S::SignOut(_)
+            | C2S::ChangePassword { .. }
+            | C2S::SetEmail { .. }
+            | C2S::StartMfa
+            | C2S::ConfirmMfa(_)
+            | C2S::DisableMfa { .. }
+            | C2S::NewRecoveryCodes { .. }
+            | C2S::RequestReset { .. }
+            | C2S::ResetPassword { .. }) => self.dispatch_accounts(st, me, msg),
             C2S::ClearChat(target) => {
                 let s = st.session(me)?;
                 let ch = match target {
@@ -1893,7 +2174,7 @@ impl Server {
         }
         if c.info.needed_join_power > 0 && p & perm::CHANNEL_JOIN_IGNORE_POWER == 0 {
             let cg = self.channel_group_for(st, &s.info.uid, ch);
-            let have = st.join_power(&s.info.server_groups, cg);
+            let have = if st.limited(s) { st.join_power(&[GROUP_GUEST], GROUP_GUEST) } else { st.join_power(&s.info.server_groups, cg) };
             if have < c.info.needed_join_power {
                 return Err(format!(
                     "Your group cannot join \"{}\" (needs join power {}, you have {have})",
@@ -2079,7 +2360,7 @@ impl Server {
             self.persist_channel(&rec)?;
         }
         st.channels.insert(id, rec);
-        st.broadcast(S2C::ChannelCreated(info));
+        st.broadcast_seen(info.id, S2C::ChannelCreated(info));
         // The creator becomes channel admin and is moved into the new channel (not into a
         // separator, which nobody can join).
         let admin = st.settings.channel_admin_group;
@@ -2124,7 +2405,7 @@ impl Server {
             c.info.sort += 1;
             let rec = ChannelRec { info: c.info.clone(), password_hash: c.password_hash.clone() };
             self.persist_channel(&rec)?;
-            st.broadcast(S2C::ChannelEdited(rec.info));
+            st.broadcast_seen(rec.info.id, S2C::ChannelEdited(rec.info));
         }
         let new_id = self.copy_channel(st, source, parent, e.name.clone(), src_sort + 1)?;
         let mut count = 1;
@@ -2152,7 +2433,7 @@ impl Server {
             self.persist_channel(&rec)?;
         }
         st.channels.insert(id, rec);
-        st.broadcast(S2C::ChannelCreated(info));
+        st.broadcast_seen(info.id, S2C::ChannelCreated(info));
         for (uid, g) in db(self.store.channel_group_assignments(source))? {
             db(self.store.set_channel_group(&uid, id, Some(g)))?;
         }
@@ -2180,7 +2461,7 @@ impl Server {
             let info = c.info.clone();
             let rec = ChannelRec { info: info.clone(), password_hash: c.password_hash.clone() };
             self.persist_channel(&rec)?;
-            st.broadcast(S2C::ChannelEdited(info));
+            st.broadcast_seen(info.id, S2C::ChannelEdited(info));
         }
         Ok(())
     }
@@ -2233,7 +2514,7 @@ impl Server {
         let info = c.info.clone();
         let rec = ChannelRec { info: info.clone(), password_hash: c.password_hash.clone() };
         self.persist_channel(&rec)?;
-        st.broadcast(S2C::ChannelEdited(info));
+        st.broadcast_seen(info.id, S2C::ChannelEdited(info));
         Ok(())
     }
 
@@ -2271,6 +2552,10 @@ impl Server {
             db(self.store.delete_channel(ch))?;
             crate::files::delete_channel_files(&self.data_dir, ch);
             st.broadcast(S2C::ChannelDeleted(ch));
+        if st.hidden.remove(&ch).is_some() {
+            let list: Vec<(ChannelId, Vec<GroupId>)> = st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect();
+            let _ = self.store.save_hidden_channels(&list);
+        }
         }
         Ok(())
     }
@@ -2995,6 +3280,13 @@ impl Server {
         }
         db(self.store.delete_group(id))?;
         st.groups.remove(&id);
+        // No longer hidden from a group that is gone.
+        for h in st.hidden.values_mut() {
+            h.retain(|g| *g != id);
+        }
+        st.hidden.retain(|_, h| !h.is_empty());
+        let list: Vec<(ChannelId, Vec<GroupId>)> = st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect();
+        let _ = self.store.save_hidden_channels(&list);
         let def_s = st.settings.default_server_group;
         let def_c = st.settings.default_channel_group;
         let mut changed = Vec::new();
@@ -3521,9 +3813,9 @@ fn find_channel_by_path(st: &State, path: &str) -> Option<ChannelId> {
     found
 }
 
-/// Whether a message refers to "channel 0" (not in a channel) where a real channel is needed.
-fn names_no_channel(msg: &C2S) -> bool {
-    let t = |x: &TextTarget| matches!(x, TextTarget::Channel(NO_CHANNEL));
+/// The channel a message acts on, if any.
+fn named_channel(msg: &C2S) -> Option<ChannelId> {
+    let t = |x: &TextTarget| if let TextTarget::Channel(c) = x { Some(*c) } else { None };
     match msg {
         C2S::SendText { target, .. }
         | C2S::FetchHistory { target, .. }
@@ -3531,12 +3823,512 @@ fn names_no_channel(msg: &C2S) -> bool {
         | C2S::PinMessage { target, .. }
         | C2S::EditMessage { target, .. } => t(target),
         C2S::GetPins(target) | C2S::ClearChat(target) => t(target),
-        C2S::FileList { channel, .. } | C2S::FileDelete { channel, .. } | C2S::FileMkdir { channel, .. } => *channel == NO_CHANNEL,
-        C2S::MoveClient { channel, .. } | C2S::SetChannelGroup { channel, .. } => *channel == NO_CHANNEL,
-        C2S::CreatePrivilegeKey { channel: Some(c), .. } => *c == NO_CHANNEL,
-        C2S::EditChannel { id, .. } | C2S::DeleteChannel { id, .. } => *id == NO_CHANNEL,
-        C2S::CloneChannel { source, .. } => *source == NO_CHANNEL,
-        _ => false,
+        C2S::FileList { channel, .. } | C2S::FileDelete { channel, .. } | C2S::FileMkdir { channel, .. } => Some(*channel),
+        C2S::MoveClient { channel, .. } | C2S::SetChannelGroup { channel, .. } | C2S::SwitchChannel { channel, .. } => Some(*channel),
+        C2S::CreatePrivilegeKey { channel: Some(c), .. } => Some(*c),
+        C2S::EditChannel { id, .. } | C2S::DeleteChannel { id, .. } => Some(*id),
+        C2S::CloneChannel { source, .. } => Some(*source),
+        C2S::SetChannelHidden { channel, .. } => Some(*channel),
+        _ => None,
+    }
+}
+
+/// Whether a message refers to "channel 0" (not in a channel) where a real channel is needed.
+fn names_no_channel(msg: &C2S) -> bool {
+    !matches!(msg, C2S::SwitchChannel { .. } | C2S::SetChannelHidden { .. }) && named_channel(msg) == Some(NO_CHANNEL)
+}
+
+/// What everyone sees before a change: all channels, and per session (channels, people,
+/// limited to Guest).
+pub struct Visibility {
+    channels: HashSet<ChannelId>,
+    per: HashMap<ClientId, (HashSet<ChannelId>, HashSet<ClientId>, bool)>,
+}
+
+/// Messages that can show or hide channels or people for someone (1.25.0+): groups,
+/// permissions, moves, channel changes, hidden lists and signing in.
+fn affects_visibility(msg: &C2S) -> bool {
+    matches!(
+        msg,
+        C2S::SwitchChannel { .. }
+            | C2S::MoveClient { .. }
+            | C2S::CreateChannel(_)
+            | C2S::EditChannel { .. }
+            | C2S::DeleteChannel { .. }
+            | C2S::CloneChannel { .. }
+            | C2S::EditGroup(_)
+            | C2S::DeleteGroup(_)
+            | C2S::SetServerGroup { .. }
+            | C2S::SetChannelGroup { .. }
+            | C2S::SetClientPerms { .. }
+            | C2S::UsePrivilegeKey(_)
+            | C2S::SetChannelHidden { .. }
+            | C2S::SetAccountPolicy(_)
+            | C2S::CreateAccount { .. }
+            | C2S::SignIn { .. }
+            | C2S::ResumeAccount(_)
+            | C2S::SignOut(_)
+            | C2S::ConfirmMfa(_)
+            | C2S::DisableMfa { .. }
+            | C2S::ResetPassword { .. }
+    )
+}
+
+/// Remembered devices sign in by themselves for this long.
+const TOKEN_DAYS: u64 = 30;
+/// Wrong passwords / codes in a row before an account is locked, and for how long.
+const ACCOUNT_MAX_FAILURES: u32 = 10;
+const ACCOUNT_LOCK_SECS: u64 = 15 * 60;
+
+// ---------------------------------------------------------------------- accounts, hidden channels
+
+impl Server {
+    /// The account rules as clients see them (whether email resets work).
+    pub fn policy_for_clients(&self, st: &State) -> AccountPolicy {
+        AccountPolicy { email_reset: crate::accounts::smtp_configured(&self.cfg), ..st.account_policy }
+    }
+
+    /// Someone's account here, for their client.
+    pub fn account_state(&self, st: &State, s: &Session) -> S2C {
+        let rec = self.store.account(&s.info.uid).ok().flatten();
+        let raw = st.raw_server_perms(s);
+        S2C::AccountState(AccountState {
+            username: rec.as_ref().map(|a| a.username.clone()),
+            signed_in: s.signed_in,
+            mfa: rec.as_ref().is_some_and(|a| a.totp.is_some()),
+            email: rec.as_ref().and_then(|a| a.email.as_deref()).map(crate::accounts::mask_email),
+            recovery_left: rec.as_ref().map(|a| a.recovery.len() as u32).unwrap_or(0),
+            limited: st.limit_reason(s, raw).is_some(),
+            reason: st.limit_reason(s, raw).unwrap_or_default().to_string(),
+        })
+    }
+
+    /// The account of the identity behind a session (an error if it has none).
+    fn my_account(&self, st: &State, me: ClientId) -> Res<(String, AccountRec)> {
+        let uid = st.session(me)?.info.uid.clone();
+        let rec = db(self.store.account(&uid))?.ok_or("You have no account on this server")?;
+        Ok((uid, rec))
+    }
+
+    fn save_account(&self, uid: &str, rec: &AccountRec) -> Res {
+        if !db(self.store.save_account(uid, rec))? {
+            return Err("That username is taken".into());
+        }
+        Ok(())
+    }
+
+    /// A wrong password or code: counts towards locking the account for a while.
+    fn account_failed(&self, uid: &str, mut rec: AccountRec, what: &str) -> Res {
+        rec.failures += 1;
+        if rec.failures >= ACCOUNT_MAX_FAILURES {
+            rec.failures = 0;
+            rec.locked_until = now_unix() + ACCOUNT_LOCK_SECS;
+            warn!("account {} locked for {} min after too many wrong tries", rec.username, ACCOUNT_LOCK_SECS / 60);
+        }
+        let _ = self.save_account(uid, &rec);
+        Err(what.to_string())
+    }
+
+    /// Changing an account needs a full sign-in on this connection: with the authenticator
+    /// app when the account has one (else a stolen password could, say, make new recovery
+    /// codes and use them instead of the app).
+    fn check_full_sign_in(st: &State, me: ClientId, rec: &AccountRec) -> Res {
+        let s = st.session(me)?;
+        if !s.signed_in {
+            return Err("Sign in first".into());
+        }
+        if rec.totp.is_some() && !s.mfa_ok {
+            return Err("Sign in with your authenticator app first".into());
+        }
+        Ok(())
+    }
+
+    fn check_lock(rec: &AccountRec) -> Res {
+        let now = now_unix();
+        if rec.locked_until > now {
+            return Err(format!("Too many wrong tries: this account is locked for {} more minutes", (rec.locked_until - now) / 60 + 1));
+        }
+        Ok(())
+    }
+
+    /// A code from the authenticator app, or an unused recovery code (used up here).
+    /// True if it was right; the record is updated (not saved).
+    fn second_factor(rec: &mut AccountRec, code: &str) -> bool {
+        if let Some(secret) = rec.totp.clone() {
+            if let Some(step) = crate::accounts::check_totp(&secret, code, now_unix(), rec.totp_last_step) {
+                rec.totp_last_step = step;
+                return true;
+            }
+        }
+        let h = crate::accounts::sha256_hex(&crate::accounts::normalize_code(code));
+        if let Some(i) = rec.recovery.iter().position(|r| crate::accounts::same(r, &h)) {
+            rec.recovery.remove(i);
+            return true;
+        }
+        false
+    }
+
+    /// Signs a session in (after the checks) and tells its client.
+    fn signed_in(&self, st: &mut State, me: ClientId, mfa: bool) {
+        if let Some(s) = st.sessions.get_mut(&me) {
+            s.signed_in = true;
+            s.mfa_ok = mfa;
+            info!("{} signed in to their account{}", s.info.nickname, if mfa { " (with MFA)" } else { "" });
+        }
+        self.send_account_state(st, me);
+    }
+
+    fn send_account_state(&self, st: &State, me: ClientId) {
+        if let Some(s) = st.sessions.get(&me) {
+            if s.client_at_least("1.33.0") {
+                s.tx.send(Out::Msg(self.account_state(st, s)));
+            }
+        }
+    }
+
+    /// Account and hidden-channel messages (1.25.0+).
+    pub(crate) fn dispatch_accounts(&self, st: &mut State, me: ClientId, msg: C2S) -> Res {
+        use crate::accounts as acc;
+        let now = now_unix();
+        match msg {
+            C2S::SetChannelHidden { channel, groups } => {
+                let s = st.session(me)?;
+                let perms = st.server_perms(s);
+                self.need(perms, perm::CHANNEL_EDIT)?;
+                let Some(rec) = st.channels.get(&channel) else { return Err("Channel not found".into()) };
+                // Newcomers are put there: it must stay visible.
+                if rec.info.is_default && !groups.is_empty() {
+                    return Err("The default channel cannot be hidden".into());
+                }
+                let mut groups: Vec<GroupId> = groups.into_iter().filter(|g| st.groups.get(g).is_some_and(|g| g.kind == GroupKind::Server)).collect();
+                groups.sort();
+                groups.dedup();
+                // Not a group of your own (you would lose the channel), and not a group
+                // with permissions you lack.
+                if groups.iter().any(|g| s.info.server_groups.contains(g)) {
+                    return Err("You cannot hide a channel from a group you are in".into());
+                }
+                if groups.iter().any(|g| st.group_perms(*g) & !perms != 0) {
+                    return Err("You cannot hide a channel from a group with permissions you do not have".into());
+                }
+                let by = s.info.nickname.clone();
+                if groups.is_empty() {
+                    st.hidden.remove(&channel);
+                } else {
+                    st.hidden.insert(channel, groups);
+                }
+                let list: Vec<(ChannelId, Vec<GroupId>)> = st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect();
+                db(self.store.save_hidden_channels(&list))?;
+                info!("{by} changed who does not see channel {channel}");
+                let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.33.0") && st.server_perms(x) & perm::CHANNEL_EDIT != 0).map(|x| x.info.id).collect();
+                for c in to {
+                    st.send(c, S2C::HiddenChannels(list.clone()));
+                }
+                Ok(())
+            }
+            C2S::SetAccountPolicy(p) => {
+                let s = st.session(me)?;
+                self.need(st.server_perms(s), perm::SERVER_EDIT)?;
+                // Turning accounts on for staff must not lock out the one doing it.
+                let raw = st.raw_server_perms(s);
+                let staff = st.is_staff(raw);
+                let requires = matches!(p.mode, AccountMode::Required) || (matches!(p.mode, AccountMode::RequiredForStaff) && staff);
+                if requires && !s.signed_in {
+                    return Err("Make an account and sign in first (you would lose your own permissions)".into());
+                }
+                if requires && staff && p.mfa_for_staff && !s.mfa_ok {
+                    return Err("Set up an authenticator app (MFA) and sign in with it first (you would lose your own permissions)".into());
+                }
+                let p = AccountPolicy { email_reset: false, ..p };
+                db(self.store.save_account_policy(&p))?;
+                info!("{} set the account rules to {:?} (MFA for staff: {})", s.info.nickname, p.mode, p.mfa_for_staff);
+                st.account_policy = p;
+                let policy = self.policy_for_clients(st);
+                let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.33.0")).map(|x| x.info.id).collect();
+                for c in to {
+                    st.send(c, S2C::AccountPolicy(policy));
+                    self.send_account_state(st, c);
+                }
+                Ok(())
+            }
+            C2S::CreateAccount { username, password, email } => {
+                if st.account_policy.mode == AccountMode::Off {
+                    return Err("This server does not use accounts".into());
+                }
+                let uid = st.session(me)?.info.uid.clone();
+                if db(self.store.account(&uid))?.is_some() {
+                    return Err("You already have an account here: sign in instead".into());
+                }
+                let username = username.trim().to_string();
+                if !valid_username(&username) {
+                    return Err("A username has 3 to 32 letters, digits, dots, dashes or underscores".into());
+                }
+                if !valid_account_password(&password) {
+                    return Err("A password needs at least 10 characters".into());
+                }
+                let email = email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+                if email.as_deref().is_some_and(|e| !acc::valid_email(e)) {
+                    return Err("That email address does not look right".into());
+                }
+                let rec = AccountRec { username: username.clone(), password_hash: self.pw_hash(&password), email, created: now, ..Default::default() };
+                self.save_account(&uid, &rec)?;
+                info!("{uid} made the account {username}");
+                self.signed_in(st, me, false);
+                Ok(())
+            }
+            C2S::SignIn { username, password, code, remember } => {
+                let s = st.session(me)?;
+                let uid = s.info.uid.clone();
+                let wrong = "Wrong username or password (or the account belongs to another identity)";
+                let owner = db(self.store.account_uid(username.trim()))?;
+                let Some(mut rec) = db(self.store.account(&uid))?.filter(|_| owner.as_deref() == Some(uid.as_str())) else {
+                    return Err(wrong.into());
+                };
+                Self::check_lock(&rec)?;
+                if !self.pw_verified(&password, &rec.password_hash) {
+                    return self.account_failed(&uid, rec, wrong);
+                }
+                let mut mfa = false;
+                if rec.totp.is_some() {
+                    match code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                        None => return Err("Enter the code from your authenticator app (or a recovery code)".into()),
+                        Some(c) if Self::second_factor(&mut rec, c) => mfa = true,
+                        Some(_) => return self.account_failed(&uid, rec, "That code is not right"),
+                    }
+                }
+                rec.failures = 0;
+                if remember {
+                    let token = acc::new_token();
+                    rec.tokens.retain(|(_, until)| *until > now);
+                    rec.tokens.push((acc::sha256_hex(&token), now + TOKEN_DAYS * 86_400));
+                    // At most 10 remembered devices: the oldest go.
+                    if rec.tokens.len() > 10 {
+                        let extra = rec.tokens.len() - 10;
+                        rec.tokens.drain(..extra);
+                    }
+                    st.send(me, S2C::AccountToken(token));
+                }
+                self.save_account(&uid, &rec)?;
+                self.signed_in(st, me, mfa);
+                Ok(())
+            }
+            C2S::ResumeAccount(token) => {
+                let uid = st.session(me)?.info.uid.clone();
+                let Some(mut rec) = db(self.store.account(&uid))? else { return Err("This device's sign-in has expired: sign in again".into()) };
+                let h = acc::sha256_hex(token.trim());
+                rec.tokens.retain(|(_, until)| *until > now);
+                if !rec.tokens.iter().any(|(t, _)| acc::same(t, &h)) {
+                    let _ = self.save_account(&uid, &rec);
+                    return Err("This device's sign-in has expired: sign in again".into());
+                }
+                self.save_account(&uid, &rec)?;
+                // A device is only remembered after a full sign-in (with MFA if it is on).
+                let mfa = rec.totp.is_some();
+                self.signed_in(st, me, mfa);
+                Ok(())
+            }
+            C2S::SignOut(token) => {
+                if let (Some(t), Ok((uid, mut rec))) = (token, self.my_account(st, me)) {
+                    let h = acc::sha256_hex(t.trim());
+                    rec.tokens.retain(|(x, _)| !acc::same(x, &h));
+                    self.save_account(&uid, &rec)?;
+                }
+                if let Some(s) = st.sessions.get_mut(&me) {
+                    s.signed_in = false;
+                    s.mfa_ok = false;
+                }
+                self.send_account_state(st, me);
+                Ok(())
+            }
+            C2S::ChangePassword { old, new } => {
+                let (uid, mut rec) = self.my_account(st, me)?;
+                Self::check_full_sign_in(st, me, &rec)?;
+                Self::check_lock(&rec)?;
+                if !self.pw_verified(&old, &rec.password_hash) {
+                    return self.account_failed(&uid, rec, "Your current password is not right");
+                }
+                if !valid_account_password(&new) {
+                    return Err("A password needs at least 10 characters".into());
+                }
+                rec.password_hash = self.pw_hash(&new);
+                // Other remembered devices must sign in again.
+                rec.tokens.clear();
+                rec.failures = 0;
+                self.save_account(&uid, &rec)?;
+                st.send(me, S2C::Notice("Your password was changed. Other devices must sign in again.".into()));
+                self.send_account_state(st, me);
+                Ok(())
+            }
+            C2S::SetEmail { password, email } => {
+                let (uid, mut rec) = self.my_account(st, me)?;
+                Self::check_full_sign_in(st, me, &rec)?;
+                Self::check_lock(&rec)?;
+                if !self.pw_verified(&password, &rec.password_hash) {
+                    return self.account_failed(&uid, rec, "Your password is not right");
+                }
+                let email = email.map(|e| e.trim().to_string()).filter(|e| !e.is_empty());
+                if email.as_deref().is_some_and(|e| !acc::valid_email(e)) {
+                    return Err("That email address does not look right".into());
+                }
+                rec.email = email;
+                rec.failures = 0;
+                self.save_account(&uid, &rec)?;
+                self.send_account_state(st, me);
+                Ok(())
+            }
+            C2S::StartMfa => {
+                let (uid, mut rec) = self.my_account(st, me)?;
+                Self::check_full_sign_in(st, me, &rec)?;
+                if rec.totp.is_some() {
+                    return Err("You already use an authenticator app: turn it off first to change it".into());
+                }
+                let secret = acc::new_totp_secret();
+                let issuer = format!("Voxa {}", st.settings.name);
+                let uri = acc::otpauth_uri(&issuer, &rec.username, &secret);
+                st.send(me, S2C::MfaSetup { secret: acc::base32(&secret), uri });
+                rec.totp_pending = Some(secret);
+                self.save_account(&uid, &rec)?;
+                Ok(())
+            }
+            C2S::ConfirmMfa(code) => {
+                let (uid, mut rec) = self.my_account(st, me)?;
+                let Some(secret) = rec.totp_pending.clone() else { return Err("Start adding the authenticator app first".into()) };
+                let Some(step) = acc::check_totp(&secret, &code, now, 0) else {
+                    return Err("That code is not right: check the time on your phone and try the newest code".into());
+                };
+                rec.totp = Some(secret);
+                rec.totp_pending = None;
+                rec.totp_last_step = step;
+                // Devices remembered before MFA must sign in with it.
+                rec.tokens.clear();
+                let (codes, hashes) = acc::new_recovery_codes();
+                rec.recovery = hashes;
+                self.save_account(&uid, &rec)?;
+                info!("{} added an authenticator app to their account", rec.username);
+                st.send(me, S2C::RecoveryCodes(codes));
+                if let Some(s) = st.sessions.get_mut(&me) {
+                    s.mfa_ok = true;
+                }
+                self.send_account_state(st, me);
+                Ok(())
+            }
+            C2S::DisableMfa { password, code } => {
+                let (uid, mut rec) = self.my_account(st, me)?;
+                Self::check_full_sign_in(st, me, &rec)?;
+                Self::check_lock(&rec)?;
+                if !self.pw_verified(&password, &rec.password_hash) {
+                    return self.account_failed(&uid, rec, "Your password is not right");
+                }
+                if !Self::second_factor(&mut rec, &code) {
+                    return self.account_failed(&uid, rec, "That code is not right");
+                }
+                rec.totp = None;
+                rec.totp_pending = None;
+                rec.recovery.clear();
+                rec.failures = 0;
+                self.save_account(&uid, &rec)?;
+                info!("{} turned off the authenticator app of their account", rec.username);
+                if let Some(s) = st.sessions.get_mut(&me) {
+                    s.mfa_ok = false;
+                }
+                self.send_account_state(st, me);
+                Ok(())
+            }
+            C2S::NewRecoveryCodes { password } => {
+                let (uid, mut rec) = self.my_account(st, me)?;
+                Self::check_full_sign_in(st, me, &rec)?;
+                Self::check_lock(&rec)?;
+                if !self.pw_verified(&password, &rec.password_hash) {
+                    return self.account_failed(&uid, rec, "Your password is not right");
+                }
+                if rec.totp.is_none() {
+                    return Err("Recovery codes come with an authenticator app: add one first".into());
+                }
+                let (codes, hashes) = acc::new_recovery_codes();
+                rec.recovery = hashes;
+                rec.failures = 0;
+                self.save_account(&uid, &rec)?;
+                st.send(me, S2C::RecoveryCodes(codes));
+                self.send_account_state(st, me);
+                Ok(())
+            }
+            C2S::RequestReset { username } => {
+                let answer = "If that account has an email address, a reset code is on its way (it works for 15 minutes).";
+                if !acc::smtp_configured(&self.cfg) {
+                    return Err("This server cannot send email: use one of your recovery codes instead".into());
+                }
+                st.spend_chat(me)?;
+                let Some(uid) = db(self.store.account_uid(username.trim()))? else {
+                    st.send(me, S2C::Notice(answer.into()));
+                    return Ok(());
+                };
+                let Some(mut rec) = db(self.store.account(&uid))? else { return Ok(()) };
+                let Some(to) = rec.email.clone() else {
+                    st.send(me, S2C::Notice(answer.into()));
+                    return Ok(());
+                };
+                // At most 3 emails an hour per account.
+                if now.saturating_sub(rec.reset_sent.1) > 3600 {
+                    rec.reset_sent = (0, now);
+                }
+                if rec.reset_sent.0 >= 3 {
+                    st.send(me, S2C::Notice(answer.into()));
+                    return Ok(());
+                }
+                rec.reset_sent.0 += 1;
+                let code = acc::new_reset_code();
+                rec.reset = Some((acc::sha256_hex(&code), now + 15 * 60, 0));
+                self.save_account(&uid, &rec)?;
+                let cfg = self.cfg.clone();
+                let server = st.settings.name.clone();
+                let user = rec.username.clone();
+                tokio::task::spawn_blocking(move || {
+                    let body = format!(
+                        "Someone asked to reset the password of the account {user} on the Voxa server {server}.\n\nYour reset code: {code}\n\nIt works for 15 minutes. If this was not you, you can ignore this email: your password has not changed.\n"
+                    );
+                    if let Err(e) = acc::send_mail(&cfg, &to, &format!("Voxa password reset for {server}"), &body) {
+                        warn!("could not send the reset email: {e}");
+                    }
+                });
+                st.send(me, S2C::Notice(answer.into()));
+                Ok(())
+            }
+            C2S::ResetPassword { username, code, password } => {
+                let wrong = "That reset code or recovery code is not right";
+                // Anyone may try this for any username: wrong codes are rate limited but do not
+                // lock the account (that would let strangers lock its owner out).
+                st.spend_chat(me)?;
+                let Some(uid) = db(self.store.account_uid(username.trim()))? else { return Err(wrong.into()) };
+                let Some(mut rec) = db(self.store.account(&uid))? else { return Err(wrong.into()) };
+                if !valid_account_password(&password) {
+                    return Err("A password needs at least 10 characters".into());
+                }
+                let digest = acc::sha256_hex(&acc::normalize_code(&code));
+                let by_email = match &mut rec.reset {
+                    Some((h, until, tries)) if *until > now && *tries < 5 => {
+                        *tries += 1;
+                        acc::same(h, &acc::sha256_hex(code.trim()))
+                    }
+                    _ => false,
+                };
+                let by_recovery = !by_email && rec.recovery.iter().position(|r| acc::same(r, &digest)).map(|i| rec.recovery.remove(i)).is_some();
+                if !by_email && !by_recovery {
+                    let _ = self.save_account(&uid, &rec);
+                    return Err(wrong.into());
+                }
+                rec.password_hash = self.pw_hash(&password);
+                rec.reset = None;
+                rec.tokens.clear();
+                rec.failures = 0;
+                rec.locked_until = 0;
+                self.save_account(&uid, &rec)?;
+                info!("the password of account {} was reset ({})", rec.username, if by_email { "email" } else { "recovery code" });
+                st.send(me, S2C::Notice("Your password was reset. Sign in with the new one.".into()));
+                self.send_account_state(st, me);
+                Ok(())
+            }
+            _ => Err("Unexpected message".into()),
+        }
     }
 }
 
