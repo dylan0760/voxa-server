@@ -133,6 +133,8 @@ pub struct State {
     pub account_policy: AccountPolicy,
     /// Channels hidden from server groups (1.25.0+).
     pub hidden: HashMap<ChannelId, Vec<GroupId>>,
+    /// Which identity owns each nickname, also while offline (1.26.0+).
+    pub names: crate::names::NameIndex,
 }
 
 pub struct Server {
@@ -854,6 +856,10 @@ impl Server {
                 options: store.server_options()?.unwrap_or_default(),
                 account_policy: store.account_policy()?,
                 hidden: store.hidden_channels()?.into_iter().collect(),
+                names: {
+                    let people = store.all_clients()?;
+                    crate::names::NameIndex::build(people.iter().map(|c| (c.uid.as_str(), c.nickname.as_str(), c.last_seen)))
+                },
             file_limits: store.load_file_limits()?.unwrap_or(FileLimits {
                     max_upload_mb: cfg.max_upload_mb,
                     channel_quota_mb: cfg.channel_quota_mb,
@@ -1171,7 +1177,9 @@ impl Server {
                 st = self.state.lock();
             }
         }
-        let nickname = self.unique_nickname(&st, &sanitize_nick(&nickname), None);
+        let wanted = sanitize_nick(&nickname);
+        let nickname = self.unique_nickname(&st, &wanted, &uid);
+        let renamed = (nickname != wanted).then(|| wanted.clone());
         let id = (1..=u16::MAX).find(|i| !st.sessions.contains_key(i)).ok_or("No free client slots")?;
 
         // Join options (stay out of channels, invisible), then the channel path.
@@ -1209,6 +1217,7 @@ impl Server {
         record.connections += 1;
         record.last_ip = ip.to_string();
         db(self.store.save_client(&record))?;
+        st.names.set(&uid, &record.nickname);
 
         let info = ClientInfo {
             id,
@@ -1225,8 +1234,8 @@ impl Server {
             talk_request: None,
             commander: false,
             streaming: None,
-            platform: platform.chars().take(32).collect(),
-            version: version.chars().take(32).collect(),
+            platform: client_platform(&platform, web),
+            version: clean_line(&version, 32),
             connected_at: now_unix(),
         };
         let voice_key: [u8; 32] = crate::secrets::random_bytes();
@@ -1252,6 +1261,12 @@ impl Server {
             bulk_token,
         };
         tx.send(Out::Msg(welcome));
+        if let Some(w) = &renamed {
+            tx.send(Out::Msg(S2C::Notice(format!(
+                "The name \"{w}\" belongs to someone else on this server, so you joined as \"{}\". Choose another name with Change nickname.",
+                info.nickname
+            ))));
+        }
         let extra_perms = self.store.client_perms(&uid).unwrap_or(0);
         if !voxa_proto::update::is_newer("1.4.0", &info.version) {
             tx.send(Out::Msg(S2C::YourPerms(extra_perms)));
@@ -1269,7 +1284,13 @@ impl Server {
         }
         // Whose cameras are on (Voxa 1.29.0+).
         if !voxa_proto::update::is_newer("1.29.0", &info.version) {
-            let cams: Vec<(ClientId, CameraInfo)> = st.sessions.values().filter_map(|x| x.camera.map(|c| (x.info.id, c))).collect();
+            // Only people the newcomer can see (not invisible people or hidden channels).
+            let cams: Vec<(ClientId, CameraInfo)> = st
+                .sessions
+                .values()
+                .filter(|x| (!x.hidden() || viewer_admin) && visible(x.info.channel))
+                .filter_map(|x| x.camera.map(|c| (x.info.id, c)))
+                .collect();
             tx.send(Out::Msg(S2C::Cameras(cams)));
         }
         // Group chats, then the group messages that arrived while this person was offline.
@@ -1370,14 +1391,21 @@ impl Server {
         Ok(id)
     }
 
-    fn unique_nickname(&self, st: &State, nick: &str, except: Option<ClientId>) -> String {
-        let taken = |n: &str| {
-            st.sessions.values().any(|s| Some(s.info.id) != except && s.info.nickname.eq_ignore_ascii_case(n))
-        };
-        if !taken(nick) {
+    /// Whether `nick` (or a look-alike) belongs to another identity: someone online, or
+    /// someone the server knows who is offline. Your own other sessions do not count.
+    fn name_taken(st: &State, nick: &str, uid: &str) -> bool {
+        let sk = crate::names::skeleton(nick);
+        st.sessions.values().any(|s| s.info.uid != uid && crate::names::skeleton(&s.info.nickname) == sk)
+            || st.names.owner_other_than(nick, uid).is_some()
+    }
+
+    /// `nick`, or the first free numbered variant ("Name2", "Name3", ...).
+    fn unique_nickname(&self, st: &State, nick: &str, uid: &str) -> String {
+        if !Self::name_taken(st, nick, uid) {
             return nick.to_string();
         }
-        (1..).map(|i| format!("{nick}{i}")).find(|n| !taken(n)).unwrap()
+        let base: String = nick.chars().take(27).collect();
+        (2..).map(|i| format!("{base}{i}")).find(|n| !Self::name_taken(st, n, uid)).unwrap()
     }
 
     fn find_ban(&self, uid: Option<&str>, ip: Option<IpAddr>) -> Option<BanEntry> {
@@ -1476,10 +1504,11 @@ impl Server {
                 return;
             }
             next = c.info.parent;
+            // Told to those who could see it (before it is gone and can't be checked).
+            st.broadcast_seen(ch, S2C::ChannelDeleted(ch));
             st.channels.remove(&ch);
             let _ = self.store.delete_channel(ch);
             crate::files::delete_channel_files(&self.data_dir, ch);
-            st.broadcast(S2C::ChannelDeleted(ch));
         if st.hidden.remove(&ch).is_some() {
             let list: Vec<(ChannelId, Vec<GroupId>)> = st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect();
             let _ = self.store.save_hidden_channels(&list);
@@ -1615,6 +1644,9 @@ impl Server {
                 let s = st.session(me)?;
                 let t = st.session(target)?;
                 self.need(self.perms_in(st, s, t.info.channel), perm::TALK_POWER_GRANT)?;
+                if target != me {
+                    self.check_outranks(st, s, t)?;
+                }
                 let t = st.sessions.get_mut(&target).unwrap();
                 t.info.is_talker = talker;
                 t.info.talk_request = None;
@@ -1625,6 +1657,7 @@ impl Server {
                 let s = st.session(me)?;
                 if target != me {
                     self.need(st.server_perms(s), perm::CLIENT_DESCRIPTION_EDIT)?;
+                    self.check_outranks(st, s, st.session(target)?)?;
                 }
                 let t = st.sessions.get_mut(&target).ok_or("Client not found")?;
                 t.info.description = clean_text(&description, 200);
@@ -2004,6 +2037,9 @@ impl Server {
                 if db(self.store.get_client(&uid))?.is_none() {
                     return Err("Unknown client".into());
                 }
+                if uid != s.info.uid {
+                    Self::outranks(mine, self.perms_of_uid(st, &uid))?;
+                }
                 db(self.store.set_client_perms(&uid, perms))?;
                 let by = s.info.nickname.clone();
                 let affected: Vec<ClientId> = st.sessions.values().filter(|x| x.info.uid == uid).map(|x| x.info.id).collect();
@@ -2126,14 +2162,18 @@ impl Server {
             if n.is_empty() {
                 return Err("Invalid nickname".into());
             }
-            let taken = st.sessions.values().any(|s| s.info.id != me && s.info.nickname.eq_ignore_ascii_case(&n));
-            if taken {
-                return Err("Nickname is already in use".into());
+            let uid = st.session(me)?.info.uid.clone();
+            if Self::name_taken(st, &n, &uid) {
+                return Err(format!("\"{n}\" (or a name that looks like it) belongs to someone else on this server. Choose another nickname."));
             }
         }
         if u.commander == Some(true) {
             let s = st.session(me)?;
             self.need(self.perms_in(st, s, s.info.channel), perm::CHANNEL_COMMANDER)?;
+        }
+        if let Some(n) = &u.nickname {
+            let uid = st.session(me)?.info.uid.clone();
+            st.names.set(&uid, &sanitize_nick(n));
         }
         let s = st.sessions.get_mut(&me).ok_or("Client not found")?;
         if let Some(n) = u.nickname {
@@ -2250,6 +2290,15 @@ impl Server {
         self.cleanup_temporary(st, old);
     }
 
+    /// A hidden channel can't be used as a parent, and answers like one that doesn't
+    /// exist, so its number and its children's names can't be probed.
+    fn check_parent_visible(st: &State, s: &Session, parent: Option<ChannelId>) -> Res {
+        match parent {
+            Some(p) if !st.sees_channel(s, p) => Err("Parent channel not found".into()),
+            _ => Ok(()),
+        }
+    }
+
     fn validate_channel_edit(&self, st: &State, id: Option<ChannelId>, e: &mut ChannelEdit) -> Res {
         e.name = clean_line(&e.name, 40);
         if e.name.is_empty() {
@@ -2334,6 +2383,7 @@ impl Server {
         if st.channels.len() >= MAX_CHANNELS {
             return Err(format!("This server has the maximum of {MAX_CHANNELS} channels"));
         }
+        Self::check_parent_visible(st, s, e.parent)?;
         self.validate_channel_edit(st, None, &mut e)?;
         let uid = s.info.uid.clone();
         let id = db(self.store.next_id("next_channel"))?;
@@ -2480,6 +2530,9 @@ impl Server {
         let sp = st.server_perms(s);
         self.need(p, perm::CHANNEL_EDIT)?;
         let old = st.channels.get(&id).ok_or("Channel not found")?.info.clone();
+        if e.parent != old.parent {
+            Self::check_parent_visible(st, s, e.parent)?;
+        }
         if e.kind != old.kind {
             self.need(sp, Self::create_perm_for(e.kind))?;
         }
@@ -2555,11 +2608,16 @@ impl Server {
             st.broadcast_about(c, S2C::ClientMoved { id: c, channel: def, by: Some(by.clone()) });
             st.broadcast_client(c);
         }
-        for ch in tree {
+        // Who could see each channel, worked out before any of them is removed.
+        let told: Vec<(ChannelId, Vec<ClientId>)> =
+            tree.iter().map(|&ch| (ch, st.sessions.values().filter(|x| st.sees_channel(x, ch)).map(|x| x.info.id).collect())).collect();
+        for (ch, to) in told {
             st.channels.remove(&ch);
             db(self.store.delete_channel(ch))?;
             crate::files::delete_channel_files(&self.data_dir, ch);
-            st.broadcast(S2C::ChannelDeleted(ch));
+            for c in to {
+                st.send(c, S2C::ChannelDeleted(ch));
+            }
         if st.hidden.remove(&ch).is_some() {
             let list: Vec<(ChannelId, Vec<GroupId>)> = st.hidden.iter().map(|(c, g)| (*c, g.clone())).collect();
             let _ = self.store.save_hidden_channels(&list);
@@ -2940,6 +2998,12 @@ impl Server {
     }
 
     /// Server-wide permissions of an identity, online or not.
+    /// Whether an identity holds the server administrator right (Edit virtual server).
+    pub fn is_server_admin(&self, uid: &str) -> bool {
+        let st = self.state.lock();
+        self.perms_of_uid(&st, uid) & perm::SERVER_EDIT != 0
+    }
+
     fn perms_of_uid(&self, st: &State, uid: &str) -> u64 {
         if let Some(s) = st.sessions.values().find(|s| s.info.uid == uid) {
             return st.server_perms(s);
@@ -3338,6 +3402,10 @@ impl Server {
         if g.perms & !mine != 0 {
             return Err("You cannot assign groups with more permissions than you have".into());
         }
+        // Taking someone out of a group needs at least their rank (like kicks and bans).
+        if !add && uid != s.info.uid {
+            Self::outranks(mine, self.perms_of_uid(st, uid))?;
+        }
         self.apply_server_group(st, uid, group, add)
     }
 
@@ -3712,6 +3780,7 @@ impl Server {
         if !db(self.store.delete_client(&uid))? {
             return Err("Unknown user".into());
         }
+        st.names.remove(&uid);
         info!("{by} removed {} ({uid}) from the server", name.as_deref().unwrap_or("?"));
         st.send(me, S2C::Notice(format!("Removed {} from the server", name.as_deref().unwrap_or("them"))));
         let people = db(self.store.all_clients())?.into_iter().map(|c| Person { uid: c.uid, nickname: c.nickname, last_seen: c.last_seen }).collect();
@@ -3721,8 +3790,9 @@ impl Server {
 
     /// Tells everyone (Voxa 1.29.0+) that `id` turned their camera on or off.
     fn camera_changed(&self, st: &mut State, id: ClientId) {
-        let camera = st.sessions.get(&id).and_then(|s| s.camera);
-        let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.29.0")).map(|x| x.info.id).collect();
+        let Some(sub) = st.sessions.get(&id) else { return };
+        let camera = sub.camera;
+        let to: Vec<ClientId> = st.sessions.values().filter(|x| x.client_at_least("1.29.0") && st.sees(x, sub)).map(|x| x.info.id).collect();
         for c in to {
             st.send(c, S2C::CameraChanged { client: id, camera });
         }
@@ -4384,11 +4454,40 @@ pub fn clean_text(s: &str, max: usize) -> String {
     truncate(&s, max)
 }
 
+/// The platform shown for a session. "Web" marks the web admin page and is set by the
+/// server only, so an app cannot pass itself off as (or hide as) a web session.
+fn client_platform(claimed: &str, web: bool) -> String {
+    if web {
+        return "Web".into();
+    }
+    let p = clean_line(claimed, 32);
+    if p.is_empty() || p.eq_ignore_ascii_case("web") {
+        "Unknown".into()
+    } else {
+        p
+    }
+}
+
 fn sanitize_nick(n: &str) -> String {
     let n = clean_line(n, 30);
     if n.chars().count() < 1 {
         "Voxa User".into()
     } else {
         n
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::client_platform;
+
+    #[test]
+    fn apps_cannot_claim_to_be_the_web_page() {
+        assert_eq!(client_platform("Android", false), "Android");
+        assert_eq!(client_platform("Web", false), "Unknown");
+        assert_eq!(client_platform(" wEb ", false), "Unknown");
+        assert_eq!(client_platform("", false), "Unknown");
+        assert_eq!(client_platform("Windows", true), "Web");
+        assert!(client_platform(&"x".repeat(100), false).chars().count() <= 32);
     }
 }

@@ -189,10 +189,22 @@ The proxy must pass the original `Host` header (Nginx Proxy Manager does). If si
 says *"This sign-in was made for a different web address"*, the proxy rewrites it.
 
 To change the port or address, set `web_port` / `web_bind` in `server.toml`. To turn
-the page off, set `web_enabled = false`. For extra safety, list the exact address(es)
-the page may be signed in from, e.g.
-`web_allowed_origins = ["https://voxa-admin.example.com", "http://192.168.1.35:9980"]`.
-Restart the server after editing.
+the page off, set `web_enabled = false`.
+
+**Which web addresses may sign in** (1.26.0): a look-alike site could otherwise relay a
+sign-in that you approve in Voxa. So the page only accepts sign-ins made for its own
+address:
+* If `web_allowed_origins` lists addresses, exactly those, e.g.
+  `web_allowed_origins = ["https://voxa-admin.example.com", "http://192.168.1.35:9980"]`.
+* If it is empty (the default), the address the **first server administrator** signs in
+  from is remembered in `web_origin.txt` in the data folder, and only that address works
+  from then on. Until an administrator has signed in, any address works.
+* Using the page from a second address (e.g. on the local network and through your
+  domain)? List both in `web_allowed_origins`. Moved the page to a new address? Delete
+  `web_origin.txt` and sign in again as an administrator. A refused address shows
+  *"This web address is not allowed for this server's web page"*.
+
+Restart the server after editing `server.toml`.
 
 ## Client version
 With `require_latest_client = true` (the default in `server.toml`), the server only
@@ -221,6 +233,19 @@ their update window by themselves. To allow older clients, set
   * **Opus Music** (stereo, up to 192 kbit/s);
   * **Lossless** (16-bit 48 kHz stereo, bit exact). The server only forwards lossless
     audio to clients that can play it.
+* **Unique names** (1.26.0): each nickname belongs to one identity on the server, also
+  while its owner is offline, so nobody can take or imitate someone else's name.
+  * Names are compared ignoring case, accents, spaces and separators (`_ - .`), and
+    look-alike characters count as the same letter: Cyrillic and Greek letters that look
+    Latin, `I`/`l`/`1`/`|`, `0`/`O` and full-width letters. "DyIan", "Dylаn" (Cyrillic
+    а) and "dy_lan" all clash with "Dylan".
+  * Joining with a name that belongs to someone else gives you a numbered name
+    ("Dylan2") and a message explaining why; renaming to it is refused.
+  * A name is released when its owner changes name, or when an administrator removes
+    them from the server (People → Remove).
+  * Your own sessions (Voxa and the web page) can share your name.
+  * On a server upgraded from an older version where two identities already had the
+    same name, the one seen most recently keeps it.
 * **Groups and moderation:** server and channel groups with a permission editor,
   privilege keys, bans, kick, move, poke and channel commander.
   * Moderators can only kick, move or ban people who have no permissions the moderator
@@ -456,8 +481,10 @@ their update window by themselves. To allow older clients, set
   a hardware ban (like address bans).
 * **Web admin page:**
   * Sign-in by proof of identity (the key stays in the browser or in Voxa), bound to the
-    page's web address so phishing sites can't reuse it; optionally pinned to the
-    addresses in `web_allowed_origins`.
+    page's web address so phishing sites can't reuse it. The address must be one of
+    `web_allowed_origins`, or (when that is empty) the one the first administrator
+    signed in from (1.26.0; see [Web admin page](#web-admin-page)). The request's own
+    `Host` header is not trusted for this, because whoever sends it chooses it.
   * One-time challenges expire after 2 minutes; 10 failed sign-ins from one address
     lock it out for 10 minutes.
   * Signing in with Voxa always needs a click in Voxa, which shows the web address.
@@ -481,12 +508,30 @@ their update window by themselves. To allow older clients, set
   accepts the files it expects (no paths outside the data folder).
 * **Text:** names, topics and messages are cleaned of control characters and invisible
   direction-changing characters.
+* **Names can't be imitated** (1.26.0): see *Unique names* in [Features](#features).
+* **Files** (1.26.0):
+  * Paths are limited to 1024 characters, 32 folder levels and 255 characters per name,
+    checked before the disk is touched (a huge path used to keep the server busy).
+  * Each upload writes to its own randomly named partial file, and an upload number
+    that is already running is refused, so partial files can't pile up outside the
+    channel quota or overwrite each other.
+* **Rank** (1.26.0): granting talk power, editing someone's description, removing them
+  from a server group and changing their personal permissions need at least their rank,
+  like kicks, moves and bans.
+* **Hidden channels** (1.26.0): who has a camera on, deleted channels, and the answer to
+  creating or moving a channel under a hidden parent no longer reveal hidden channels or
+  the people in them.
+* **Platform:** the platform shown for a person (Windows, Android) is what their app
+  reports, cleaned and at most 32 characters. Only the server marks web admin page
+  sessions as "Web": an app that claims to be "Web" is shown as "Unknown", so it can't
+  pass itself off as (or hide among) web sessions.
 * **Video and calendars:** see [Features](#features); every limit and permission is
   checked by the server, not just by Voxa.
 
 ## Data & configuration
 Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
-`identity.key`, `chat.key`, `files\`, `logs\`, `status.json`, and the backup settings
+`identity.key`, `chat.key`, `files\`, `logs\`, `status.json`, `web_origin.txt` (the web
+page's remembered address), and the backup settings
 (`backup.json`, `backup.key`, `backup-status.json`).
 * Use [Backups](#backups) rather than copying the folder: the `.key` files only work on
   the same machine, and copying `voxa.db` while the server runs can catch it half-written.
@@ -506,7 +551,7 @@ Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
 | `web_enabled` | `true` | Serve the [web admin page](#web-admin-page) |
 | `web_bind` | `0.0.0.0` | Address the web admin page listens on |
 | `web_port` | `9980` | TCP port of the web admin page |
-| `web_allowed_origins` | `[]` | Web addresses the page may be signed in from (empty = any) |
+| `web_allowed_origins` | `[]` | Web addresses the page may be signed in from (empty = the first administrator's address, kept in `web_origin.txt`) |
 
 Restart the server after editing.
 
@@ -535,10 +580,16 @@ Tests:
 * `cargo test -p voxa-server -p voxa-proto` runs the unit tests.
 * End-to-end tests run against a running server, with
   `cargo run --release -p voxa-proto --example <name> -- 127.0.0.1:9987 <data dir>`:
-  `smoke`, `moderation_test`, `transfer_test`, `image_test` and `clone_test`.
+  `smoke`, `moderation_test`, `transfer_test`, `image_test`, `clone_test` and
+  `names_test` (unique names and the platform field) and `web_origin_test` (the web
+  page's address pin; needs the web page on, and a third argument with its address,
+  e.g. `127.0.0.1:9980`).
 * The client repository has more: `security_test`, `feature_test`, `spacer_test` and
   others. Build those from the client repository: they report the client's version,
   which the server's version check expects.
+* Start each test with a **fresh data folder**: the tests claim the one-time admin
+  privilege key, and names stay reserved between runs. `feature_test` also needs
+  `require_latest_client = true` (the others are easiest with `false`).
 
 ## Releasing an update
 1. Bump `version` in `Cargo.toml` and commit.
@@ -548,6 +599,13 @@ Tests:
 
 Release the matching Voxa client first. The server's `MIN_CLIENT_VERSION` (in
 `state.rs`) is the oldest client it accepts.
+
+### Test builds
+New work goes to the **`test` branch** first. A test build is published as a GitHub
+**pre-release** named `vX.Y.Z (test)`, made from the `test` branch. Pre-releases are not
+"latest", so installed servers and Voxa Server Manager do not offer them as updates;
+install them by hand from the release page. Once tested, merge `test` into `main` and
+publish the normal release.
 
 ## Protocol crate
 `crates/voxa-proto` is shared with [voxa-client](https://github.com/dylan0760/voxa-client).

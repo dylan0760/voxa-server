@@ -9,7 +9,9 @@
 //!   origin. Either the page computes it (the key is pasted and never leaves the browser)
 //!   or the installed Voxa client does (`voxa://web-login` link, after the user agrees),
 //!   handing the proof back to that origin in the user's own browser. Binding the origin
-//!   means a proof obtained by a look-alike site is useless on the real one.
+//!   means a proof obtained by a look-alike site is useless on the real one, provided the
+//!   origin is one this page really has: `web_allowed_origins`, or (1.26.0+) the address
+//!   of the first administrator sign-in, remembered in `web_origin.txt`.
 //! * A signed-in page is an ordinary session of that identity (shown with platform "Web",
 //!   no voice): every action goes through the same handler and permission checks as the
 //!   desktop client. Updates are streamed to the page with Server-Sent Events, actions
@@ -274,9 +276,23 @@ async fn login(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip:
     let proof = b64.decode(body.proof.trim()).ok().filter(|p| p.len() == 32);
     // The proof must be for this page's origin (a look-alike site gets a useless proof).
     let origin = body.origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    // The request's Host header is chosen by whoever sends it, so on its own it can't
+    // stop a look-alike site from replaying a proof made for itself. The address must
+    // also be allowed: `web_allowed_origins`, or else the address of the first
+    // administrator sign-in, remembered in the data folder (1.26.0+).
     let allowed = &server.cfg.web_allowed_origins;
-    let pinned_ok = allowed.is_empty() || allowed.iter().any(|a| a.trim().trim_end_matches('/').eq_ignore_ascii_case(&origin));
-    if !pinned_ok || !req.origins(proxied).contains(&origin) {
+    let learned = if allowed.is_empty() { learned_origin(server) } else { None };
+    let pinned_ok = if !allowed.is_empty() {
+        allowed.iter().any(|a| a.trim().trim_end_matches('/').eq_ignore_ascii_case(&origin))
+    } else {
+        learned.as_deref().map(|l| l == origin).unwrap_or(true)
+    };
+    if !pinned_ok {
+        fail(web);
+        warn!("web: sign-in from {ip} for {origin:?}, which is not an allowed address of this web page (add it to web_allowed_origins in server.toml)");
+        return json(s, "403 Forbidden", &[], &refuse("This web address is not allowed for this server's web page. An administrator can add it to web_allowed_origins in server.toml.")).await;
+    }
+    if !req.origins(proxied).contains(&origin) {
         fail(web);
         warn!("web: sign-in from {ip} for origin {origin:?}, but this page is {:?} (a reverse proxy must pass the original Host header)", req.origins(proxied));
         return json(s, "403 Forbidden", &[], &refuse("This sign-in was made for a different web address")).await;
@@ -304,6 +320,13 @@ async fn login(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip:
         if let Err(e) = checked {
             fail(web);
             return json(s, "403 Forbidden", &[], &refuse(&e)).await;
+        }
+    }
+    // The first administrator to sign in fixes the page's address (see above).
+    if allowed.is_empty() && learned.is_none() && server.is_server_admin(&uid) {
+        match std::fs::write(server.data_dir.join(ORIGIN_FILE), &origin) {
+            Ok(()) => info!("web: the web page's address is now {origin} (signed in by an administrator); other addresses need web_allowed_origins"),
+            Err(e) => warn!("web: could not save the web page's address: {e}"),
         }
     }
     // Nickname and channel: as given, else what this identity used last time.
@@ -712,6 +735,16 @@ async fn read_request(s: &mut TcpStream) -> Option<Request> {
     }
     body.truncate(len);
     Some(Request { method, path, query, headers, body })
+}
+
+/// Where the web page's address is remembered when `web_allowed_origins` is empty.
+/// Delete the file to let the next administrator sign-in set it again.
+const ORIGIN_FILE: &str = "web_origin.txt";
+
+fn learned_origin(server: &Server) -> Option<String> {
+    let s = std::fs::read_to_string(server.data_dir.join(ORIGIN_FILE)).ok()?;
+    let s = s.trim().trim_end_matches('/').to_ascii_lowercase();
+    (!s.is_empty()).then_some(s)
 }
 
 /// The visitor's address. Behind a reverse proxy on this PC or the local network the

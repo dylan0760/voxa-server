@@ -17,6 +17,11 @@ fn is_device_name(part: &str) -> bool {
             && stem[3..].chars().all(|c| c.is_ascii_digit() || "¹²³".contains(c)))
 }
 
+/// Limits on client supplied file paths (bytes, folder levels, bytes per name).
+pub const MAX_PATH_LEN: usize = 1024;
+pub const MAX_DEPTH: usize = 32;
+pub const MAX_NAME_LEN: usize = 255;
+
 /// True if the path exists and is a symbolic link, junction or other reparse point.
 fn is_link(p: &Path) -> bool {
     let Ok(m) = std::fs::symlink_metadata(p) else { return false };
@@ -34,12 +39,21 @@ fn is_link(p: &Path) -> bool {
 /// Resolves a client supplied relative path safely inside the channel root. Links and
 /// junctions on the way are refused, so nothing outside the data folder can be reached.
 pub fn resolve(data: &Path, ch: ChannelId, rel: &str) -> Result<PathBuf, String> {
+    // Checked before touching the disk: every part costs a file system lookup, so an
+    // enormous path ("a/a/a/...") would otherwise keep the server busy for minutes.
+    if rel.len() > MAX_PATH_LEN {
+        return Err("Path too long".into());
+    }
+    let parts: Vec<&str> = rel.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    if parts.len() > MAX_DEPTH || parts.iter().any(|p| p.len() > MAX_NAME_LEN) {
+        return Err("Path too long".into());
+    }
     let files = data.join("files");
     let mut p = channel_root(data, ch);
     if is_link(&files) || is_link(&p) {
         return Err("Invalid path".into());
     }
-    for part in rel.split(['/', '\\']).filter(|s| !s.is_empty()) {
+    for part in parts {
         if part == "." || part == ".." || part.contains(':') || part.chars().any(|c| c.is_control() || "<>\"|?*".contains(c)) {
             return Err("Invalid path".into());
         }
@@ -128,6 +142,17 @@ mod tests {
         for ok in ["a.txt", "dir/sub/file", "console.log", "com10", r"\\server\share\x"] {
             assert!(resolve(data, 1, ok).unwrap().starts_with(r"C:\data\files\channel_1"), "{ok:?}");
         }
+    }
+
+    #[test]
+    fn resolve_refuses_huge_paths_quickly() {
+        let data = Path::new(r"C:\data");
+        let started = std::time::Instant::now();
+        assert!(resolve(data, 1, &"a/".repeat(500_000)).is_err(), "1 MB path");
+        assert!(resolve(data, 1, &"a/".repeat(MAX_DEPTH + 1)).is_err(), "too deep");
+        assert!(resolve(data, 1, &"x".repeat(MAX_NAME_LEN + 1)).is_err(), "name too long");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "checked before any disk access");
+        assert!(resolve(data, 1, &"a/".repeat(MAX_DEPTH)).is_ok());
     }
 
     /// A junction in the channel folder (made by someone with access to the data

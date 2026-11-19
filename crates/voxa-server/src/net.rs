@@ -288,6 +288,10 @@ async fn bulk(
             BulkC2S::UploadBegin { id: tid, channel, path, size, overwrite } => {
                 let res = if uploads.len() >= MAX_UPLOADS {
                     Err(format!("At most {MAX_UPLOADS} uploads can run at the same time"))
+                } else if uploads.contains_key(&tid) {
+                    // Replacing a running upload would leave its partial file behind,
+                    // hidden from listings and outside the quota.
+                    Err("That upload is already running".to_string())
                 } else {
                     begin_upload(&server, id, channel, &path, size, overwrite).await
                 };
@@ -460,10 +464,13 @@ async fn begin_upload(
     if let Some(parent) = target.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
     }
+    // A temp file of its own per upload, so two uploads of the same file can't write
+    // into each other. `create_new` never reuses or follows an existing file.
+    let tag: [u8; 6] = crate::secrets::random_bytes();
     let mut temp = target.clone().into_os_string();
-    temp.push(".voxa-part");
+    temp.push(format!(".{}.voxa-part", tag.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let temp = PathBuf::from(temp);
-    let file = tokio::fs::File::create(&temp).await.map_err(|e| format!("Cannot create file: {e}"))?;
+    let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await.map_err(|e| format!("Cannot create file: {e}"))?;
     Ok(Upload { file, temp, target, remaining: size, _space: space })
 }
 
