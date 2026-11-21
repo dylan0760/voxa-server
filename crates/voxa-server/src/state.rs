@@ -1756,6 +1756,10 @@ impl Server {
                     GroupKind::Channel => {
                         let mut v = Vec::new();
                         for (uid, ch) in db(self.store.channel_group_members(g))? {
+                            // Not in channels hidden from the asker (they would show its name).
+                            if !st.sees_channel(s, ch) {
+                                continue;
+                            }
                             let nick = self.store.get_client(&uid).ok().flatten().map(|c| c.nickname).unwrap_or_default();
                             let cname = st.channels.get(&ch).map(|c| c.info.name.clone()).unwrap_or_default();
                             v.push(GroupMember { online: online.contains(uid.as_str()), uid, name: format!("{nick} ({cname})") });

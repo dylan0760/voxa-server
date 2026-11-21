@@ -420,7 +420,8 @@ their update window by themselves. To allow older clients, set
   from** picks server groups that don't see a channel. For them the channel, its
   sub-channels, the people in it, its chat, pictures, files and calendar don't exist.
   Everything about it is left out of what they are sent (also as a meeting place in the
-  server calendar, 1.26.1), and asking for it by number gets "Channel not found" (or
+  server calendar, 1.26.1, and as a member's channel in a channel group's member list,
+  1.26.2), and asking for it by number gets "Channel not found" (or
   "Image not found" for its pictures).
   * A new permission, **See channels**: a group without it only sees the channel it is
     in. Every server group gets it when the server updates, so nothing changes until you
