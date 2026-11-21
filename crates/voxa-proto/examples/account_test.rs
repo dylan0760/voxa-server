@@ -198,6 +198,8 @@ async fn main() {
     println!("8. hidden from members: Bob lost the channel and Alice; joining it: \"{}\"", error(&mut bob).await);
     bob.w.send(&C2S::FetchHistory { target: TextTarget::Channel(secret_ch), before: None, limit: 10 }).await.unwrap();
     println!("8. reading its chat: \"{}\"", error(&mut bob).await);
+    bob.w.send(&C2S::GetCalendar(secret_ch)).await.unwrap();
+    println!("8. opening its calendar: \"{}\"", error(&mut bob).await);
     let bob2 = login(&addr, &KeyPair::generate(), "Bob2").await;
     assert!(!bob2.channels.contains(&secret_ch), "a newcomer was told about the hidden channel");
     assert!(!bob2.welcome.iter().any(|m| matches!(m, S2C::ClientJoined(c) if c.id == aid)));

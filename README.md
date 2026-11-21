@@ -152,7 +152,8 @@ Obsidian) and the two-tone ones where one colour blends into another.
   * use the 🌴 Vice City theme (1.23.0), like Voxa's, or **Your picture** (1.24.0): a
     picture of yours behind the see-through panels, kept in that browser only (shrunk
     to 1920 pixels and stored as JPEG in the browser's storage, never sent to the
-    server);
+    server). Its **Choose picture** and **Remove picture** buttons follow the theme
+    (1.26.1; before, they stayed light grey and were hard to read on dark themes);
   * find a permission with the 🔍 search above the permission list (1.22.0): every word
     you type must appear in the permission's name, in any order; the ticks of hidden
     permissions are kept;
@@ -417,8 +418,10 @@ their update window by themselves. To allow older clients, set
   * Removing someone from the server deletes their account too.
 * **Hidden channels** (1.25.1, Voxa 1.33.1 and the web page): **Edit Channel → Hidden
   from** picks server groups that don't see a channel. For them the channel, its
-  sub-channels, the people in it and its chat don't exist. Everything about it is left
-  out of what they are sent, and asking for it by number gets "Channel not found".
+  sub-channels, the people in it, its chat, pictures, files and calendar don't exist.
+  Everything about it is left out of what they are sent (also as a meeting place in the
+  server calendar, 1.26.1), and asking for it by number gets "Channel not found" (or
+  "Image not found" for its pictures).
   * A new permission, **See channels**: a group without it only sees the channel it is
     in. Every server group gets it when the server updates, so nothing changes until you
     change it.

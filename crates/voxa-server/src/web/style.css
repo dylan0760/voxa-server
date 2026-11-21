@@ -83,6 +83,9 @@
 }
 .own-bg-row { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
 .own-bg-controls { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+/* A button without a class still follows the theme (never the browser's light grey). */
+button:not([class]) { background: var(--card); color: var(--text); border: 1px solid var(--control-line); border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+button:not([class]):hover { background: var(--hover); }
 :root { --green: #3BA55D; --red: #ED4245; --yellow: #FAA61A; }
 
 * { box-sizing: border-box; }

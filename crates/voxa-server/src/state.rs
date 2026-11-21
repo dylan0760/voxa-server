@@ -1880,7 +1880,7 @@ impl Server {
                 }
                 self.need(st.server_perms(s), perm::CALENDAR_VIEW)?;
                 st.sessions.get_mut(&me).unwrap().calendar_subs.insert(ch);
-                let msg = self.server_calendar_msg(st)?;
+                let msg = self.server_calendar_msg(st, me)?;
                 st.send(me, msg);
                 Ok(())
             }
@@ -3637,6 +3637,10 @@ impl Server {
                 // Older Server tab pictures: like its history, only with "See server events".
                 Some(SERVER_CHAT_CHANNEL) => self.need(st.server_perms(s), perm::SERVER_EVENTS)?,
                 Some(ch) => {
+                    // A channel hidden from them (1.25.0+): its pictures do not exist for them.
+                    if !st.sees_channel(s, ch) {
+                        return Err("Image not found (it may have been deleted)".into());
+                    }
                     if s.info.channel != ch && st.server_perms(s) & perm::CHANNEL_EDIT == 0 {
                         return Err("Join the channel to see its images".into());
                     }
@@ -3741,9 +3745,9 @@ impl Server {
         db(self.store.save_calendar(ch, &cal))?;
         if server {
             let to: Vec<ClientId> = st.sessions.values().filter(|x| x.calendar_subs.contains(&ch) && st.server_perms(x) & perm::CALENDAR_VIEW != 0).map(|x| x.info.id).collect();
-            let msg = self.server_calendar_msg(st)?;
             for c in to {
-                st.send(c, msg.clone());
+                let msg = self.server_calendar_msg(st, c)?;
+                st.send(c, msg);
             }
             return Ok(());
         }
@@ -3756,9 +3760,14 @@ impl Server {
 
     /// The server calendar for a client: meeting places of events that still exist, in
     /// channels that still exist.
-    fn server_calendar_msg(&self, st: &State) -> Res<S2C> {
+    /// Meeting places in channels hidden from the viewer are left out (1.25.0+).
+    fn server_calendar_msg(&self, st: &State, viewer: ClientId) -> Res<S2C> {
         let cal = db(self.store.calendar(SERVER_CALENDAR))?;
-        let meet = db(self.store.calendar_meet())?.into_iter().filter(|(e, ch)| cal.events.iter().any(|x| x.id == *e) && st.channels.contains_key(ch)).collect();
+        let v = st.session(viewer)?;
+        let meet = db(self.store.calendar_meet())?
+            .into_iter()
+            .filter(|(e, ch)| cal.events.iter().any(|x| x.id == *e) && st.channels.contains_key(ch) && st.sees_channel(v, *ch))
+            .collect();
         Ok(S2C::ServerCalendar { calendars: cal.calendars, events: cal.events, meet })
     }
 
@@ -3907,13 +3916,32 @@ fn named_channel(msg: &C2S) -> Option<ChannelId> {
         C2S::EditChannel { id, .. } | C2S::DeleteChannel { id, .. } => Some(*id),
         C2S::CloneChannel { source, .. } => Some(*source),
         C2S::SetChannelHidden { channel, .. } => Some(*channel),
+        C2S::GetCalendar(channel)
+        | C2S::CreateCalendar { channel, .. }
+        | C2S::RenameCalendar { channel, .. }
+        | C2S::DeleteCalendar { channel, .. }
+        | C2S::SaveEvent { channel, .. }
+        | C2S::DeleteEvent { channel, .. }
+        | C2S::AnswerEvent { channel, .. } => Some(*channel),
+        C2S::SaveServerEvent { meet: Some(channel), .. } => Some(*channel),
         _ => None,
     }
 }
 
 /// Whether a message refers to "channel 0" (not in a channel) where a real channel is needed.
 fn names_no_channel(msg: &C2S) -> bool {
-    !matches!(msg, C2S::SwitchChannel { .. } | C2S::SetChannelHidden { .. }) && named_channel(msg) == Some(NO_CHANNEL)
+    // Channel 0 is also the server calendar (and "no meeting place" is None, not 0).
+    let calendar = matches!(
+        msg,
+        C2S::GetCalendar(_)
+            | C2S::CreateCalendar { .. }
+            | C2S::RenameCalendar { .. }
+            | C2S::DeleteCalendar { .. }
+            | C2S::SaveEvent { .. }
+            | C2S::DeleteEvent { .. }
+            | C2S::AnswerEvent { .. }
+    );
+    !calendar && !matches!(msg, C2S::SwitchChannel { .. } | C2S::SetChannelHidden { .. }) && named_channel(msg) == Some(NO_CHANNEL)
 }
 
 /// What everyone sees before a change: all channels, and per session (channels, people,
@@ -4114,7 +4142,7 @@ impl Server {
                 let raw = st.raw_server_perms(s);
                 let staff = st.is_staff(raw);
                 let requires = matches!(p.mode, AccountMode::Required) || (matches!(p.mode, AccountMode::RequiredForStaff) && staff);
-                if requires && !s.signed_in {
+                if requires && (!s.signed_in || s.must_change) {
                     return Err("Make an account and sign in first (you would lose your own permissions)".into());
                 }
                 if requires && staff && p.mfa_for_staff && !s.mfa_ok {
@@ -4259,6 +4287,7 @@ impl Server {
             }
             C2S::ConfirmMfa(code) => {
                 let (uid, mut rec) = self.my_account(st, me)?;
+                Self::check_full_sign_in(st, me, &rec)?;
                 let Some(secret) = rec.totp_pending.clone() else { return Err("Start adding the authenticator app first".into()) };
                 let Some(step) = acc::check_totp(&secret, &code, now, 0) else {
                     return Err("That code is not right: check the time on your phone and try the newest code".into());

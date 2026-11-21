@@ -162,9 +162,9 @@
     try { dim = Number(localStorage.getItem(OWN_DIM) ?? 0.35) || 0; } catch (_) { /* private mode */ }
     const range = el('input', { type: 'range', min: '0', max: '0.8', step: '0.05', value: String(dim), oninput: () => { try { localStorage.setItem(OWN_DIM, range.value); } catch (_) { /* */ } applyBackground(); } });
     return el('div', { class: 'own-bg-controls' },
-      el('button', { onclick: () => file.click() }, '🖼 Choose picture…'),
-      el('button', { onclick: () => { try { localStorage.removeItem(OWN_BG); } catch (_) { /* */ } applyBackground(); } }, 'Remove picture'),
-      el('label', { class: 'small' }, 'Darken ', range), file, msg);
+      el('button', { class: 'btn', onclick: () => file.click() }, '🖼 Choose picture…'),
+      el('button', { class: 'btn', onclick: () => { try { localStorage.removeItem(OWN_BG); } catch (_) { /* */ } applyBackground(); } }, 'Remove picture'),
+      el('label', { class: 'small', style: 'color:var(--text);display:flex;gap:6px;align-items:center' }, 'Darken', range), file, msg);
   }
   const themeMenu = () => themeDialog();
 
