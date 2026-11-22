@@ -167,6 +167,18 @@ async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: 
         ("GET", "/crypto.js") => static_file(&mut s, "text/javascript; charset=utf-8", CRYPTO_JS).await,
         ("GET", "/app.js") => static_file(&mut s, "text/javascript; charset=utf-8", APP_JS).await,
         ("GET", "/icon.svg") | ("GET", "/favicon.ico") => static_file(&mut s, "image/svg+xml", ICON).await,
+        // Languages (1.30.0+): the list, and each language's translations (Voxa's files).
+        ("GET", "/i18n/langs.json") => {
+            let list: Vec<serde_json::Value> = voxa_proto::i18n::LANGS
+                .iter()
+                .map(|l| serde_json::json!({ "code": l.code, "name": l.name, "english": l.english, "rtl": l.rtl }))
+                .collect();
+            json(&mut s, "200 OK", &[], &serde_json::Value::from(list)).await
+        }
+        ("GET", p) if p.starts_with("/i18n/") && p.ends_with(".json") => match voxa_proto::i18n::json(&p["/i18n/".len()..p.len() - ".json".len()]) {
+            Some(body) => static_file(&mut s, "application/json; charset=utf-8", body).await,
+            None => respond(&mut s, "404 Not Found", "text/plain", &[], b"Not found").await,
+        },
         ("GET", "/api/challenge") => challenge(&server, &web, &mut s).await,
         ("GET", "/api/session") => match signed_in(&web, &req) {
             Some(j) => json(&mut s, "200 OK", &[], &serde_json::json!({ "signed_in": true, "uid": j.uid, "nickname": j.nickname })).await,

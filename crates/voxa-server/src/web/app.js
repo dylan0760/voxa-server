@@ -1,8 +1,60 @@
 // Voxa web admin page: the server as the Voxa client shows it, in a browser.
 // Everything the user or other people typed is inserted as text, never as HTML.
 'use strict';
-(function () {
+(async function () {
   const C = globalThis.VoxaCrypto;
+
+  // ---------------------------------------------------------------- languages
+  // Servers 1.30.0+: the page in the chosen language (Voxa's translations, from the
+  // server). T('English text') is the text in that language, else the English.
+  const LANG_KEY = 'voxa-web-lang';
+  let LANGS = [];
+  const TR = {};
+  function langFromLocale(loc) {
+    loc = String(loc || '').toLowerCase().replace('_', '-');
+    if (loc.startsWith('zh')) return /hant|-tw|-hk|-mo/.test(loc) ? 'zh-TW' : 'zh-CN';
+    if (loc.startsWith('pt')) return loc.endsWith('-pt') ? 'pt-PT' : 'pt-BR';
+    let base = loc.split('-')[0];
+    if (base === 'no' || base === 'nn') base = 'nb';
+    return LANGS.some((l) => l.code === base) ? base : 'en';
+  }
+  function chosenLang() {
+    let saved = null;
+    try { saved = localStorage.getItem(LANG_KEY); } catch (_) { /* private mode */ }
+    if (saved && LANGS.some((l) => l.code === saved)) return saved;
+    for (const l of navigator.languages || [navigator.language]) {
+      const c = langFromLocale(l);
+      if (c !== 'en') return c;
+    }
+    return 'en';
+  }
+  try {
+    LANGS = await (await fetch('/i18n/langs.json', { cache: 'no-cache' })).json();
+    const code = chosenLang();
+    document.documentElement.lang = code;
+    if (code !== 'en') {
+      const t = await (await fetch('/i18n/' + code + '.json', { cache: 'no-cache' })).json();
+      // Only translations that keep the text's {} (filled in by the page).
+      for (const [k, v] of Object.entries(t)) {
+        if (typeof v === 'string' && v.trim() && k.split('{}').length === v.split('{}').length) TR[k] = v;
+      }
+    }
+  } catch (_) { /* an older server, or offline: English */ }
+  const T = (s) => (Object.prototype.hasOwnProperty.call(TR, s) ? TR[s] : s);
+  function languageDialog() {
+    let saved = null;
+    try { saved = localStorage.getItem(LANG_KEY); } catch (_) { /* */ }
+    const sel = el('select', null,
+      el('option', { value: '', selected: !saved }, T('System language')),
+      LANGS.map((l) => el('option', { value: l.code, selected: saved === l.code, title: l.english }, l.name)));
+    dialog(T('Language'), el('div', { class: 'form' }, sel), [
+      { label: T('Cancel') },
+      { label: T('OK'), primary: true, onClick: () => {
+        try { if (sel.value) localStorage.setItem(LANG_KEY, sel.value); else localStorage.removeItem(LANG_KEY); } catch (_) { /* */ }
+        location.reload();
+      } },
+    ]);
+  }
 
   // ---------------------------------------------------------------- helpers
   function el(tag, props, ...kids) {
@@ -44,7 +96,7 @@
     if (h > 0) return h + 'h ' + m + 'm';
     return m + 'm ' + (secs % 60) + 's';
   }
-  const awayText = (a) => (!a ? 'Away' : /^away\b/i.test(a) ? a : 'Away: ' + a);
+  const awayText = (a) => (!a ? T('Away') : /^away\b/i.test(a) ? a : T('Away: ') + a);
   function initials(name) {
     const w = (name || '?').trim().split(/\s+/).filter(Boolean);
     return ((w[0] || '?')[0] + (w.length > 1 ? w[1][0] : (w[0] || '').slice(1, 2))).toUpperCase();
@@ -89,8 +141,8 @@
   const THEMES = [['dark', 'Dark'], ['light', 'Light'], ['sakura', 'Sakura'], ['layette', 'Layette'], ['crimson', 'Crimson'], ['midnight', 'Midnight'], ['celadon', 'Celadon'],
     ['mustard', 'Mustard'], ['slate', 'Slate'], ['obsidian', 'Obsidian'],
     ['citrus', 'Citrus', 1], ['candyfloss', 'Candyfloss', 1], ['spearmint', 'Spearmint', 1], ['lofi', 'Lo-fi', 1], ['dune', 'Dune', 1],
-    ['raincloud', 'Raincloud', 1], ['afterglow', 'Afterglow', 1], ['bloodmoon', 'Blood Moon', 1], ['nightshade', 'Nightshade', 1], ['twilight', 'Twilight', 1],
-    ['synthwave', 'Synthwave', 1], ['pinklemonade', 'Pink Lemonade', 1], ['aurora', 'Aurora', 1], ['woodland', 'Woodland', 1], ['vicecity', 'Vice City', 1], ['ownpicture', 'Your picture', 2]];
+    ['raincloud', 'Raincloud', 1], ['afterglow', 'Afterglow', 1], ['bloodmoon', T('Blood Moon'), 1], ['nightshade', 'Nightshade', 1], ['twilight', 'Twilight', 1],
+    ['synthwave', 'Synthwave', 1], ['pinklemonade', T('Pink Lemonade'), 1], ['aurora', 'Aurora', 1], ['woodland', 'Woodland', 1], ['vicecity', T('Vice City'), 1], ['ownpicture', T('Your picture'), 2]];
   function applyTheme(t, fromServer) {
     if (!THEMES.some(([k]) => k === t)) t = 'dark';
     document.documentElement.dataset.theme = t;
@@ -124,17 +176,17 @@
       tiles.push(t);
       return t;
     };
-    dialog('Theme', el('div', null,
-      el('div', { class: 'section', style: 'margin-top:0' }, 'Your picture'),
-      el('div', { class: 'dim small' }, 'Any picture of yours behind see-through panels. It is kept in this browser only.'),
+    dialog(T('Theme'), el('div', null,
+      el('div', { class: 'section', style: 'margin-top:0' }, T('Your picture')),
+      el('div', { class: 'dim small' }, T('Any picture of yours behind see-through panels. It is kept in this browser only.')),
       el('div', { class: 'own-bg-row' }, THEMES.filter((t) => t[2] === 2).map(tile), ownPictureControls(() => { const t = tiles.find((x) => x.title === 'Your picture'); applyTheme('ownpicture'); for (const x of tiles) x.classList.toggle('on', x === t); })),
-      el('div', { class: 'section' }, 'Solid'),
-      el('div', { class: 'dim small' }, 'One colour family per theme.'),
+      el('div', { class: 'section' }, T('Solid')),
+      el('div', { class: 'dim small' }, T('One colour family per theme.')),
       el('div', { class: 'theme-grid' }, THEMES.filter((t) => !t[2]).map(tile)),
-      el('div', { class: 'section' }, 'Two-tone'),
-      el('div', { class: 'dim small' }, 'A colour that blends into another, behind see-through panels.'),
+      el('div', { class: 'section' }, T('Two-tone')),
+      el('div', { class: 'dim small' }, T('A colour that blends into another, behind see-through panels.')),
       el('div', { class: 'theme-grid' }, THEMES.filter((t) => t[2] === 1).map(tile))),
-      [{ label: 'Done', primary: true }], { wide: true });
+      [{ label: T('Done'), primary: true }], { wide: true });
   }
   // Choose / remove the picture and how dark it is.
   function ownPictureControls(chosen) {
@@ -142,7 +194,7 @@
     const file = el('input', { type: 'file', accept: 'image/*', style: 'display:none', onchange: () => {
       const f = file.files && file.files[0];
       if (!f) return;
-      if (f.size > 40 * 1024 * 1024) { msg.textContent = 'That picture is larger than 40 MB.'; return; }
+      if (f.size > 40 * 1024 * 1024) { msg.textContent = T('That picture is larger than 40 MB.'); return; }
       const img = new Image();
       const url = URL.createObjectURL(f);
       img.onload = () => {
@@ -151,20 +203,20 @@
         const cv = document.createElement('canvas');
         cv.width = Math.max(1, Math.round(img.width * k)); cv.height = Math.max(1, Math.round(img.height * k));
         cv.getContext('2d').drawImage(img, 0, 0, cv.width, cv.height);
-        try { localStorage.setItem(OWN_BG, cv.toDataURL('image/jpeg', 0.85)); msg.textContent = ''; } catch (_) { msg.textContent = 'The browser has no room to keep that picture.'; return; }
+        try { localStorage.setItem(OWN_BG, cv.toDataURL('image/jpeg', 0.85)); msg.textContent = ''; } catch (_) { msg.textContent = T('The browser has no room to keep that picture.'); return; }
         applyBackground();
         chosen();
       };
-      img.onerror = () => { URL.revokeObjectURL(url); msg.textContent = 'That file is not a picture the browser can show.'; };
+      img.onerror = () => { URL.revokeObjectURL(url); msg.textContent = T('That file is not a picture the browser can show.'); };
       img.src = url;
     } });
     let dim = 0.35;
     try { dim = Number(localStorage.getItem(OWN_DIM) ?? 0.35) || 0; } catch (_) { /* private mode */ }
     const range = el('input', { type: 'range', min: '0', max: '0.8', step: '0.05', value: String(dim), oninput: () => { try { localStorage.setItem(OWN_DIM, range.value); } catch (_) { /* */ } applyBackground(); } });
     return el('div', { class: 'own-bg-controls' },
-      el('button', { class: 'btn', onclick: () => file.click() }, '🖼 Choose picture…'),
-      el('button', { class: 'btn', onclick: () => { try { localStorage.removeItem(OWN_BG); } catch (_) { /* */ } applyBackground(); } }, 'Remove picture'),
-      el('label', { class: 'small', style: 'color:var(--text);display:flex;gap:6px;align-items:center' }, 'Darken', range), file, msg);
+      el('button', { class: 'btn', onclick: () => file.click() }, T('🖼 Choose picture…')),
+      el('button', { class: 'btn', onclick: () => { try { localStorage.removeItem(OWN_BG); } catch (_) { /* */ } applyBackground(); } }, T('Remove picture')),
+      el('label', { class: 'small', style: 'color:var(--text);display:flex;gap:6px;align-items:center' }, T('Darken'), range), file, msg);
   }
   const themeMenu = () => themeDialog();
 
@@ -180,19 +232,19 @@
     CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37, CALENDAR_VIEW: 38, CALENDAR_RSVP: 39, CALENDAR_EVENTS: 40, CALENDAR_MANAGE: 41, CHANNEL_VIEW: 42, GIF_MANAGE: 43,
   };
   const PERM_NAMES = [
-    [P.SERVER_EDIT, 'Edit virtual server settings'], [P.CHANNEL_CREATE_PERMANENT, 'Create permanent channels'],
-    [P.CHANNEL_CREATE_SEMI_PERMANENT, 'Create semi-permanent channels'], [P.CHANNEL_CREATE_TEMPORARY, 'Create temporary channels'],
-    [P.CHANNEL_EDIT, 'Edit channels'], [P.CHANNEL_DELETE, 'Delete channels'], [P.CHANNEL_VIEW, 'See channels'], [P.GIF_MANAGE, 'Manage server GIFs'], [P.CHANNEL_JOIN, 'Join / switch channels'],
-    [P.CHANNEL_JOIN_IGNORE_POWER, 'Join channels regardless of join power'], [P.CHANNEL_JOIN_IGNORE_PASSWORD, 'Join channels without password'],
-    [P.CHANNEL_JOIN_IGNORE_MAXCLIENTS, 'Join full channels'], [P.CLIENT_MOVE, 'Move clients'], [P.CLIENT_KICK_CHANNEL, 'Kick clients from channel'],
-    [P.CLIENT_KICK_SERVER, 'Kick clients from server'], [P.CLIENT_BAN, 'Ban clients'], [P.BAN_LIST, 'View and edit ban list'],
-    [P.CLIENT_POKE, 'Poke clients'], [P.PRIVATE_MESSAGE, 'Send private messages'], [P.SERVER_EVENTS, 'See server events (the Server tab)'], [P.CALENDAR_VIEW, 'See the channel calendar'], [P.CALENDAR_RSVP, 'Answer calendar invitations'], [P.CALENDAR_EVENTS, 'Create and edit calendar events'], [P.CALENDAR_MANAGE, 'Create, rename and delete calendars'], [P.SERVER_CHAT, 'Send server chat messages (no longer used)'],
-    [P.CHANNEL_CHAT, 'Send channel chat messages'], [P.CHAT_HISTORY, 'Read chat history'], [P.CHAT_DELETE, "Delete anyone's chat messages (incl. history)"],
-    [P.CHAT_CLEAR, 'Clear entire chat history'], [P.CHAT_PIN, 'Pin messages'], [P.CHAT_EDIT_OWN, 'Edit own chat messages'], [P.GROUP_MANAGE, 'Create, edit and delete groups'],
-    [P.GROUP_ASSIGN_SERVER, 'Assign server groups'], [P.GROUP_ASSIGN_CHANNEL, 'Assign channel groups'], [P.TALK_POWER_GRANT, 'Grant / revoke talk power'],
-    [P.PRIVILEGE_KEY_CREATE, 'Create privilege keys'], [P.FILE_BROWSE, 'Browse channel files'], [P.FILE_UPLOAD, 'Upload files'],
-    [P.FILE_DOWNLOAD, 'Download files'], [P.FILE_DELETE, 'Delete files'], [P.SCREEN_SHARE, 'Share screen / applications'],
-    [P.CHANNEL_COMMANDER, 'Use channel commander'], [P.CLIENT_DESCRIPTION_EDIT, 'Edit client descriptions'], [P.IGNORE_SERVER_MAXCLIENTS, 'Join when server is full'],
+    [P.SERVER_EDIT, T('Edit virtual server settings')], [P.CHANNEL_CREATE_PERMANENT, T('Create permanent channels')],
+    [P.CHANNEL_CREATE_SEMI_PERMANENT, T('Create semi-permanent channels')], [P.CHANNEL_CREATE_TEMPORARY, T('Create temporary channels')],
+    [P.CHANNEL_EDIT, T('Edit channels')], [P.CHANNEL_DELETE, T('Delete channels')], [P.CHANNEL_VIEW, T('See channels')], [P.GIF_MANAGE, T('Manage server GIFs')], [P.CHANNEL_JOIN, T('Join / switch channels')],
+    [P.CHANNEL_JOIN_IGNORE_POWER, T('Join channels regardless of join power')], [P.CHANNEL_JOIN_IGNORE_PASSWORD, T('Join channels without password')],
+    [P.CHANNEL_JOIN_IGNORE_MAXCLIENTS, T('Join full channels')], [P.CLIENT_MOVE, T('Move clients')], [P.CLIENT_KICK_CHANNEL, T('Kick clients from channel')],
+    [P.CLIENT_KICK_SERVER, T('Kick clients from server')], [P.CLIENT_BAN, T('Ban clients')], [P.BAN_LIST, T('View and edit ban list')],
+    [P.CLIENT_POKE, T('Poke clients')], [P.PRIVATE_MESSAGE, T('Send private messages')], [P.SERVER_EVENTS, T('See server events (the Server tab)')], [P.CALENDAR_VIEW, T('See the channel calendar')], [P.CALENDAR_RSVP, T('Answer calendar invitations')], [P.CALENDAR_EVENTS, T('Create and edit calendar events')], [P.CALENDAR_MANAGE, T('Create, rename and delete calendars')], [P.SERVER_CHAT, T('Send server chat messages (no longer used)')],
+    [P.CHANNEL_CHAT, T('Send channel chat messages')], [P.CHAT_HISTORY, T('Read chat history')], [P.CHAT_DELETE, "Delete anyone's chat messages (incl. history)"],
+    [P.CHAT_CLEAR, T('Clear entire chat history')], [P.CHAT_PIN, T('Pin messages')], [P.CHAT_EDIT_OWN, T('Edit own chat messages')], [P.GROUP_MANAGE, T('Create, edit and delete groups')],
+    [P.GROUP_ASSIGN_SERVER, T('Assign server groups')], [P.GROUP_ASSIGN_CHANNEL, T('Assign channel groups')], [P.TALK_POWER_GRANT, T('Grant / revoke talk power')],
+    [P.PRIVILEGE_KEY_CREATE, T('Create privilege keys')], [P.FILE_BROWSE, T('Browse channel files')], [P.FILE_UPLOAD, T('Upload files')],
+    [P.FILE_DOWNLOAD, T('Download files')], [P.FILE_DELETE, T('Delete files')], [P.SCREEN_SHARE, T('Share screen / applications')],
+    [P.CHANNEL_COMMANDER, T('Use channel commander')], [P.CLIENT_DESCRIPTION_EDIT, T('Edit client descriptions')], [P.IGNORE_SERVER_MAXCLIENTS, T('Join when server is full')],
   ];
   const bit = (n) => 1n << BigInt(n);
   const GUEST_GROUP = 3;
@@ -227,15 +279,15 @@
     if (c === 'lossless') return 1536;
     return Math.round((8000 + q * 8800) / 1000);
   }
-  const CODEC_NAMES = { voice: 'Opus Voice', music: 'Opus Music', lossless: 'Lossless' };
-  const KIND_NAMES = { Permanent: 'Permanent', SemiPermanent: 'Semi-Permanent', Temporary: 'Temporary' };
+  const CODEC_NAMES = { voice: T('Opus Voice'), music: T('Opus Music'), lossless: T('Lossless') };
+  const KIND_NAMES = { Permanent: T('Permanent'), SemiPermanent: T('Semi-Permanent'), Temporary: T('Temporary') };
   const keyOf = (t) => (t === 'Server' ? 'server' : t.Channel !== undefined ? 'ch:' + t.Channel : null);
   const IMAGE_RE = /^📷 ([\s\S]*)\n\[voxa-image:(\d+):(\d+)x(\d+)\]$/;
   function leaveText(r) {
-    if (r === 'TimedOut') return 'timed out';
+    if (r === 'TimedOut') return T('timed out');
     if (r.Disconnected !== undefined) return r.Disconnected ? 'left (' + r.Disconnected + ')' : 'left';
-    if (r.Kicked) return 'was kicked by ' + r.Kicked.by + (r.Kicked.reason ? ': ' + r.Kicked.reason : '');
-    if (r.Banned) return 'was banned by ' + r.Banned.by + (r.Banned.reason ? ': ' + r.Banned.reason : '');
+    if (r.Kicked) return T('was kicked by ') + r.Kicked.by + (r.Kicked.reason ? ': ' + r.Kicked.reason : '');
+    if (r.Banned) return T('was banned by ') + r.Banned.by + (r.Banned.reason ? ': ' + r.Banned.reason : '');
     return 'left';
   }
 
@@ -257,10 +309,10 @@
   // Channel 0: on the server, but in no channel (like Discord).
   const inChannel = () => { const c = myChannel(); return c != null && c !== 0; };
   const PRESENCES = [
-    ['Online', 'var(--green)', 'Online', 'Everyone sees you online'],
-    ['Away', 'var(--yellow)', 'Away', 'Shown as away'],
-    ['Busy', 'var(--red)', 'Do not disturb', 'No sounds for joins and leaves'],
-    ['Invisible', 'var(--dim)', 'Invisible', 'Appear offline while you are not in a channel (administrators still see you)'],
+    ['Online', 'var(--green)', 'Online', T('Everyone sees you online')],
+    ['Away', 'var(--yellow)', 'Away', T('Shown as away')],
+    ['Busy', 'var(--red)', T('Do not disturb'), T('No sounds for joins and leaves')],
+    ['Invisible', 'var(--dim)', 'Invisible', T('Appear offline while you are not in a channel (administrators still see you)')],
   ];
   function myPresence() {
     const me = S.clients.get(S.me);
@@ -292,7 +344,7 @@
   async function post(path, body) {
     const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Voxa': '1' }, body: JSON.stringify(body ?? {}), credentials: 'same-origin' });
     if (!r.ok && r.status !== 204) {
-      let msg = 'Request failed (' + r.status + ')';
+      let msg = T('Request failed (') + r.status + ')';
       try { msg = (await r.json()).error || msg; } catch (_) { /* not JSON */ }
       throw new Error(msg);
     }
@@ -310,7 +362,7 @@
 
   async function boot() {
     if (!C.selfTest()) {
-      put(document.getElementById('root'), el('div', { class: 'login' }, el('div', { class: 'login-card' }, el('h1', null, 'Unsupported browser'), el('p', { class: 'sub' }, 'This browser computed the sign-in cryptography wrongly. Please use a current Chrome, Edge, Firefox or Safari.'))));
+      put(document.getElementById('root'), el('div', { class: 'login' }, el('div', { class: 'login-card' }, el('h1', null, T('Unsupported browser')), el('p', { class: 'sub' }, T('This browser computed the sign-in cryptography wrongly. Please use a current Chrome, Edge, Firefox or Safari.')))));
       return;
     }
     // A sign-in through Voxa that never finished must not leave a password behind.
@@ -367,7 +419,7 @@
   async function signInWithKey(key, p) {
     let priv;
     try { priv = C.b64decode(key.trim()); } catch (_) { priv = null; }
-    if (!priv || priv.length !== 32) throw new Error('That is not a Voxa identity key (it should be 44 characters ending in "=").');
+    if (!priv || priv.length !== 32) throw new Error(T('That is not a Voxa identity key (it should be 44 characters ending in "=").'));
     const ch = await challenge();
     const serverKey = C.b64decode(ch.server_key);
     const pub = C.publicKey(priv);
@@ -384,7 +436,7 @@
     localStorage.setItem(PENDING, JSON.stringify({ ...p, ts: Date.now() }));
     const q = new URLSearchParams({ o: location.origin, i: ch.id, k: ch.server_key, n: ch.nonce, f: ch.fingerprint || '', s: ch.name || '' });
     location.href = 'voxa://web-login?' + q.toString();
-    status('Waiting for Voxa… Confirm the sign-in in the Voxa window.');
+    status(T('Waiting for Voxa… Confirm the sign-in in the Voxa window.'));
     // Picked up when the tab Voxa opens has signed in (same browser, so the same cookie).
     const started = Date.now();
     return new Promise((resolve, reject) => {
@@ -399,14 +451,14 @@
       if (channelBus) channelBus.addEventListener('message', onMsg);
       const timer = setInterval(async () => {
         if ((await signedIn()) === true) { done(); resolve(); }
-        else if (Date.now() - started > 120000) { done(); localStorage.removeItem(PENDING); reject(new Error('Voxa did not answer. Is it installed and running? You can paste your identity key instead.')); }
+        else if (Date.now() - started > 120000) { done(); localStorage.removeItem(PENDING); reject(new Error(T('Voxa did not answer. Is it installed and running? You can paste your identity key instead.'))); }
       }, 2000);
     });
   }
 
   async function finishClientSignIn(data) {
     let d;
-    try { d = JSON.parse(new TextDecoder().decode(C.b64decode(data.replace(/-/g, '+').replace(/_/g, '/')))); } catch (_) { throw new Error('The sign-in from Voxa could not be read.'); }
+    try { d = JSON.parse(new TextDecoder().decode(C.b64decode(data.replace(/-/g, '+').replace(/_/g, '/')))); } catch (_) { throw new Error(T('The sign-in from Voxa could not be read.')); }
     let p = {};
     try { p = JSON.parse(localStorage.getItem(PENDING) || '{}'); } catch (_) { /* none */ }
     localStorage.removeItem(PENDING);
@@ -421,7 +473,7 @@
       });
       if (taken) {
         put(document.getElementById('root'), el('div', { class: 'login' }, el('div', { class: 'login-card' },
-          el('img', { class: 'logo', src: '/icon.svg', alt: '' }), el('h1', null, 'Signed in'), el('p', { class: 'sub' }, 'You are signed in in your other tab. You can close this one.'))));
+          el('img', { class: 'logo', src: '/icon.svg', alt: '' }), el('h1', null, T('Signed in')), el('p', { class: 'sub' }, T('You are signed in in your other tab. You can close this one.')))));
         window.close();
         return;
       }
@@ -437,26 +489,26 @@
     let channels = [];
     try { channels = (await (await fetch('/api/channels', { cache: 'no-store' })).json()).channels || []; } catch (_) { /* none */ }
     const lastChannel = localStorage.getItem('voxa-web-channel');
-    const key = el('textarea', { placeholder: 'Paste your exported identity key', spellcheck: 'false', autocomplete: 'off' });
-    const nick = el('input', { type: 'text', value: localStorage.getItem('voxa-web-nick') || '', placeholder: 'Last used, or "Web admin"', maxlength: '30' });
-    const pw = el('input', { type: 'password', placeholder: 'Server password', autocomplete: 'current-password' });
+    const key = el('textarea', { placeholder: T('Paste your exported identity key'), spellcheck: 'false', autocomplete: 'off' });
+    const nick = el('input', { type: 'text', value: localStorage.getItem('voxa-web-nick') || '', placeholder: T('Last used, or "Web admin"'), maxlength: '30' });
+    const pw = el('input', { type: 'password', placeholder: T('Server password'), autocomplete: 'current-password' });
     // The channel to join: a list when the server shares it, otherwise a path.
     const chSel = channels.length
       ? el('select', null,
-        el('option', { value: '\u0001', selected: lastChannel == null }, 'The one I used last time'),
-        el('option', { value: '', selected: lastChannel === '' }, 'The default channel'),
-        el('option', { value: '\u0001nochannel\u0001', selected: lastChannel === '\u0001nochannel\u0001' }, 'No channel (just be on the server)'),
+        el('option', { value: '\u0001', selected: lastChannel == null }, T('The one I used last time')),
+        el('option', { value: '', selected: lastChannel === '' }, T('The default channel')),
+        el('option', { value: '\u0001nochannel\u0001', selected: lastChannel === '\u0001nochannel\u0001' }, T('No channel (just be on the server)')),
         channels.map((c) => el('option', { value: c.path, selected: c.path === lastChannel }, c.path + (c.password ? '  🔒' : ''))))
       : el('input', { type: 'text', placeholder: 'e.g. Lobby/Games (empty: the one used last time)', value: lastChannel || '' });
-    const chPw = el('input', { type: 'password', placeholder: 'Channel password', autocomplete: 'off' });
-    const chPwRow = el('div', { style: 'display:flex;flex-direction:column;gap:6px' }, el('label', null, 'Channel password'), chPw);
+    const chPw = el('input', { type: 'password', placeholder: T('Channel password'), autocomplete: 'off' });
+    const chPwRow = el('div', { style: 'display:flex;flex-direction:column;gap:6px' }, el('label', null, T('Channel password')), chPw);
     const updPw = () => { const c = channels.find((x) => x.path === chSel.value); chPwRow.classList.toggle('hidden', !(c && c.password) && channels.length > 0); };
     chSel.addEventListener('change', updPw);
     updPw();
     const remember = el('input', { type: 'checkbox', id: 'remember' });
     const err = el('div', { class: 'error' }, error || '');
-    const btn = el('button', { class: 'btn primary', type: 'submit' }, 'Sign in with key');
-    const voxaBtn = el('button', { class: 'btn primary', type: 'button' }, '🎧 Sign in with Voxa');
+    const btn = el('button', { class: 'btn primary', type: 'submit' }, T('Sign in with key'));
+    const voxaBtn = el('button', { class: 'btn primary', type: 'button' }, T('🎧 Sign in with Voxa'));
     const pending = () => {
       let channel = chSel.value;
       if (channel === '\u0001') channel = null;
@@ -498,34 +550,35 @@
       },
     },
       voxaBtn,
-      el('div', { class: 'help', style: 'margin:2px 0 6px;text-align:center' }, 'Uses the identity Voxa on this PC has for this server. Voxa asks you to confirm.'),
-      el('div', { class: 'or' }, 'or paste an identity key'),
+      el('div', { class: 'help', style: 'margin:2px 0 6px;text-align:center' }, T('Uses the identity Voxa on this PC has for this server. Voxa asks you to confirm.')),
+      el('div', { class: 'or' }, T('or paste an identity key')),
       key,
-      el('div', { class: 'row' }, remember, el('label', { for: 'remember', style: 'margin:0;color:var(--text);font-size:13px' }, 'Remember the key in this browser')),
+      el('div', { class: 'row' }, remember, el('label', { for: 'remember', style: 'margin:0;color:var(--text);font-size:13px' }, T('Remember the key in this browser'))),
       btn,
       el('div', { class: 'or' }, 'options'),
-      el('label', null, 'Nickname'), nick,
-      el('label', null, 'Join channel'), chSel,
+      el('label', null, T('Nickname')), nick,
+      el('label', null, T('Join channel')), chSel,
       chPwRow,
-      info.has_password ? [el('label', null, 'Server password'), pw] : null,
+      info.has_password ? [el('label', null, T('Server password')), pw] : null,
       err);
     put(document.getElementById('root'),
       el('div', { class: 'login' },
-        el('button', { class: 'icon-btn login-theme', title: 'Theme', onclick: (e) => themeMenu(e.clientX - 160, e.clientY + 10) }, '🎨'),
+        el('button', { class: 'icon-btn login-lang', title: T('Language'), onclick: languageDialog }, '🌐'),
+        el('button', { class: 'icon-btn login-theme', title: T('Theme'), onclick: (e) => themeMenu(e.clientX - 160, e.clientY + 10) }, '🎨'),
         el('div', { class: 'login-card' },
           el('img', { class: 'logo', src: '/icon.svg', alt: '' }),
-          el('h1', null, info.name || 'Voxa Server'),
-          el('div', { class: 'sub' }, 'Server administration · Voxa Server ' + (info.version || '')),
+          el('h1', null, info.name || T('Voxa Server')),
+          el('div', { class: 'sub' }, T('Server administration · Voxa Server ') + (info.version || '')),
           form,
-          el('div', { class: 'help' }, 'You get the same rights here as your identity has in Voxa. To get a key, in Voxa click your name at the bottom left ▸ Identities and export the one you use on this server. Keys stay in this browser: only a proof that you own one is sent.'),
-          info.fingerprint ? el('div', { class: 'fp' }, 'Server fingerprint: ' + info.fingerprint) : null)));
+          el('div', { class: 'help' }, T('You get the same rights here as your identity has in Voxa. To get a key, in Voxa click your name at the bottom left ▸ Identities and export the one you use on this server. Keys stay in this browser: only a proof that you own one is sent.')),
+          info.fingerprint ? el('div', { class: 'fp' }, T('Server fingerprint: ') + info.fingerprint) : null)));
   }
 
   async function signOut() {
     localStorage.removeItem('voxa-web-key');
     sessionStorage.removeItem('voxa-web-pw');
     try { await post('/api/logout'); } catch (_) { /* already gone */ }
-    showLogin('Signed out.');
+    showLogin(T('Signed out.'));
   }
 
   /// Theme, nickname and channel are remembered per identity on the server, so they
@@ -556,12 +609,12 @@
     };
     es.onerror = async () => {
       if (!S.connected) {
-        if ((await signedIn()) === false) showLogin('Your sign-in expired. Please sign in again.');
+        if ((await signedIn()) === false) showLogin(T('Your sign-in expired. Please sign in again.'));
         return;
       }
       S.connected = false;
-      banner('Connection lost, reconnecting…');
-      if ((await signedIn()) === false) showLogin('Your sign-in expired. Please sign in again.');
+      banner(T('Connection lost, reconnecting…'));
+      if ((await signedIn()) === false) showLogin(T('Your sign-in expired. Please sign in again.'));
     };
   }
   function banner(text) {
@@ -574,8 +627,8 @@
     if (es) { es.close(); es = null; }
     S.connected = false;
     dialog(title, el('p', null, text), [
-      { label: 'Sign out', onClick: signOut },
-      { label: 'Reconnect', primary: true, onClick: () => connect() },
+      { label: T('Sign out'), onClick: signOut },
+      { label: T('Reconnect'), primary: true, onClick: () => connect() },
     ], { noClose: true });
   }
 
@@ -632,18 +685,18 @@
         if (v.presence === 'Online') S.presences.delete(v.id); else S.presences.set(v.id, v.presence);
         break;
       case 'Refused':
-        stopped('Could not join the server', v);
+        stopped(T('Could not join the server'), v);
         break;
       case 'Kicked':
-        stopped('Disconnected', 'You ' + leaveText(v) + '.');
+        stopped(T('Disconnected'), T('You ') + leaveText(v) + '.');
         break;
       case 'Error':
         if (/sign-in has expired/.test(v)) { localStorage.removeItem(accountKey()); if (S.account && S.account.limited && !S.accountDlg) accountDialog(); }
-        if (S.accountDlg) S.accountDlg.error(v);
-        toast(v, 'bad');
+        if (S.accountDlg) S.accountDlg.error(T(v));
+        toast(T(v), 'bad');
         break;
       case 'Notice':
-        toast(v);
+        toast(T(v));
         break;
       case 'ServerUpdated':
         S.server = v;
@@ -689,7 +742,7 @@
           } else if (inChannel() && (was === myChannel() || v.channel === myChannel())) {
             tones(v.channel === myChannel() ? JOIN_TONES : LEAVE_TONES);
             const ch = S.channels.get(v.channel);
-            pushEvent('ch:' + myChannel(), c.nickname + (v.channel === myChannel() ? ' joined the channel' : ' went to ' + (ch ? ch.name : 'another channel')) + (v.by ? ' (moved by ' + v.by + ')' : ''));
+            pushEvent('ch:' + myChannel(), c.nickname + (v.channel === myChannel() ? T(' joined the channel') : T(' went to ') + (ch ? ch.name : T('another channel'))) + (v.by ? ' (moved by ' + v.by + ')' : ''));
           }
         }
         break;
@@ -738,12 +791,12 @@
         const key = keyOf(v.target);
         if (!key) break;
         log(key).lines = [];
-        pushEvent(key, 'The chat history was cleared by ' + v.by, 'warn');
+        pushEvent(key, T('The chat history was cleared by ') + v.by, 'warn');
         S.msgDirty = true;
         break;
       }
       case 'Poked':
-        toast(v.from_name + ' poked you' + (v.message ? ': ' + v.message : ''), 'warn');
+        toast(v.from_name + T(' poked you') + (v.message ? ': ' + v.message : ''), 'warn');
         break;
       case 'GroupsUpdated':
         S.groups = new Map(v.map((g) => [g.id, g]));
@@ -758,7 +811,7 @@
         break;
       case 'PinChanged':
         if (keyOf(v.target) === tabKey() && S.showPins) send({ GetPins: v.target });
-        pushEvent(keyOf(v.target), v.by + (v.pinned ? ' pinned a message' : ' unpinned a message'));
+        pushEvent(keyOf(v.target), v.by + (v.pinned ? T(' pinned a message') : T(' unpinned a message')));
         break;
       case 'People':
         S.people = v;
@@ -788,7 +841,7 @@
           openDm(m.from_uid, m.from_name);
           pushMsg('dm:' + m.from_uid, { id: 0, target: { Private: 0 }, from: null, from_uid: m.from_uid, from_name: m.from_name, ts: m.ts, text: m.text });
         }
-        toast(v.length + ' direct message(s) arrived while you were away');
+        toast(v.length + T(' direct message(s) arrived while you were away'));
         break;
       case 'AccountPolicy':
         S.accountPolicy = v;
@@ -812,11 +865,11 @@
         localStorage.setItem(accountKey(), v);
         break;
       case 'AccountReset':
-        dialog('Temporary password', el('div', null,
-          el('p', null, 'The password of the account "' + v.username + '" was reset. Give them this temporary password (it is not shown again):'),
+        dialog(T('Temporary password'), el('div', null,
+          el('p', null, T('The password of the account "') + v.username + '" was reset. Give them this temporary password (it is not shown again):'),
           el('p', null, el('code', { style: 'font-size:18px;user-select:all' }, v.password)),
-          el('p', { class: 'dim small' }, 'They sign in with their username and this password, then choose a new password.')),
-          [{ label: 'Copy', onClick: () => { if (navigator.clipboard) navigator.clipboard.writeText(v.password); return false; } }, { label: 'Done', primary: true }]);
+          el('p', { class: 'dim small' }, T('They sign in with their username and this password, then choose a new password.'))),
+          [{ label: T('Copy'), onClick: () => { if (navigator.clipboard) navigator.clipboard.writeText(v.password); return false; } }, { label: T('Done'), primary: true }]);
         break;
       case 'MfaSetup':
         S.mfaSetup = v;
@@ -838,7 +891,7 @@
         S.hidden = new Map(v);
         break;
       case 'OfflineQueued':
-        pushEvent('dm:' + v.to_uid, personName(v.to_uid) + ' is offline: the message will be delivered when they come online');
+        pushEvent('dm:' + v.to_uid, personName(v.to_uid) + T(' is offline: the message will be delivered when they come online'));
         break;
       default:
         break;
@@ -876,7 +929,7 @@
   // ---------------------------------------------------------------- auto away
   // After the server's idle time without any input on the page you are set away, and
   // back when you return (only if Voxa set it).
-  const AUTO_AWAY = 'Away (idle)';
+  const AUTO_AWAY = T('Away (idle)');
   let lastInput = Date.now();
   for (const ev of ['mousemove', 'mousedown', 'keydown', 'wheel', 'touchstart']) {
     document.addEventListener(ev, () => {
@@ -917,12 +970,12 @@
 
   let R = {}; // persistent elements of the layout
   function buildApp() {
-    const search = el('input', { type: 'text', class: 'search', placeholder: '🔍 Search people', oninput: () => schedule() });
-    const input = el('textarea', { rows: '1', placeholder: 'Message', onkeydown: onComposerKey, oninput: autoGrow });
+    const search = el('input', { type: 'text', class: 'search', placeholder: T('🔍 Search people'), oninput: () => schedule() });
+    const input = el('textarea', { rows: '1', placeholder: T('Message'), onkeydown: onComposerKey, oninput: autoGrow });
     R = {
       app: el('div', { class: 'app' }),
       rail: el('nav', { class: 'rail' }),
-      sideHead: el('div', { class: 'side-head', title: 'Server menu', onclick: (e) => serverMenu(e.clientX, e.clientY), oncontextmenu: (e) => { e.preventDefault(); serverMenu(e.clientX, e.clientY); } }),
+      sideHead: el('div', { class: 'side-head', title: T('Server menu'), onclick: (e) => serverMenu(e.clientX, e.clientY), oncontextmenu: (e) => { e.preventDefault(); serverMenu(e.clientX, e.clientY); } }),
       tree: el('div', { class: 'tree' }),
       status: el('div', { class: 'status-card' }),
       meCard: el('div', { class: 'me-card' }),
@@ -936,7 +989,7 @@
       search,
       infoBody: el('div', { class: 'info-body' }),
     };
-    R.composer = el('div', { class: 'composer' }, input, el('button', { class: 'icon-btn send', title: 'Send (Enter)', onclick: sendComposer }, '➤'));
+    R.composer = el('div', { class: 'composer' }, input, el('button', { class: 'icon-btn send', title: T('Send (Enter)'), onclick: sendComposer }, '➤'));
     R.app.append(
       R.rail,
       el('aside', { class: 'side' }, R.sideHead, R.tree, R.status, R.meCard),
@@ -964,9 +1017,10 @@
       el('div', { class: 'srv', title: name, onclick: () => { S.selected = { kind: 'server' }; S.right = 'info'; S.showRight = true; schedule(); } }, initials(name)),
       el('div', { class: 'sep' }),
       el('div', { class: 'grow' }),
-      el('button', { class: 'icon-btn', title: 'Join / leave sounds (click to turn ' + (localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off') + ')', onclick: () => { localStorage.setItem('voxa-web-sounds', localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off'); schedule(); } }, localStorage.getItem('voxa-web-sounds') === 'off' ? '🔕' : '🔔'),
-      el('button', { class: 'icon-btn', title: 'Theme', onclick: (e) => themeMenu(e.clientX + 10, e.clientY - 250) }, '🎨'),
-      el('button', { class: 'icon-btn', title: 'Sign out', onclick: () => confirmDialog('Sign out', 'Sign out of the web admin page?', 'Sign out').then((ok) => ok && signOut()) }, '⏻'));
+      el('button', { class: 'icon-btn', title: T('Join / leave sounds (click to turn ') + (localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off') + ')', onclick: () => { localStorage.setItem('voxa-web-sounds', localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off'); schedule(); } }, localStorage.getItem('voxa-web-sounds') === 'off' ? '🔕' : '🔔'),
+      el('button', { class: 'icon-btn', title: T('Language'), onclick: languageDialog }, '🌐'),
+      el('button', { class: 'icon-btn', title: T('Theme'), onclick: (e) => themeMenu(e.clientX + 10, e.clientY - 250) }, '🎨'),
+      el('button', { class: 'icon-btn', title: T('Sign out'), onclick: () => confirmDialog(T('Sign out'), T('Sign out of the web admin page?'), T('Sign out')).then((ok) => ok && signOut()) }, '⏻'));
   }
 
   function renderSide() {
@@ -975,7 +1029,7 @@
     const online = S.clients.size;
     put(R.status, 
       el('span', { style: 'color:var(--green);font-size:16px' }, '🌐'),
-      el('div', { class: 'grow' }, el('div', { class: 't' }, 'Web admin connected'), el('div', { class: 'dim small' }, online + ' online · ' + location.host)));
+      el('div', { class: 'grow' }, el('div', { class: 't' }, T('Web admin connected')), el('div', { class: 'dim small' }, online + ' online · ' + location.host)));
     const me = S.clients.get(S.me);
     if (!me) return;
     const away = me.away != null;
@@ -983,11 +1037,11 @@
     const status = away ? awayText(me.away) : pr[2];
     put(R.meCard, 
       avatar(me.nickname, me.uid, 36, pr[1]),
-      el('div', { class: 'who', style: 'cursor:pointer', title: 'Set your status', onclick: (e) => presenceMenu(e.clientX, e.clientY - 220) },
+      el('div', { class: 'who', style: 'cursor:pointer', title: T('Set your status'), onclick: (e) => presenceMenu(e.clientX, e.clientY - 220) },
         el('div', { class: 'n' }, me.nickname),
         el('div', { class: 'small', style: 'color:' + pr[1] }, '● ' + status + (inChannel() ? '' : ' · not in a channel'))),
-      el('button', { class: 'icon-btn' + (away ? ' on' : ''), title: away ? 'Set online' : 'Set away', onclick: toggleAway }, '🌙'),
-      el('button', { class: 'icon-btn', title: 'Change nickname', onclick: changeNickname }, '✏️'));
+      el('button', { class: 'icon-btn' + (away ? ' on' : ''), title: away ? T('Set online') : T('Set away'), onclick: toggleAway }, '🌙'),
+      el('button', { class: 'icon-btn', title: T('Change nickname'), onclick: changeNickname }, '✏️'));
   }
 
   function children(parent) {
@@ -1067,9 +1121,9 @@
       el('span', { class: 'ico', style: full ? 'color:var(--red)' : mine ? 'color:var(--green)' : '' }, ch.has_password ? '🔒' : '🔊'),
       el('span', { class: 'label' }, ch.name),
       el('span', { class: 'badges' },
-        ch.is_default ? el('span', { title: 'Default channel' }, '🏠') : null,
-        ch.kind === 'Temporary' ? el('span', { title: 'Temporary channel' }, '⏳') : null,
-        ch.max_clients != null ? el('span', { title: 'Max clients' }, n + '/' + ch.max_clients) : n && S.collapsed.has(ch.id) ? el('span', null, String(n)) : null));
+        ch.is_default ? el('span', { title: T('Default channel') }, '🏠') : null,
+        ch.kind === 'Temporary' ? el('span', { title: T('Temporary channel') }, '⏳') : null,
+        ch.max_clients != null ? el('span', { title: T('Max clients') }, n + '/' + ch.max_clients) : n && S.collapsed.has(ch.id) ? el('span', null, String(n)) : null));
     dropTarget(row, ch);
     return row;
   }
@@ -1091,15 +1145,15 @@
       el('span', { class: 'label' }, el('span', { class: 'nick' }, c.nickname),
         tags.map((t) => { const col = nameColor(t); return el('span', { class: 'gtag', style: `color:${col};background:${col}40` }, t); })),
       el('span', { class: 'badges' },
-        c.platform === 'Web' ? el('span', { class: 'webtag', title: 'On the web admin page' }, 'WEB') : null,
-        S.presences.get(c.id) === 'Busy' ? el('span', { title: 'Do not disturb', style: 'color:var(--red)' }, '⛔') : null,
+        c.platform === 'Web' ? el('span', { class: 'webtag', title: T('On the web admin page') }, T('WEB')) : null,
+        S.presences.get(c.id) === 'Busy' ? el('span', { title: T('Do not disturb'), style: 'color:var(--red)' }, '⛔') : null,
         S.presences.get(c.id) === 'Invisible' ? el('span', { title: 'Invisible: others see them as offline', style: 'color:var(--dim)' }, '👻') : null,
-        c.streaming ? el('span', { class: 'live', title: c.streaming.title + ' (' + c.streaming.width + 'x' + c.streaming.height + ')' }, 'LIVE') : null,
-        c.output_muted ? el('span', { title: 'Speakers muted', style: 'color:var(--red)' }, '🔇') : null,
-        c.input_muted ? el('span', { title: 'Microphone muted', style: 'color:var(--red)' }, '🎤') : null,
-        c.talk_request != null ? el('span', { title: 'Requests talk power: ' + (c.talk_request || '') }, '✋') : null,
-        c.commander ? el('span', { title: 'Channel commander', style: 'color:var(--yellow)' }, '★') : null,
-        c.away != null ? el('span', { title: c.away ? 'Away: ' + c.away : 'Away', style: 'color:var(--yellow)' }, '🌙') : null));
+        c.streaming ? el('span', { class: 'live', title: c.streaming.title + ' (' + c.streaming.width + 'x' + c.streaming.height + ')' }, T('LIVE')) : null,
+        c.output_muted ? el('span', { title: T('Speakers muted'), style: 'color:var(--red)' }, '🔇') : null,
+        c.input_muted ? el('span', { title: T('Microphone muted'), style: 'color:var(--red)' }, '🎤') : null,
+        c.talk_request != null ? el('span', { title: T('Requests talk power: ') + (c.talk_request || '') }, '✋') : null,
+        c.commander ? el('span', { title: T('Channel commander'), style: 'color:var(--yellow)' }, '★') : null,
+        c.away != null ? el('span', { title: c.away ? T('Away: ') + c.away : T('Away'), style: 'color:var(--yellow)' }, '🌙') : null));
     return row;
   }
 
@@ -1134,28 +1188,28 @@
 
   function renderChatHead() {
     let title, sub;
-    if (S.tab === 'server') { title = '🖥  ' + (S.server ? S.server.name : 'Server'); sub = can(P.SERVER_EVENTS) ? 'Server events: who connects and leaves' : 'Welcome'; }
-    else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); title = '#  ' + (ch ? ch.name : ''); sub = ch && ch.topic ? ch.topic : 'Channel chat'; }
-    else { const uid = S.tab.slice(3); title = '@  ' + personName(uid); sub = onlineByUid(uid) ? 'Direct message' : 'Offline · gets your messages later'; }
+    if (S.tab === 'server') { title = '🖥  ' + (S.server ? S.server.name : T('Server')); sub = can(P.SERVER_EVENTS) ? T('Server events: who connects and leaves') : T('Welcome'); }
+    else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); title = '#  ' + (ch ? ch.name : ''); sub = ch && ch.topic ? ch.topic : T('Channel chat'); }
+    else { const uid = S.tab.slice(3); title = '@  ' + personName(uid); sub = onlineByUid(uid) ? T('Direct message') : T('Offline · gets your messages later'); }
     const isDm = S.tab.startsWith('dm:');
     const peopleOn = S.showRight && S.right === 'people';
     put(R.head, 
       el('div', { class: 't' }, el('div', { class: 'title' }, title), el('div', { class: 'subtitle' }, sub)),
-      !isDm && !(S.tab === 'server' && !can(P.SERVER_EVENTS)) ? el('button', { class: 'icon-btn' + (S.showPins ? ' on' : ''), title: 'Pinned messages', onclick: togglePins }, '📌') : null,
-      !isDm && can(P.CHAT_CLEAR) ? el('button', { class: 'icon-btn', title: 'Clear the entire chat history', onclick: clearChat }, '🗑') : null,
-      isDm ? el('button', { class: 'icon-btn', title: 'Close this conversation', onclick: () => closeDm(S.tab.slice(3)) }, '✕') : null,
-      el('button', { class: 'icon-btn' + (S.showRight ? ' on' : ''), title: 'Show / hide info panel', onclick: () => { S.showRight = !S.showRight; schedule(); } }, 'ℹ'),
-      el('button', { class: 'pill' + (peopleOn ? ' on' : ''), title: 'Everyone on this server, online and offline', onclick: () => { S.showRight = !peopleOn; S.right = 'people'; schedule(); } }, '👥 People'));
+      !isDm && !(S.tab === 'server' && !can(P.SERVER_EVENTS)) ? el('button', { class: 'icon-btn' + (S.showPins ? ' on' : ''), title: T('Pinned messages'), onclick: togglePins }, '📌') : null,
+      !isDm && can(P.CHAT_CLEAR) ? el('button', { class: 'icon-btn', title: T('Clear the entire chat history'), onclick: clearChat }, '🗑') : null,
+      isDm ? el('button', { class: 'icon-btn', title: T('Close this conversation'), onclick: () => closeDm(S.tab.slice(3)) }, '✕') : null,
+      el('button', { class: 'icon-btn' + (S.showRight ? ' on' : ''), title: T('Show / hide info panel'), onclick: () => { S.showRight = !S.showRight; schedule(); } }, 'ℹ'),
+      el('button', { class: 'pill' + (peopleOn ? ' on' : ''), title: T('Everyone on this server, online and offline'), onclick: () => { S.showRight = !peopleOn; S.right = 'people'; schedule(); } }, T('👥 People')));
   }
 
   function renderTabs() {
     const tab = (id, label, unread, close) => el('button', { class: 'tab' + (S.tab === id ? ' on' : ''), onclick: () => activateTab(id) },
       label, unread ? el('span', { class: 'unread' }, unread) : null,
-      close ? el('span', { class: 'x', title: 'Close', onclick: (e) => { e.stopPropagation(); closeDm(close); } }, '✕') : null);
+      close ? el('span', { class: 'x', title: T('Close'), onclick: (e) => { e.stopPropagation(); closeDm(close); } }, '✕') : null);
     const ch = S.channels.get(myChannel());
     put(R.tabs, 
-      tab('server', '🖥 Server', S.tab === 'server' ? 0 : log('server').unread),
-      inChannel() ? tab('channel', '# ' + (ch ? ch.name : 'Channel'), S.tab === 'channel' ? 0 : log('ch:' + myChannel()).unread) : null,
+      tab('server', T('🖥 Server'), S.tab === 'server' ? 0 : log('server').unread),
+      inChannel() ? tab('channel', '# ' + (ch ? ch.name : T('Channel')), S.tab === 'channel' ? 0 : log('ch:' + myChannel()).unread) : null,
       S.dms.map((d) => tab('dm:' + d.uid, '@ ' + personName(d.uid) + (onlineByUid(d.uid) ? '' : ' (offline)'), S.tab === 'dm:' + d.uid ? 0 : log('dm:' + d.uid).unread, d.uid)));
   }
 
@@ -1176,12 +1230,12 @@
     const show = S.showPins && !S.tab.startsWith('dm:');
     R.pins.classList.toggle('hidden', !show);
     if (!show) return;
-    if (!S.pins) { put(R.pins, el('span', { class: 'dim' }, 'Loading pinned messages…')); return; }
-    if (!S.pins.length) { put(R.pins, el('span', { class: 'dim' }, '📌 No pinned messages in this chat.')); return; }
+    if (!S.pins) { put(R.pins, el('span', { class: 'dim' }, T('Loading pinned messages…'))); return; }
+    if (!S.pins.length) { put(R.pins, el('span', { class: 'dim' }, T('📌 No pinned messages in this chat.'))); return; }
     put(R.pins, ...S.pins.map((p) => el('div', { class: 'pin' },
       el('span', null, '📌'),
       el('div', { style: 'flex:1;min-width:0' }, el('div', null, el('span', { class: 'strong' }, p.message.from_name), el('span', { class: 'dim small' }, '  ' + fmtDate(p.message.ts) + ' · pinned by ' + p.pinned_by)), el('div', { class: 'desc' }, messageText(p.message.text))),
-      can(P.CHAT_PIN) ? el('button', { class: 'btn small', onclick: () => send({ PinMessage: { target: tabTarget(), id: p.message.id, pin: false } }) }, 'Unpin') : null)));
+      can(P.CHAT_PIN) ? el('button', { class: 'btn small', onclick: () => send({ PinMessage: { target: tabTarget(), id: p.message.id, pin: false } }) }, T('Unpin')) : null)));
   }
 
   function messageText(text) {
@@ -1220,9 +1274,9 @@
     if (S.tab === 'server' && !can(P.SERVER_EVENTS)) {
       const welcome = (S.server && S.server.welcome_message) || '';
       put(box, el('div', { class: 'welcome-tab' },
-        el('h2', null, 'Welcome to ' + (S.server ? S.server.name : 'the server')),
-        el('div', { class: 'welcome-text' }, welcome.trim() ? welcome : 'The server has no welcome message.'),
-        el('div', { class: 'dim small' }, 'Chat in a channel (double-click one to join it), or with direct messages.')));
+        el('h2', null, T('Welcome to ') + (S.server ? S.server.name : T('the server'))),
+        el('div', { class: 'welcome-text' }, welcome.trim() ? welcome : T('The server has no welcome message.')),
+        el('div', { class: 'dim small' }, T('Chat in a channel (double-click one to join it), or with direct messages.'))));
       return;
     }
     // The permission arrived while the Server tab was open: load its history now.
@@ -1235,10 +1289,10 @@
       out.push(el('div', { class: 'older' }, el('button', { class: 'btn small', onclick: () => {
         const oldest = l.lines.find((x) => x.msg);
         send({ FetchHistory: { target, before: oldest ? oldest.msg.id : null, limit: 50 } });
-      } }, 'Load older messages')));
+      } }, T('Load older messages'))));
     }
     if (!l.lines.length) {
-      out.push(el('div', { class: 'event', style: 'padding-left:6px' }, isDm ? 'This is the start of your conversation. On the web page direct messages are not kept after you close it.' : 'No messages yet.'));
+      out.push(el('div', { class: 'event', style: 'padding-left:6px' }, isDm ? T('This is the start of your conversation. On the web page direct messages are not kept after you close it.') : T('No messages yet.')));
     }
     let prev = null, prevDay = '';
     for (const line of l.lines) {
@@ -1261,16 +1315,16 @@
       const canEdit = !isDm && mine && m.id && !IMAGE_RE.test(m.text) && can(P.CHAT_EDIT_OWN);
       const editing = S.editing && S.editing.key === key && S.editing.id === m.id;
       const actions = el('div', { class: 'actions' },
-        canEdit && !editing ? el('button', { class: 'icon-btn', title: 'Edit message', onclick: () => startEdit(key, m) }, '✏️') : null,
-        el('button', { class: 'icon-btn', title: 'Copy text', onclick: () => copy(m.text) }, '📋'),
-        !isDm && can(P.CHAT_PIN) && m.id ? el('button', { class: 'icon-btn', title: 'Pin', onclick: () => send({ PinMessage: { target, id: m.id, pin: true } }) }, '📌') : null,
-        canDel ? el('button', { class: 'icon-btn', title: isDm ? 'Remove from this page' : 'Delete message', style: 'color:var(--red)', onclick: () => deleteMessage(m) }, '🗑') : null);
+        canEdit && !editing ? el('button', { class: 'icon-btn', title: T('Edit message'), onclick: () => startEdit(key, m) }, '✏️') : null,
+        el('button', { class: 'icon-btn', title: T('Copy text'), onclick: () => copy(m.text) }, '📋'),
+        !isDm && can(P.CHAT_PIN) && m.id ? el('button', { class: 'icon-btn', title: T('Pin'), onclick: () => send({ PinMessage: { target, id: m.id, pin: true } }) }, '📌') : null,
+        canDel ? el('button', { class: 'icon-btn', title: isDm ? T('Remove from this page') : T('Delete message'), style: 'color:var(--red)', onclick: () => deleteMessage(m) }, '🗑') : null);
       out.push(el('div', { class: 'msg' + (cont ? ' cont' : '') },
         avatar(m.from_name, m.from_uid, 36),
         el('div', { class: 'body' },
           cont ? null : el('div', { class: 'head' }, el('span', { class: 'from' }, m.from_name), el('span', { class: 'time' }, fmtTime(m.ts))),
-          editing ? [S.editing.box, el('div', { class: 'edit-hint' }, 'Enter to save · Esc to cancel · Shift+Enter for a new line')]
-            : el('div', { class: 'text', title: fmtDate(m.ts) }, messageText(m.text), m.edited ? el('span', { class: 'edited', title: 'Edited ' + fmtDate(m.edited) }, '(edited)') : null)),
+          editing ? [S.editing.box, el('div', { class: 'edit-hint' }, T('Enter to save · Esc to cancel · Shift+Enter for a new line'))]
+            : el('div', { class: 'text', title: fmtDate(m.ts) }, messageText(m.text), m.edited ? el('span', { class: 'edited', title: T('Edited ') + fmtDate(m.edited) }, '(edited)') : null)),
         actions));
       prev = m;
     }
@@ -1310,12 +1364,12 @@
       schedule();
       return;
     }
-    confirmDialog('Delete message', 'Delete this message for everyone? It is also removed from the stored history.', 'Delete', true)
+    confirmDialog(T('Delete message'), T('Delete this message for everyone? It is also removed from the stored history.'), 'Delete', true)
       .then((ok) => ok && send({ DeleteMessage: { target: tabTarget(), id: m.id } }));
   }
   function clearChat() {
     const target = tabTarget();
-    confirmDialog('Clear chat history', 'This removes all messages for everyone and permanently deletes them from the server\'s chat history. It cannot be undone.', 'Clear history', true)
+    confirmDialog(T('Clear chat history'), T('This removes all messages for everyone and permanently deletes them from the server\'s chat history. It cannot be undone.'), T('Clear history'), true)
       .then((ok) => ok && send({ ClearChat: target }));
   }
 
@@ -1323,10 +1377,10 @@
     let placeholder, allowed = true, note;
     // The Server tab shows what happens on the server (connects, leaves): no messages there.
     R.composer.classList.toggle('hidden', S.tab === 'server');
-    if (S.tab === 'server') { placeholder = ''; allowed = false; note = can(P.SERVER_EVENTS) ? 'ℹ This tab shows what happens on the server. Chat in a channel, or with direct messages.' : ''; }
-    else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); placeholder = 'Message #' + (ch ? ch.name : ''); allowed = can(P.CHANNEL_CHAT); note = '🔒 Messages are encrypted in transit and stored encrypted on the server'; }
-    else { placeholder = 'Message @' + personName(S.tab.slice(3)); allowed = can(P.PRIVATE_MESSAGE); note = '🔒 Encrypted in transit · direct messages are not kept by the web page'; }
-    if (!allowed) placeholder = 'You do not have permission to write here';
+    if (S.tab === 'server') { placeholder = ''; allowed = false; note = can(P.SERVER_EVENTS) ? T('ℹ This tab shows what happens on the server. Chat in a channel, or with direct messages.') : ''; }
+    else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); placeholder = T('Message #') + (ch ? ch.name : ''); allowed = can(P.CHANNEL_CHAT); note = T('🔒 Messages are encrypted in transit and stored encrypted on the server'); }
+    else { placeholder = T('Message @') + personName(S.tab.slice(3)); allowed = can(P.PRIVATE_MESSAGE); note = T('🔒 Encrypted in transit · direct messages are not kept by the web page'); }
+    if (!allowed) placeholder = T('You do not have permission to write here');
     R.input.placeholder = placeholder + (allowed ? '  ·  Shift+Enter for a new line' : '');
     R.input.disabled = !allowed;
     R.enc.textContent = note;
@@ -1365,8 +1419,8 @@
   function renderInfo() {
     if (!S.showRight) return;
     put(R.infoTabs, 
-      el('button', { class: 'pill' + (S.right === 'info' ? ' on' : ''), onclick: () => { S.right = 'info'; schedule(); } }, 'ℹ Info'),
-      el('button', { class: 'pill' + (S.right === 'people' ? ' on' : ''), onclick: () => { S.right = 'people'; schedule(); } }, '👥 People'));
+      el('button', { class: 'pill' + (S.right === 'info' ? ' on' : ''), onclick: () => { S.right = 'info'; schedule(); } }, T('ℹ Info')),
+      el('button', { class: 'pill' + (S.right === 'people' ? ' on' : ''), onclick: () => { S.right = 'people'; schedule(); } }, T('👥 People')));
     R.search.classList.toggle('hidden', S.right !== 'people');
     put(R.infoBody, ...(S.right === 'people' ? peopleView() : infoView()));
   }
@@ -1381,14 +1435,14 @@
     if (!s) return [];
     return [
       el('div', { class: 'info-hero' }, avatar(s.name, s.fingerprint, 52, null, true), el('div', null, el('div', { class: 'n' }, s.name), el('div', { class: 'dim small' }, location.host))),
-      el('div', { class: 'section' }, 'Server'),
-      kv([['Version', 'Voxa Server ' + s.version], ['Platform', s.platform], ['Online', S.clients.size + ' / ' + s.max_clients], ['Channels', String(S.channels.size)], ['Uptime', fmtDuration(now() - s.started)], ['Created', fmtDate(s.created)]]),
-      el('div', { class: 'section' }, 'Security'),
-      kv([['Fingerprint', s.fingerprint, true], ['Password', s.has_password ? 'Yes' : 'No'], ['Chat history', s.chat_retention_days ? 'Encrypted on server, kept ' + s.chat_retention_days + ' days' : 'Encrypted on server'], ['Voice', 'Encrypted']]),
-      s.welcome_message ? [el('div', { class: 'section' }, 'Welcome message'), el('div', { class: 'desc' }, s.welcome_message)] : null,
-      s.host_message ? [el('div', { class: 'section' }, 'Host message'), el('div', { class: 'desc' }, s.host_message)] : null,
+      el('div', { class: 'section' }, T('Server')),
+      kv([['Version', T('Voxa Server ') + s.version], ['Platform', s.platform], ['Online', S.clients.size + ' / ' + s.max_clients], ['Channels', String(S.channels.size)], ['Uptime', fmtDuration(now() - s.started)], ['Created', fmtDate(s.created)]]),
+      el('div', { class: 'section' }, T('Security')),
+      kv([['Fingerprint', s.fingerprint, true], ['Password', s.has_password ? T('Yes') : T('No')], ['Chat history', s.chat_retention_days ? T('Encrypted on server, kept ') + s.chat_retention_days + ' days' : T('Encrypted on server')], ['Voice', 'Encrypted']]),
+      s.welcome_message ? [el('div', { class: 'section' }, T('Welcome message')), el('div', { class: 'desc' }, s.welcome_message)] : null,
+      s.host_message ? [el('div', { class: 'section' }, T('Host message')), el('div', { class: 'desc' }, s.host_message)] : null,
       can(P.SERVER_EDIT) ? statsView() : null,
-      can(P.SERVER_EDIT) ? el('div', { class: 'actions-row' }, el('button', { class: 'btn', onclick: editServer }, '⚙ Edit server')) : null,
+      can(P.SERVER_EDIT) ? el('div', { class: 'actions-row' }, el('button', { class: 'btn', onclick: editServer }, T('⚙ Edit server'))) : null,
     ].flat().filter(Boolean);
   }
 
@@ -1410,12 +1464,12 @@
     const row = (k, a, b) => [el('div', { class: 'k' }, k), el('div', { class: 'v' }, fmtSize(a)), el('div', { class: 'v' }, fmtSize(b))];
     const totalIn = t.voice_in + t.files_in + t.screen_in + t.chat_in, totalOut = t.voice_out + t.files_out + t.screen_out + t.chat_out;
     return [
-      el('div', { class: 'section' }, 'Traffic since the server started'),
+      el('div', { class: 'section' }, T('Traffic since the server started')),
       el('div', { class: 'stats' },
-        el('div'), el('div', { class: 'k' }, '⬇ Received'), el('div', { class: 'k' }, '⬆ Sent'),
-        row('Voice', t.voice_in, t.voice_out), row('File transfers', t.files_in, t.files_out), row('Screen sharing & video', t.screen_in, t.screen_out), row('Chat & other', t.chat_in, t.chat_out),
-        [el('div', { class: 'k strong' }, 'Total'), el('div', { class: 'v strong' }, fmtSize(totalIn)), el('div', { class: 'v strong' }, fmtSize(totalOut))]),
-      el('div', { class: 'dim small' }, 'All traffic combined: ' + fmtSize(totalIn + totalOut)),
+        el('div'), el('div', { class: 'k' }, T('⬇ Received')), el('div', { class: 'k' }, T('⬆ Sent')),
+        row(T('Voice'), t.voice_in, t.voice_out), row(T('File transfers'), t.files_in, t.files_out), row(T('Screen sharing & video'), t.screen_in, t.screen_out), row(T('Chat & other'), t.chat_in, t.chat_out),
+        [el('div', { class: 'k strong' }, T('Total')), el('div', { class: 'v strong' }, fmtSize(totalIn)), el('div', { class: 'v strong' }, fmtSize(totalOut))]),
+      el('div', { class: 'dim small' }, T('All traffic combined: ') + fmtSize(totalIn + totalOut)),
     ];
   }
 
@@ -1425,24 +1479,24 @@
     const codec = codecOf(ch.codec_quality);
     return [
       el('div', { class: 'info-hero' }, el('span', { class: 'avatar sq', style: 'width:52px;height:52px;font-size:24px;background:var(--card);color:var(--dim)' }, sp ? '―' : ch.has_password ? '🔒' : '💬'),
-        el('div', null, el('div', { class: 'n' }, sp ? 'Separator' : ch.name), el('div', { class: 'dim small' }, sp ? ch.name : ch.topic || ''))),
-      el('div', { class: 'section' }, 'Channel'),
-      kv(sp ? [['Type', 'Separator (nobody can join it)']] : [
+        el('div', null, el('div', { class: 'n' }, sp ? T('Separator') : ch.name), el('div', { class: 'dim small' }, sp ? ch.name : ch.topic || ''))),
+      el('div', { class: 'section' }, T('Channel')),
+      kv(sp ? [['Type', T('Separator (nobody can join it)')]] : [
         ['Type', KIND_NAMES[ch.kind] + (ch.is_default ? ' · default channel' : '')],
         ['Codec', CODEC_NAMES[codec] + (codec === 'lossless' ? '' : ' · quality ' + qualityOf(ch.codec_quality))],
         ['Bitrate', '~' + bitrate(ch.codec_quality) + ' kbit/s' + (codec === 'voice' ? '' : ' stereo')],
         ['Clients', n + (ch.max_clients != null ? ' / ' + ch.max_clients : '')],
-        ['Password', ch.has_password ? 'Yes' : 'No'],
+        ['Password', ch.has_password ? T('Yes') : T('No')],
         ['Talk power', ch.needed_talk_power ? 'needs ' + ch.needed_talk_power : 'anyone'],
         ['Join power', ch.needed_join_power ? 'needs ' + ch.needed_join_power : 'anyone'],
-        ['Voice', ch.voice_encrypted ? 'Encrypted' : 'Not encrypted'],
+        ['Voice', ch.voice_encrypted ? T('Encrypted') : T('Not encrypted')],
       ]),
-      ch.description ? [el('div', { class: 'section' }, 'Description'), el('div', { class: 'desc' }, ch.description)] : null,
+      ch.description ? [el('div', { class: 'section' }, T('Description')), el('div', { class: 'desc' }, ch.description)] : null,
       el('div', { class: 'actions-row' },
-        !sp && ch.id !== myChannel() ? el('button', { class: 'btn', onclick: () => joinChannel(ch) }, '➜ Join') : null,
-        ch.id === myChannel() ? el('button', { class: 'btn', title: 'Stay connected to the server without being in a channel', onclick: leaveChannel }, '🚪 Leave') : null,
-        can(P.CHANNEL_EDIT) ? el('button', { class: 'btn', onclick: () => channelDialog(ch) }, '✏️ Edit') : null,
-        can(P.CHANNEL_DELETE) ? el('button', { class: 'btn danger', onclick: () => deleteChannel(ch) }, '🗑 Delete') : null),
+        !sp && ch.id !== myChannel() ? el('button', { class: 'btn', onclick: () => joinChannel(ch) }, T('➜ Join')) : null,
+        ch.id === myChannel() ? el('button', { class: 'btn', title: T('Stay connected to the server without being in a channel'), onclick: leaveChannel }, T('🚪 Leave')) : null,
+        can(P.CHANNEL_EDIT) ? el('button', { class: 'btn', onclick: () => channelDialog(ch) }, T('✏️ Edit')) : null,
+        can(P.CHANNEL_DELETE) ? el('button', { class: 'btn danger', onclick: () => deleteChannel(ch) }, T('🗑 Delete')) : null),
     ].flat().filter(Boolean);
   }
 
@@ -1452,25 +1506,25 @@
     const away = c.away != null;
     return [
       el('div', { class: 'info-hero' }, avatar(c.nickname, c.uid, 52, away ? 'var(--yellow)' : 'var(--green)'),
-        el('div', null, el('div', { class: 'n' }, c.nickname), el('div', { class: 'small', style: 'color:' + (away ? 'var(--yellow)' : 'var(--green)') }, away ? awayText(c.away) : 'Online'))),
-      el('div', { class: 'section' }, 'Client'),
+        el('div', null, el('div', { class: 'n' }, c.nickname), el('div', { class: 'small', style: 'color:' + (away ? 'var(--yellow)' : 'var(--green)') }, away ? awayText(c.away) : T('Online')))),
+      el('div', { class: 'section' }, T('Client')),
       kv([
         ['Channel', ch ? ch.name : ''],
         ['Server groups', groups || '—'],
         ['Channel group', S.groups.get(c.channel_group)?.name || '—'],
-        ['Platform', c.platform === 'Web' ? 'Web admin page' : c.platform],
-        c.platform === 'Web' ? null : ['Version', 'Voxa ' + c.version],
+        ['Platform', c.platform === 'Web' ? T('Web admin page') : c.platform],
+        c.platform === 'Web' ? null : ['Version', T('Voxa ') + c.version],
         ['Connected', fmtDuration(now() - c.connected_at)],
-        ['Microphone', c.input_muted ? 'Muted' : 'On'],
-        ['Speakers', c.output_muted ? 'Muted' : 'On'],
+        ['Microphone', c.input_muted ? T('Muted') : T('On')],
+        ['Speakers', c.output_muted ? T('Muted') : T('On')],
         c.streaming ? ['Sharing', c.streaming.title + ' (' + c.streaming.width + '×' + c.streaming.height + ')'] : null,
         ['Unique ID', c.uid, true],
       ]),
-      c.description ? [el('div', { class: 'section' }, 'Description'), el('div', { class: 'desc' }, c.description)] : null,
+      c.description ? [el('div', { class: 'section' }, T('Description')), el('div', { class: 'desc' }, c.description)] : null,
       c.id !== S.me ? el('div', { class: 'actions-row' },
-        el('button', { class: 'btn', onclick: () => { openDm(c.uid, c.nickname); activateTab('dm:' + c.uid); } }, '💬 Message'),
-        can(P.CLIENT_POKE) ? el('button', { class: 'btn', onclick: () => pokeClient(c) }, '👉 Poke') : null,
-        el('button', { class: 'btn', onclick: (e) => clientMenu(c, e.clientX, e.clientY) }, '⋯ More')) : null,
+        el('button', { class: 'btn', onclick: () => { openDm(c.uid, c.nickname); activateTab('dm:' + c.uid); } }, T('💬 Message')),
+        can(P.CLIENT_POKE) ? el('button', { class: 'btn', onclick: () => pokeClient(c) }, T('👉 Poke')) : null,
+        el('button', { class: 'btn', onclick: (e) => clientMenu(c, e.clientX, e.clientY) }, T('⋯ More'))) : null,
     ].flat().filter(Boolean);
   }
 
@@ -1488,26 +1542,26 @@
     // Right-click: message, or (offline, with "Create, edit and delete groups") forget them.
     const personMenu = (uid, name, online, x, y) => menu(x, y, [
       { head: name },
-      { label: '💬  Send Message', onClick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
-      !online && can(P.GROUP_MANAGE) ? { label: '🗑  Remove from Server…', onClick: () => forgetPerson(uid, name) } : null,
-      S.accountPolicy && can(P.SERVER_EDIT) && uid !== S.uid ? { label: '🔑  Reset Account Password…', onClick: () => resetAccount(uid, name) } : null,
+      { label: T('💬  Send Message'), onClick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
+      !online && can(P.GROUP_MANAGE) ? { label: T('🗑  Remove from Server…'), onClick: () => forgetPerson(uid, name) } : null,
+      S.accountPolicy && can(P.SERVER_EDIT) && uid !== S.uid ? { label: T('🔑  Reset Account Password…'), onClick: () => resetAccount(uid, name) } : null,
     ]);
-    const row = (uid, name, sub, dot) => el('div', { class: 'person' + (dot ? '' : ' off'), title: dot ? 'Send a direct message' : 'Send a message: it is delivered when they come online (right-click for more)', onclick: () => { openDm(uid, name); activateTab('dm:' + uid); }, oncontextmenu: (e) => { e.preventDefault(); personMenu(uid, name, !!dot, e.clientX, e.clientY); } },
+    const row = (uid, name, sub, dot) => el('div', { class: 'person' + (dot ? '' : ' off'), title: dot ? T('Send a direct message') : T('Send a message: it is delivered when they come online (right-click for more)'), onclick: () => { openDm(uid, name); activateTab('dm:' + uid); }, oncontextmenu: (e) => { e.preventDefault(); personMenu(uid, name, !!dot, e.clientX, e.clientY); } },
       avatar(name, uid, 30, dot),
       el('div', { style: 'min-width:0' }, el('div', { class: 'n' }, name), el('div', { class: 'dim small' }, sub)));
     // Where they are (a channel, or just on the server like Discord) and their status.
     const status = (c) => {
       const ch = c.channel !== 0 && S.channels.get(c.channel);
-      const place = ch ? 'in ' + ch.name : 'on the server';
+      const place = ch ? 'in ' + ch.name : T('on the server');
       const p = S.presences.get(c.id);
-      const [dot, st] = c.away != null ? ['var(--yellow)', awayText(c.away)] : p === 'Busy' ? ['var(--red)', 'Do not disturb'] : p === 'Invisible' ? ['var(--dim)', 'Invisible'] : ['var(--green)', ''];
+      const [dot, st] = c.away != null ? ['var(--yellow)', awayText(c.away)] : p === 'Busy' ? ['var(--red)', T('Do not disturb')] : p === 'Invisible' ? ['var(--dim)', 'Invisible'] : ['var(--green)', ''];
       return [dot, (st ? st + ' · ' : '') + place + (c.platform === 'Web' ? ' · web' : '')];
     };
     return [
-      el('div', { class: 'section' }, 'Online — ' + online.length),
+      el('div', { class: 'section' }, T('Online — ') + online.length),
       online.map((c) => { const [dot, sub] = status(c); return row(c.uid, c.nickname, sub, dot); }),
-      offline.length ? el('div', { class: 'section' }, 'Offline — ' + offline.length) : null,
-      offline.map((p) => row(p.uid, p.nickname, p.last_seen ? 'last seen ' + fmtDuration(now() - p.last_seen) + ' ago' : 'offline', false)),
+      offline.length ? el('div', { class: 'section' }, T('Offline — ') + offline.length) : null,
+      offline.map((p) => row(p.uid, p.nickname, p.last_seen ? T('last seen ') + fmtDuration(now() - p.last_seen) + ' ago' : 'offline', false)),
     ].flat().filter(Boolean);
   }
 
@@ -1531,17 +1585,17 @@
 
   function serverMenu(x, y) {
     menu(x, y, [
-      { head: S.server ? S.server.name : 'Server' },
-      S.account ? { label: '🔐  Account & Security…', onClick: accountDialog } : null,
-      can(P.SERVER_EDIT) ? { label: '⚙  Edit Virtual Server…', onClick: editServer } : null,
-      can(P.GROUP_MANAGE) ? { label: '👥  Groups & Permissions…', onClick: groupsDialog } : null,
-      can(P.BAN_LIST) ? { label: '⛔  Ban List…', onClick: banListDialog } : null,
-      can(P.PRIVILEGE_KEY_CREATE) ? { label: '🔑  Create Privilege Key…', onClick: privilegeKeyDialog } : null,
-      { label: '🎟  Use Privilege Key…', onClick: usePrivilegeKey },
+      { head: S.server ? S.server.name : T('Server') },
+      S.account ? { label: T('🔐  Account & Security…'), onClick: accountDialog } : null,
+      can(P.SERVER_EDIT) ? { label: T('⚙  Edit Virtual Server…'), onClick: editServer } : null,
+      can(P.GROUP_MANAGE) ? { label: T('👥  Groups & Permissions…'), onClick: groupsDialog } : null,
+      can(P.BAN_LIST) ? { label: T('⛔  Ban List…'), onClick: banListDialog } : null,
+      can(P.PRIVILEGE_KEY_CREATE) ? { label: T('🔑  Create Privilege Key…'), onClick: privilegeKeyDialog } : null,
+      { label: T('🎟  Use Privilege Key…'), onClick: usePrivilegeKey },
       { sep: true },
-      canCreate() ? { label: '➕  Create Channel…', onClick: () => channelDialog(null, null) } : null,
-      can(P.CHAT_CLEAR) ? { label: '🗑  Clear Server Chat…', danger: true, onClick: () => confirmDialog('Clear server chat', 'Delete every server chat message for everyone, including the stored history?', 'Clear history', true).then((ok) => ok && send({ ClearChat: 'Server' })) } : null,
-      { label: '📋  Copy Fingerprint', onClick: () => copy(S.server.fingerprint) },
+      canCreate() ? { label: T('➕  Create Channel…'), onClick: () => channelDialog(null, null) } : null,
+      can(P.CHAT_CLEAR) ? { label: T('🗑  Clear Server Chat…'), danger: true, onClick: () => confirmDialog(T('Clear server chat'), T('Delete every server chat message for everyone, including the stored history?'), T('Clear history'), true).then((ok) => ok && send({ ClearChat: 'Server' })) } : null,
+      { label: T('📋  Copy Fingerprint'), onClick: () => copy(S.server.fingerprint) },
     ]);
   }
 
@@ -1569,20 +1623,20 @@
     const sib = siblings(ch);
     const i = sib.findIndex((c) => c.id === ch.id);
     menu(x, y, [
-      { head: sp ? 'Separator' : ch.name },
-      !sp && ch.id !== myChannel() ? { label: '➜  Join Channel', onClick: () => joinChannel(ch) } : null,
-      ch.id === myChannel() ? { label: '🚪  Leave Channel', onClick: leaveChannel } : null,
-      { label: 'ℹ  Channel Info', onClick: () => { select({ kind: 'channel', id: ch.id }); S.showRight = true; } },
+      { head: sp ? T('Separator') : ch.name },
+      !sp && ch.id !== myChannel() ? { label: T('➜  Join Channel'), onClick: () => joinChannel(ch) } : null,
+      ch.id === myChannel() ? { label: T('🚪  Leave Channel'), onClick: leaveChannel } : null,
+      { label: T('ℹ  Channel Info'), onClick: () => { select({ kind: 'channel', id: ch.id }); S.showRight = true; } },
       { sep: true },
-      canCreate() ? { label: '➕  Create Channel…', onClick: () => channelDialog(null, ch.parent ?? null) } : null,
-      canCreate() && !sp ? { label: '➕  Create Sub-Channel…', onClick: () => channelDialog(null, ch.id) } : null,
-      can(P.CHANNEL_EDIT) ? { label: '✏  Edit Channel…', onClick: () => channelDialog(ch) } : null,
-      canCreate() && !sp ? { label: '⧉  Clone Channel…', onClick: () => cloneChannel(ch) } : null,
-      can(P.CHANNEL_EDIT) ? { label: '▲  Move Up', disabled: i <= 0, onClick: () => moveChannel(ch, -1) } : null,
-      can(P.CHANNEL_EDIT) ? { label: '▼  Move Down', disabled: i >= sib.length - 1, onClick: () => moveChannel(ch, 1) } : null,
-      { label: '📋  Copy Channel Name', onClick: () => copy(ch.name) },
+      canCreate() ? { label: T('➕  Create Channel…'), onClick: () => channelDialog(null, ch.parent ?? null) } : null,
+      canCreate() && !sp ? { label: T('➕  Create Sub-Channel…'), onClick: () => channelDialog(null, ch.id) } : null,
+      can(P.CHANNEL_EDIT) ? { label: T('✏  Edit Channel…'), onClick: () => channelDialog(ch) } : null,
+      canCreate() && !sp ? { label: T('⧉  Clone Channel…'), onClick: () => cloneChannel(ch) } : null,
+      can(P.CHANNEL_EDIT) ? { label: T('▲  Move Up'), disabled: i <= 0, onClick: () => moveChannel(ch, -1) } : null,
+      can(P.CHANNEL_EDIT) ? { label: T('▼  Move Down'), disabled: i >= sib.length - 1, onClick: () => moveChannel(ch, 1) } : null,
+      { label: T('📋  Copy Channel Name'), onClick: () => copy(ch.name) },
       can(P.CHANNEL_DELETE) ? { sep: true } : null,
-      can(P.CHANNEL_DELETE) ? { label: '🗑  Delete Channel…', danger: true, onClick: () => deleteChannel(ch) } : null,
+      can(P.CHANNEL_DELETE) ? { label: T('🗑  Delete Channel…'), danger: true, onClick: () => deleteChannel(ch) } : null,
     ]);
   }
 
@@ -1590,33 +1644,33 @@
     if (c.id === S.me) {
       menu(x, y, [
         { head: c.nickname },
-        { label: '✏  Change Nickname…', onClick: changeNickname },
-        { label: '🟢  Set Status…', onClick: () => presenceMenu(x, y) },
-        can(P.CHANNEL_COMMANDER) ? { label: '⭐  Toggle Channel Commander', onClick: () => send({ UpdateSelf: { commander: !c.commander } }) } : null,
-        { label: '📝  Edit Description…', onClick: () => editDescription(c) },
-        { label: '📋  Copy Unique ID', onClick: () => copy(c.uid) },
+        { label: T('✏  Change Nickname…'), onClick: changeNickname },
+        { label: T('🟢  Set Status…'), onClick: () => presenceMenu(x, y) },
+        can(P.CHANNEL_COMMANDER) ? { label: T('⭐  Toggle Channel Commander'), onClick: () => send({ UpdateSelf: { commander: !c.commander } }) } : null,
+        { label: T('📝  Edit Description…'), onClick: () => editDescription(c) },
+        { label: T('📋  Copy Unique ID'), onClick: () => copy(c.uid) },
       ]);
       return;
     }
     menu(x, y, [
       { head: c.nickname },
-      { label: '💬  Send Message', onClick: () => { openDm(c.uid, c.nickname); activateTab('dm:' + c.uid); } },
-      can(P.CLIENT_POKE) ? { label: '👉  Poke…', onClick: () => pokeClient(c) } : null,
-      can(P.CLIENT_MOVE) ? { label: '➜  Move to Channel…', onClick: () => moveClientDialog(c) } : null,
-      can(P.CLIENT_MOVE) && inChannel() && c.channel !== myChannel() ? { label: '⤵  Move to My Channel', onClick: () => send({ MoveClient: { target: c.id, channel: myChannel() } }) } : null,
-      can(P.TALK_POWER_GRANT) ? { label: c.is_talker ? '🗣  Revoke Talk Power' : '🗣  Grant Talk Power', onClick: () => send({ SetTalker: { target: c.id, talker: !c.is_talker } }) } : null,
+      { label: T('💬  Send Message'), onClick: () => { openDm(c.uid, c.nickname); activateTab('dm:' + c.uid); } },
+      can(P.CLIENT_POKE) ? { label: T('👉  Poke…'), onClick: () => pokeClient(c) } : null,
+      can(P.CLIENT_MOVE) ? { label: T('➜  Move to Channel…'), onClick: () => moveClientDialog(c) } : null,
+      can(P.CLIENT_MOVE) && inChannel() && c.channel !== myChannel() ? { label: T('⤵  Move to My Channel'), onClick: () => send({ MoveClient: { target: c.id, channel: myChannel() } }) } : null,
+      can(P.TALK_POWER_GRANT) ? { label: c.is_talker ? T('🗣  Revoke Talk Power') : T('🗣  Grant Talk Power'), onClick: () => send({ SetTalker: { target: c.id, talker: !c.is_talker } }) } : null,
       { sep: true },
-      can(P.GROUP_ASSIGN_SERVER) ? { label: '👥  Server Groups…', onClick: () => serverGroupsDialog(c) } : null,
-      can(P.GROUP_ASSIGN_CHANNEL) ? { label: '👥  Channel Group…', onClick: () => channelGroupDialog(c) } : null,
-      can(P.GROUP_MANAGE) ? { label: '🔐  Permissions…', onClick: () => clientPermsDialog(c) } : null,
-      S.accountPolicy && can(P.SERVER_EDIT) && c.id !== S.me ? { label: '🔑  Reset Account Password…', onClick: () => resetAccount(c.uid, c.nickname) } : null,
-      can(P.CLIENT_DESCRIPTION_EDIT) ? { label: '📝  Edit Description…', onClick: () => editDescription(c) } : null,
-      can(P.CLIENT_DESCRIPTION_EDIT) && avatars.get(c.uid)?.image ? { label: '🖼  Remove Avatar Picture…', danger: true, onClick: () => confirmDialog('Remove avatar picture', 'Remove the avatar picture of ' + c.nickname + '? They cannot use the same picture again on this server.', 'Remove', true).then((ok) => ok && send({ ClearAvatar: c.uid })) } : null,
-      { label: '📋  Copy Unique ID', onClick: () => copy(c.uid) },
+      can(P.GROUP_ASSIGN_SERVER) ? { label: T('👥  Server Groups…'), onClick: () => serverGroupsDialog(c) } : null,
+      can(P.GROUP_ASSIGN_CHANNEL) ? { label: T('👥  Channel Group…'), onClick: () => channelGroupDialog(c) } : null,
+      can(P.GROUP_MANAGE) ? { label: T('🔐  Permissions…'), onClick: () => clientPermsDialog(c) } : null,
+      S.accountPolicy && can(P.SERVER_EDIT) && c.id !== S.me ? { label: T('🔑  Reset Account Password…'), onClick: () => resetAccount(c.uid, c.nickname) } : null,
+      can(P.CLIENT_DESCRIPTION_EDIT) ? { label: T('📝  Edit Description…'), onClick: () => editDescription(c) } : null,
+      can(P.CLIENT_DESCRIPTION_EDIT) && avatars.get(c.uid)?.image ? { label: T('🖼  Remove Avatar Picture…'), danger: true, onClick: () => confirmDialog(T('Remove avatar picture'), T('Remove the avatar picture of ') + c.nickname + '? They cannot use the same picture again on this server.', 'Remove', true).then((ok) => ok && send({ ClearAvatar: c.uid })) } : null,
+      { label: T('📋  Copy Unique ID'), onClick: () => copy(c.uid) },
       { sep: true },
-      can(P.CLIENT_KICK_CHANNEL) ? { label: '👢  Kick from Channel…', danger: true, onClick: () => kickClient(c, false) } : null,
-      can(P.CLIENT_KICK_SERVER) ? { label: '👢  Kick from Server…', danger: true, onClick: () => kickClient(c, true) } : null,
-      can(P.CLIENT_BAN) ? { label: '⛔  Ban…', danger: true, onClick: () => banClient(c) } : null,
+      can(P.CLIENT_KICK_CHANNEL) ? { label: T('👢  Kick from Channel…'), danger: true, onClick: () => kickClient(c, false) } : null,
+      can(P.CLIENT_KICK_SERVER) ? { label: T('👢  Kick from Server…'), danger: true, onClick: () => kickClient(c, true) } : null,
+      can(P.CLIENT_BAN) ? { label: T('⛔  Ban…'), danger: true, onClick: () => banClient(c) } : null,
     ]);
   }
 
@@ -1632,7 +1686,7 @@
       onclick: async () => { const r = b.onClick ? await b.onClick() : undefined; if (r !== false) close(); },
     }, b.label));
     ov.append(el('div', { class: 'dialog' + (opts.wide ? ' wide' : '') },
-      el('div', { class: 'dh' }, title, opts.noClose ? null : el('button', { class: 'icon-btn', title: 'Close', onclick: close }, '✕')),
+      el('div', { class: 'dh' }, title, opts.noClose ? null : el('button', { class: 'icon-btn', title: T('Close'), onclick: close }, '✕')),
       el('div', { class: 'db' }, body),
       foot.length ? el('div', { class: 'df' }, foot) : null));
     ov.addEventListener('mousedown', (e) => { if (e.target === ov && !opts.noClose) close(); });
@@ -1649,25 +1703,25 @@
   // Resets someone's account password (servers 1.25.1+): the server answers with AccountReset.
   function resetAccount(uid, name) {
     const mfa = el('input', { type: 'checkbox' });
-    dialog('Reset account password: ' + name, el('div', null,
-      el('p', { style: 'margin-top:0' }, 'The server makes a temporary password for their account and shows it to you once. Give it to them: they sign in with it and must then choose a new password. Their remembered devices are signed out.'),
-      el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, mfa, 'Also turn off their authenticator app (they lost their phone or key)'),
-      el('p', { class: 'dim small' }, 'Make sure it really is them asking: whoever has the temporary password gets the account.')), [
-      { label: 'Cancel' },
-      { label: 'Reset password', danger: true, onClick: () => send({ ResetAccount: { uid, remove_mfa: mfa.checked } }) },
+    dialog(T('Reset account password: ') + name, el('div', null,
+      el('p', { style: 'margin-top:0' }, T('The server makes a temporary password for their account and shows it to you once. Give it to them: they sign in with it and must then choose a new password. Their remembered devices are signed out.')),
+      el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, mfa, T('Also turn off their authenticator app (they lost their phone or key)')),
+      el('p', { class: 'dim small' }, T('Make sure it really is them asking: whoever has the temporary password gets the account.'))), [
+      { label: T('Cancel') },
+      { label: T('Reset password'), danger: true, onClick: () => send({ ResetAccount: { uid, remove_mfa: mfa.checked } }) },
     ]);
   }
   async function forgetPerson(uid, name) {
-    const text = 'The server forgets ' + name + ': their server groups, personal permissions, channel groups, picture and messages waiting for them. ' +
-      'Their chat messages stay. If they connect again they start fresh, like someone new (to keep them out, ban them instead).';
-    if (await confirmDialog('Remove from server', text, 'Remove', true)) send({ ForgetClient: uid });
+    const text = T('The server forgets ') + name + ': their server groups, personal permissions, channel groups, picture and messages waiting for them. ' +
+      T('Their chat messages stay. If they connect again they start fresh, like someone new (to keep them out, ban them instead).');
+    if (await confirmDialog(T('Remove from server'), text, 'Remove', true)) send({ ForgetClient: uid });
   }
 
   function confirmDialog(title, text, ok, danger) {
     return new Promise((res) => {
       let done = false;
       dialog(title, el('p', { style: 'margin:0' }, text), [
-        { label: 'Cancel', onClick: () => { done = true; res(false); } },
+        { label: T('Cancel'), onClick: () => { done = true; res(false); } },
         { label: ok || 'OK', primary: !danger, danger, onClick: () => { done = true; res(true); } },
       ], { onClose: () => { if (!done) res(false); } });
     });
@@ -1680,7 +1734,7 @@
       const submit = () => { done = true; res(input.value); };
       if (!opts.multiline) input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); submit(); d.close(); } });
       const d = dialog(title, el('div', { class: 'form', style: 'grid-template-columns:120px 1fr' }, el('label', null, label), input, opts.note ? el('div', { class: 'note' }, opts.note) : null), [
-        { label: 'Cancel', onClick: () => { done = true; res(null); } },
+        { label: T('Cancel'), onClick: () => { done = true; res(null); } },
         { label: ok || 'OK', primary: true, onClick: submit },
       ], { onClose: () => { if (!done) res(null); } });
     });
@@ -1699,13 +1753,13 @@
   function joinChannel(ch) {
     if (spacer(ch.name)) return;
     if (ch.has_password && !can(P.CHANNEL_JOIN_IGNORE_PASSWORD)) {
-      promptDialog('Join ' + ch.name, 'Password', '', 'Join', { password: true }).then((pw) => pw != null && send({ SwitchChannel: { channel: ch.id, password: pw } }));
+      promptDialog(T('Join ') + ch.name, 'Password', '', 'Join', { password: true }).then((pw) => pw != null && send({ SwitchChannel: { channel: ch.id, password: pw } }));
     } else send({ SwitchChannel: { channel: ch.id, password: null } });
   }
 
   function changeNickname() {
     const me = S.clients.get(S.me);
-    promptDialog('Change nickname', 'Nickname', me ? me.nickname : '', 'Change', { max: 30 }).then((n) => {
+    promptDialog(T('Change nickname'), 'Nickname', me ? me.nickname : '', 'Change', { max: 30 }).then((n) => {
       if (n && n.trim()) {
         send({ UpdateSelf: { nickname: n.trim() } });
         localStorage.setItem('voxa-web-nick', n.trim());
@@ -1716,15 +1770,15 @@
   function presenceMenu(x, y) {
     const cur = myPresence();
     menu(x, y, [
-      { head: 'Status' },
+      { head: T('Status') },
       ...PRESENCES.map(([p, , label]) => ({ label: (cur === p ? '◉  ' : '○  ') + label, onClick: () => setPresence(p) })),
-      { label: '🌙  Away with a message…', onClick: toggleAwayMessage },
+      { label: T('🌙  Away with a message…'), onClick: toggleAwayMessage },
       inChannel() ? { sep: true } : null,
-      inChannel() ? { label: '🚪  Leave Channel', onClick: leaveChannel } : null,
+      inChannel() ? { label: T('🚪  Leave Channel'), onClick: leaveChannel } : null,
     ]);
   }
   function toggleAwayMessage() {
-    promptDialog('Set away', 'Message', '', 'Set away', { max: 80, note: 'Optional, shown next to your name.' }).then((m) => m != null && send({ UpdateSelf: { away: m.trim() } }));
+    promptDialog(T('Set away'), 'Message', '', T('Set away'), { max: 80, note: T('Optional, shown next to your name.') }).then((m) => m != null && send({ UpdateSelf: { away: m.trim() } }));
   }
   function toggleAway() {
     const me = S.clients.get(S.me);
@@ -1733,17 +1787,17 @@
     else toggleAwayMessage();
   }
   function editDescription(c) {
-    promptDialog('Edit description', 'Description', c.description, 'Save', { multiline: true, max: 500 }).then((d) => {
+    promptDialog(T('Edit description'), 'Description', c.description, 'Save', { multiline: true, max: 500 }).then((d) => {
       if (d == null) return;
       if (c.id === S.me) send({ UpdateSelf: { description: d } });
       else send({ EditClientDescription: { target: c.id, description: d } });
     });
   }
   function pokeClient(c) {
-    promptDialog('Poke ' + c.nickname, 'Message', '', 'Poke', { max: 100 }).then((m) => m != null && send({ Poke: { target: c.id, message: m } }));
+    promptDialog(T('Poke ') + c.nickname, 'Message', '', 'Poke', { max: 100 }).then((m) => m != null && send({ Poke: { target: c.id, message: m } }));
   }
   function kickClient(c, fromServer) {
-    promptDialog((fromServer ? 'Kick from server: ' : 'Kick from channel: ') + c.nickname, 'Reason', '', 'Kick', { max: 80 })
+    promptDialog((fromServer ? T('Kick from server: ') : T('Kick from channel: ')) + c.nickname, 'Reason', '', 'Kick', { max: 80 })
       .then((r) => r != null && send({ Kick: { target: c.id, from_server: fromServer, reason: r } }));
   }
   const DURATIONS = [[3600, '1 hour'], [86400, '1 day'], [7 * 86400, '7 days'], [30 * 86400, '30 days'], [0, 'Permanent']];
@@ -1754,16 +1808,16 @@
     const dur = durationSelect();
     const reason = el('input', { type: 'text', maxlength: '80' });
     const check = (label, on, note, disabled) => { const i = el('input', { type: 'checkbox', checked: on && !disabled, disabled }); return [i, el('label', { style: 'display:flex;gap:6px;color:var(--text)' + (disabled ? ';opacity:.5' : ''), title: note }, i, label)]; };
-    const [byUid, uidRow] = check('Unique ID (this identity)', true, '');
-    const [byIp, ipRow] = check('IP address (' + 'their current address)', true, '');
+    const [byUid, uidRow] = check(T('Unique ID (this identity)'), true, '');
+    const [byIp, ipRow] = check(T('IP address (') + T('their current address)'), true, '');
     const noHw = c.platform === 'Web';
-    const [byHw, hwRow] = check('Hardware (this PC: network adapters and Windows machine ID)', false, '', noHw);
-    dialog('Ban ' + c.nickname, el('div', { class: 'form' },
-      field('Ban by', el('div', { style: 'display:flex;flex-direction:column;gap:4px' }, uidRow, ipRow, hwRow)),
-      noHw ? el('div', { class: 'note' }, 'The web page has no hardware to ban.') : el('div', { class: 'note' }, 'Hardware bans stop new identities from the same PC.'),
-      field('Duration', dur), field('Reason', reason)), [
-      { label: 'Cancel' },
-      { label: 'Ban', danger: true, onClick: () => {
+    const [byHw, hwRow] = check(T('Hardware (this PC: network adapters and Windows machine ID)'), false, '', noHw);
+    dialog(T('Ban ') + c.nickname, el('div', { class: 'form' },
+      field(T('Ban by'), el('div', { style: 'display:flex;flex-direction:column;gap:4px' }, uidRow, ipRow, hwRow)),
+      noHw ? el('div', { class: 'note' }, T('The web page has no hardware to ban.')) : el('div', { class: 'note' }, T('Hardware bans stop new identities from the same PC.')),
+      field(T('Duration'), dur), field(T('Reason'), reason)), [
+      { label: T('Cancel') },
+      { label: T('Ban'), danger: true, onClick: () => {
         if (!byUid.checked && !byIp.checked && !byHw.checked) { toast('Choose at least one thing to ban', 'warn'); return false; }
         send({ BanWith: { target: c.id, uid: byUid.checked, ip: byIp.checked, hardware: byHw.checked, duration_secs: Number(dur.value) || null, reason: reason.value } });
       } },
@@ -1771,24 +1825,24 @@
   }
   function moveClientDialog(c) {
     const sel = el('select', null, [...S.channels.values()].filter((ch) => !spacer(ch.name)).sort((a, b) => a.name.localeCompare(b.name)).map((ch) => el('option', { value: String(ch.id), selected: ch.id === c.channel }, ch.name)));
-    dialog('Move ' + c.nickname, el('div', { class: 'form' }, field('Channel', sel)), [
-      { label: 'Cancel' },
-      { label: 'Move', primary: true, onClick: () => send({ MoveClient: { target: c.id, channel: Number(sel.value) } }) },
+    dialog(T('Move ') + c.nickname, el('div', { class: 'form' }, field(T('Channel'), sel)), [
+      { label: T('Cancel') },
+      { label: T('Move'), primary: true, onClick: () => send({ MoveClient: { target: c.id, channel: Number(sel.value) } }) },
     ]);
   }
   function deleteChannel(ch) {
     const n = subtree(ch.id).reduce((a, id) => a + clientsIn(id).length, 0);
     const subs = subtree(ch.id).length - 1;
-    const text = 'Delete "' + (spacer(ch.name) ? 'this separator' : ch.name) + '"' + (subs ? ' and its ' + subs + ' sub-channel(s)' : '') + '?' + (n ? ' ' + n + ' client(s) inside are moved to the default channel.' : '') + ' Its files and chat history are deleted too.';
-    confirmDialog('Delete channel', text, 'Delete', true).then((ok) => ok && send({ DeleteChannel: { id: ch.id, force: true } }));
+    const text = T('Delete "') + (spacer(ch.name) ? T('this separator') : ch.name) + '"' + (subs ? T(' and its ') + subs + ' sub-channel(s)' : '') + '?' + (n ? ' ' + n + ' client(s) inside are moved to the default channel.' : '') + T(' Its files and chat history are deleted too.');
+    confirmDialog(T('Delete channel'), text, 'Delete', true).then((ok) => ok && send({ DeleteChannel: { id: ch.id, force: true } }));
   }
   function cloneChannel(ch) {
     const name = el('input', { type: 'text', value: ch.name + ' (copy)', maxlength: '40' });
     const kids = el('input', { type: 'checkbox', checked: children(ch.id).length > 0 });
-    dialog('Clone channel', el('div', { class: 'form' }, field('Name', name), [el('span'), el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, kids, 'Include sub-channels')],
-      el('div', { class: 'note' }, 'Copies every setting, the password and everyone\'s channel group.')), [
-      { label: 'Cancel' },
-      { label: 'Clone', primary: true, onClick: () => send({ CloneChannel: { source: ch.id, name: name.value.trim(), with_children: kids.checked } }) },
+    dialog(T('Clone channel'), el('div', { class: 'form' }, field(T('Name'), name), [el('span'), el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, kids, T('Include sub-channels'))],
+      el('div', { class: 'note' }, T('Copies every setting, the password and everyone\'s channel group.'))), [
+      { label: T('Cancel') },
+      { label: T('Clone'), primary: true, onClick: () => send({ CloneChannel: { source: ch.id, name: name.value.trim(), with_children: kids.checked } }) },
     ]);
   }
 
@@ -1822,7 +1876,7 @@
     const hiddenBox = hidden && el('div', { style: 'display:flex;flex-direction:column;gap:4px' }, [...S.groups.values()].filter((g) => g.kind === 'Server').sort((a, b) => a.sort - b.sort || a.id - b.id).map((g) => {
       const own = myGroups.includes(g.id);
       const box = el('input', { type: 'checkbox', checked: hidden.includes(g.id), disabled: own && !hidden.includes(g.id), onchange: () => { hidden = hidden.filter((x) => x !== g.id); if (box.checked) hidden.push(g.id); } });
-      return el('label', { style: 'display:flex;gap:6px;color:var(--text)', title: own ? 'You are in this group' : '' }, box, g.name);
+      return el('label', { style: 'display:flex;gap:6px;color:var(--text)', title: own ? T('You are in this group') : '' }, box, g.name);
     }));
     const parentSel = el('select', null, el('option', { value: '' }, '(top level)'),
       [...S.channels.values()].filter((c) => !spacer(c.name) && !(editing && subtree(ch.id).includes(c.id))).sort((a, b) => a.name.localeCompare(b.name))
@@ -1830,36 +1884,36 @@
     let kind = e.kind, align = sp ? sp.align : 'c';
     const qLabel = el('span', { class: 'dim' });
     const qRange = el('input', { type: 'range', min: '0', max: '10', value: String(quality), oninput: () => { quality = Number(qRange.value); updQ(); } });
-    const updQ = () => { qLabel.textContent = codec === 'lossless' ? 'up to ~1.5 Mbit/s per listener, bit exact' : '~' + bitrate(packCodec(codec, quality)) + ' kbit/s' + (codec === 'music' ? ' stereo' : ''); qRange.disabled = codec === 'lossless'; };
+    const updQ = () => { qLabel.textContent = codec === 'lossless' ? T('up to ~1.5 Mbit/s per listener, bit exact') : '~' + bitrate(packCodec(codec, quality)) + ' kbit/s' + (codec === 'music' ? ' stereo' : ''); qRange.disabled = codec === 'lossless'; };
     updQ();
     const draw = () => {
       put(body, el('div', { class: 'form' },
-        field('Type', radios('t' + id, [[false, 'Channel'], [true, 'Separator (organises the list, nobody can join it)']], isSep, (v) => { isSep = v; draw(); })),
+        field(T('Type'), radios('t' + id, [[false, 'Channel'], [true, T('Separator (organises the list, nobody can join it)')]], isSep, (v) => { isSep = v; draw(); })),
         isSep ? [
-          field('Style', radios('a' + id, [['c', 'Text in the middle'], ['l', 'Text on the left'], ['r', 'Text on the right'], ['*', 'Line (the text repeated)']], align, (v) => { align = v; })),
-          field('Text', name, 'e.g. Games, or for a line: ─ or - (empty = a thin line)'),
-          field('Parent', parentSel),
+          field(T('Style'), radios('a' + id, [['c', T('Text in the middle')], ['l', T('Text on the left')], ['r', T('Text on the right')], ['*', T('Line (the text repeated)')]], align, (v) => { align = v; })),
+          field(T('Text'), name, 'e.g. Games, or for a line: ─ or - (empty = a thin line)'),
+          field(T('Parent'), parentSel),
         ] : [
-          field('Name', name),
-          field('Parent', parentSel),
-          field('Topic', topic),
-          field('Description', desc),
-          field('Password', el('div', { style: 'display:flex;gap:10px;align-items:center' }, pw, editing && ch.has_password ? el('label', { style: 'display:flex;gap:4px;white-space:nowrap;color:var(--text)' }, pwClear, 'Remove') : null)),
-          field('Lifetime', radios('k' + id, [['Permanent', 'Permanent'], ['SemiPermanent', 'Semi-Permanent'], ['Temporary', 'Temporary']], kind, (v) => { kind = v; })),
-          field('Max clients', el('div', { style: 'display:flex;gap:10px;align-items:center' }, el('label', { style: 'display:flex;gap:4px;white-space:nowrap;color:var(--text)' }, unlimited, 'Unlimited'), maxc)),
-          field('Default channel', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, isDefault, 'New clients join this channel')),
-          field('Codec', radios('c' + id, [['voice', 'Opus Voice'], ['music', 'Opus Music'], ['lossless', 'Lossless']], codec, (v) => { codec = v; updQ(); })),
-          field('Quality', el('div', { style: 'display:flex;gap:10px;align-items:center' }, qRange, qLabel)),
-          field('Needed talk power', talk),
-          field('Needed join power', join),
-          field('Voice encryption', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, enc, 'Encrypt voice in this channel')),
-          hiddenBox ? field('Hidden from', hiddenBox, 'People in these groups do not see this channel, its sub-channels, people or chat. Administrators always see it.') : null,
+          field(T('Name'), name),
+          field(T('Parent'), parentSel),
+          field(T('Topic'), topic),
+          field(T('Description'), desc),
+          field(T('Password'), el('div', { style: 'display:flex;gap:10px;align-items:center' }, pw, editing && ch.has_password ? el('label', { style: 'display:flex;gap:4px;white-space:nowrap;color:var(--text)' }, pwClear, 'Remove') : null)),
+          field(T('Lifetime'), radios('k' + id, [['Permanent', 'Permanent'], ['SemiPermanent', 'Semi-Permanent'], ['Temporary', 'Temporary']], kind, (v) => { kind = v; })),
+          field(T('Max clients'), el('div', { style: 'display:flex;gap:10px;align-items:center' }, el('label', { style: 'display:flex;gap:4px;white-space:nowrap;color:var(--text)' }, unlimited, 'Unlimited'), maxc)),
+          field(T('Default channel'), el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, isDefault, T('New clients join this channel'))),
+          field(T('Codec'), radios('c' + id, [['voice', T('Opus Voice')], ['music', T('Opus Music')], ['lossless', 'Lossless']], codec, (v) => { codec = v; updQ(); })),
+          field(T('Quality'), el('div', { style: 'display:flex;gap:10px;align-items:center' }, qRange, qLabel)),
+          field(T('Needed talk power'), talk),
+          field(T('Needed join power'), join),
+          field(T('Voice encryption'), el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, enc, T('Encrypt voice in this channel'))),
+          hiddenBox ? field(T('Hidden from'), hiddenBox, T('People in these groups do not see this channel, its sub-channels, people or chat. Administrators always see it.')) : null,
         ]));
     };
     draw();
-    dialog(editing ? 'Edit channel' : 'Create channel', body, [
-      { label: 'Cancel' },
-      { label: editing ? 'Save' : 'Create', primary: true, onClick: () => {
+    dialog(editing ? T('Edit channel') : T('Create channel'), body, [
+      { label: T('Cancel') },
+      { label: editing ? T('Save') : T('Create'), primary: true, onClick: () => {
         const out = Object.assign({}, e);
         out.parent = parentSel.value ? Number(parentSel.value) : null;
         if (isSep) {
@@ -1914,83 +1968,83 @@
       const has = !!a.username;
       let p = a.signed_in && a.must_change ? 'password' : page === 'main' && !a.signed_in && has ? 'signin' : page;
       const rows = [];
-      if (a.limited && a.reason) rows.push(el('div', { class: 'note full', style: 'color:var(--warn,#e0b040)' }, '⚠ ' + a.reason + ' Until then you only have Guest permissions here.'));
+      if (a.limited && a.reason) rows.push(el('div', { class: 'note full', style: 'color:var(--warn,#e0b040)' }, '⚠ ' + a.reason + T(' Until then you only have Guest permissions here.')));
       if (err) rows.push(el('div', { class: 'note full', style: 'color:var(--bad,#e05050)' }, err));
       const actions = (...b) => el('div', { class: 'actions-row full', style: 'display:flex;gap:8px;flex-wrap:wrap' }, b);
       if (S.recoveryCodes) {
-        rows.push(el('div', { class: 'full' }, el('p', null, 'Your recovery codes. Each works once, instead of your authenticator app or to reset your password. Keep them somewhere safe: they are not shown again.'),
+        rows.push(el('div', { class: 'full' }, el('p', null, T('Your recovery codes. Each works once, instead of your authenticator app or to reset your password. Keep them somewhere safe: they are not shown again.')),
           el('pre', { style: 'font-size:15px;user-select:all' }, S.recoveryCodes.join('\n'))),
-          actions(btn('Copy', () => navigator.clipboard && navigator.clipboard.writeText(S.recoveryCodes.join('\n'))), btn('I have saved them', () => { S.recoveryCodes = null; draw(); }, 'primary')));
+          actions(btn(T('Copy'), () => navigator.clipboard && navigator.clipboard.writeText(S.recoveryCodes.join('\n'))), btn(T('I have saved them'), () => { S.recoveryCodes = null; draw(); }, 'primary')));
       } else if (S.mfaSetup) {
-        rows.push(el('div', { class: 'full' }, el('p', null, 'Add this account to an authenticator app (Microsoft or Google Authenticator, Aegis, 2FAS, Yubico Authenticator…): on a phone tap the link, otherwise type the key into the app. Then enter the 6-digit code it shows.'),
-          el('p', null, 'Key: ', el('code', { style: 'user-select:all' }, S.mfaSetup.secret)),
-          el('p', null, el('a', { href: S.mfaSetup.uri }, 'Open in an authenticator app'))),
-          ...field('Code', code),
-          actions(btn('Turn on', () => { if (code.value.trim()) send({ ConfirmMfa: code.value.trim() }); code.value = ''; }, 'primary'), btn('Cancel', () => { S.mfaSetup = null; draw(); })));
+        rows.push(el('div', { class: 'full' }, el('p', null, T('Add this account to an authenticator app (Microsoft or Google Authenticator, Aegis, 2FAS, Yubico Authenticator…): on a phone tap the link, otherwise type the key into the app. Then enter the 6-digit code it shows.')),
+          el('p', null, T('Key: '), el('code', { style: 'user-select:all' }, S.mfaSetup.secret)),
+          el('p', null, el('a', { href: S.mfaSetup.uri }, T('Open in an authenticator app')))),
+          ...field(T('Code'), code),
+          actions(btn(T('Turn on'), () => { if (code.value.trim()) send({ ConfirmMfa: code.value.trim() }); code.value = ''; }, 'primary'), btn(T('Cancel'), () => { S.mfaSetup = null; draw(); })));
       } else if (p === 'main' && !has) {
-        if (pol.mode === 'Off') rows.push(el('p', { class: 'full' }, 'This server does not use accounts.'));
+        if (pol.mode === 'Off') rows.push(el('p', { class: 'full' }, T('This server does not use accounts.')));
         else {
-          rows.push(...field('Username', user, '3-32 letters, digits, . - _'), ...field('Password', pw, 'At least 10 characters.'), ...field('Again', pw2),
-            el('div', { class: 'note full' }, 'Forgot it later? Use a recovery code (you get them with an authenticator app), or ask a server administrator to reset it.'),
-            ...field('', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, remember, 'Remember this browser for 30 days')),
-            actions(btn('Make account', () => {
+          rows.push(...field(T('Username'), user, '3-32 letters, digits, . - _'), ...field(T('Password'), pw, T('At least 10 characters.')), ...field(T('Again'), pw2),
+            el('div', { class: 'note full' }, T('Forgot it later? Use a recovery code (you get them with an authenticator app), or ask a server administrator to reset it.')),
+            ...field('', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, remember, T('Remember this browser for 30 days'))),
+            actions(btn(T('Make account'), () => {
               const u = user.value.trim();
-              if (!/^[\p{L}\p{N}._-]{3,32}$/u.test(u)) return fail('A username has 3 to 32 letters, digits, dots, dashes or underscores.');
-              if (!goodPw(pw.value)) return fail('A password needs at least 10 characters.');
-              if (pw.value !== pw2.value) return fail('The two passwords are different.');
+              if (!/^[\p{L}\p{N}._-]{3,32}$/u.test(u)) return fail(T('A username has 3 to 32 letters, digits, dots, dashes or underscores.'));
+              if (!goodPw(pw.value)) return fail(T('A password needs at least 10 characters.'));
+              if (pw.value !== pw2.value) return fail(T('The two passwords are different.'));
               send({ CreateAccount: { username: u, password: pw.value } });
               if (remember.checked) S.afterCreate = { username: u, password: pw.value };
               clear();
-            }, 'primary'), btn('I already have an account', () => go('signin'))));
+            }, 'primary'), btn(T('I already have an account'), () => go('signin'))));
         }
       } else if (p === 'signin') {
         if (!user.value && a.username) user.value = a.username;
-        rows.push(...field('Username', user), ...field('Password', pw), ...field('Code', code, 'From your authenticator app (or a recovery code), if you use one.'),
-          ...field('', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, remember, 'Remember this browser for 30 days')),
-          actions(btn('Sign in', () => {
+        rows.push(...field(T('Username'), user), ...field(T('Password'), pw), ...field(T('Code'), code, T('From your authenticator app (or a recovery code), if you use one.')),
+          ...field('', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, remember, T('Remember this browser for 30 days'))),
+          actions(btn(T('Sign in'), () => {
             if (!pw.value) return;
             send({ SignIn: { username: user.value.trim(), password: pw.value, code: code.value.trim() || null, remember: remember.checked } });
             clear(); err = '';
-          }, 'primary'), btn('Forgot password?', () => go('forgot')), has ? null : btn('Back', () => go('main'))));
+          }, 'primary'), btn(T('Forgot password?'), () => go('forgot')), has ? null : btn(T('Back'), () => go('main'))));
       } else if (p === 'forgot') {
-        rows.push(...field('Username', user));
-        rows.push(...field('Recovery code', code), ...field('New password', npw, 'At least 10 characters.'),
-          actions(btn('Reset password', () => {
-            if (!goodPw(npw.value)) return fail('A password needs at least 10 characters.');
+        rows.push(...field(T('Username'), user));
+        rows.push(...field(T('Recovery code'), code), ...field(T('New password'), npw, T('At least 10 characters.')),
+          actions(btn(T('Reset password'), () => {
+            if (!goodPw(npw.value)) return fail(T('A password needs at least 10 characters.'));
             if (!code.value.trim()) return;
             send({ ResetPassword: { username: user.value.trim(), code: code.value.trim(), password: npw.value } });
             clear(); go('signin');
-          }, 'primary'), btn('Back', () => go('signin'))),
-          el('div', { class: 'note full' }, 'No recovery code? Ask a server administrator to reset your password: they give you a temporary one, and you choose a new password after signing in.'));
+          }, 'primary'), btn(T('Back'), () => go('signin'))),
+          el('div', { class: 'note full' }, T('No recovery code? Ask a server administrator to reset your password: they give you a temporary one, and you choose a new password after signing in.')));
       } else if (p === 'password') {
         const forced = a.must_change;
-        if (forced) rows.push(el('div', { class: 'full', style: 'color:var(--warn,#e0b040);font-weight:600' }, 'An administrator reset your password: choose a new one.'));
-        rows.push(...field(forced ? 'Temporary password' : 'Current password', pw), ...field('New password', npw, 'At least 10 characters.'), ...field('Again', pw2),
-          actions(btn('Change', () => {
-            if (!goodPw(npw.value)) return fail('A password needs at least 10 characters.');
-            if (npw.value !== pw2.value) return fail('The two new passwords are different.');
+        if (forced) rows.push(el('div', { class: 'full', style: 'color:var(--warn,#e0b040);font-weight:600' }, T('An administrator reset your password: choose a new one.')));
+        rows.push(...field(forced ? T('Temporary password') : T('Current password'), pw), ...field(T('New password'), npw, T('At least 10 characters.')), ...field(T('Again'), pw2),
+          actions(btn(T('Change'), () => {
+            if (!goodPw(npw.value)) return fail(T('A password needs at least 10 characters.'));
+            if (npw.value !== pw2.value) return fail(T('The two new passwords are different.'));
             send({ ChangePassword: { old: pw.value, new: npw.value } });
             clear(); go('main');
-          }, 'primary'), forced ? null : btn('Back', () => go('main'))));
+          }, 'primary'), forced ? null : btn(T('Back'), () => go('main'))));
       } else if (p === 'nomfa') {
-        rows.push(...field('Your password', pw), ...field('Code', code, 'From the app, or a recovery code.'),
-          actions(btn('Turn off', () => { if (pw.value) { send({ DisableMfa: { password: pw.value, code: code.value.trim() } }); clear(); go('main'); } }, 'danger'), btn('Back', () => go('main'))));
+        rows.push(...field(T('Your password'), pw), ...field(T('Code'), code, T('From the app, or a recovery code.')),
+          actions(btn(T('Turn off'), () => { if (pw.value) { send({ DisableMfa: { password: pw.value, code: code.value.trim() } }); clear(); go('main'); } }, 'danger'), btn(T('Back'), () => go('main'))));
       } else if (p === 'codes') {
-        rows.push(el('p', { class: 'full' }, 'The old codes stop working.'), ...field('Your password', pw),
-          actions(btn('Make new codes', () => { if (pw.value) { send({ NewRecoveryCodes: { password: pw.value } }); clear(); go('main'); } }, 'primary'), btn('Back', () => go('main'))));
+        rows.push(el('p', { class: 'full' }, T('The old codes stop working.')), ...field(T('Your password'), pw),
+          actions(btn(T('Make new codes'), () => { if (pw.value) { send({ NewRecoveryCodes: { password: pw.value } }); clear(); go('main'); } }, 'primary'), btn(T('Back'), () => go('main'))));
       } else {
         const tok = localStorage.getItem(accountKey());
-        rows.push(el('div', { class: 'full', style: 'color:var(--good,#40c070);font-weight:600' }, '✔ Signed in as ' + a.username),
-          ...field('Authenticator app', el('span', null, a.mfa ? 'On' : 'Off')),
-          ...field('Recovery codes left', el('span', null, a.mfa ? String(a.recovery_left) : '-')),
-          ...field('This browser', el('span', null, tok ? 'remembered' : 'not remembered')),
+        rows.push(el('div', { class: 'full', style: 'color:var(--good,#40c070);font-weight:600' }, T('✔ Signed in as ') + a.username),
+          ...field(T('Authenticator app'), el('span', null, a.mfa ? T('On') : T('Off'))),
+          ...field(T('Recovery codes left'), el('span', null, a.mfa ? String(a.recovery_left) : '-')),
+          ...field(T('This browser'), el('span', null, tok ? 'remembered' : T('not remembered'))),
           actions(
-            a.mfa ? btn('Turn off the authenticator app…', () => go('nomfa')) : btn('🔑 Add an authenticator app (MFA)', () => send('StartMfa'), 'primary'),
-            a.mfa ? btn('New recovery codes…', () => go('codes')) : null,
-            btn('Change password…', () => go('password')),
-            btn('Sign out', () => { send({ SignOut: tok }); localStorage.removeItem(accountKey()); })));
+            a.mfa ? btn(T('Turn off the authenticator app…'), () => go('nomfa')) : btn(T('🔑 Add an authenticator app (MFA)'), () => send('StartMfa'), 'primary'),
+            a.mfa ? btn(T('New recovery codes…'), () => go('codes')) : null,
+            btn(T('Change password…'), () => go('password')),
+            btn(T('Sign out'), () => { send({ SignOut: tok }); localStorage.removeItem(accountKey()); })));
       }
-      put(body, el('div', null, el('p', { class: 'dim small', style: 'margin-top:0' }, 'Each server has its own accounts. The password protects your identity here: someone with a copy of your identity key still needs it.'),
+      put(body, el('div', null, el('p', { class: 'dim small', style: 'margin-top:0' }, T('Each server has its own accounts. The password protects your identity here: someone with a copy of your identity key still needs it.')),
         el('div', { class: 'form' }, rows)));
       // Made an account and asked to be remembered: sign in once to get this browser's token.
       if (S.afterCreate && a.signed_in) {
@@ -2001,7 +2055,7 @@
     };
     S.accountDlg = { redraw: draw, error: fail };
     draw();
-    dialog('🔐 Account & security', body, [{ label: 'Close' }], { wide: true, onClose: () => { S.accountDlg = null; S.afterCreate = null; } });
+    dialog(T('🔐 Account & security'), body, [{ label: T('Close') }], { wide: true, onClose: () => { S.accountDlg = null; S.afterCreate = null; } });
   }
 
   function groupSelect(kind, value) {
@@ -2024,31 +2078,31 @@
     const upload = el('input', { type: 'number', min: '0', placeholder: 'loading…' });
     const quota = el('input', { type: 'number', min: '0', placeholder: 'loading…' });
     const pol = S.accountPolicy || { mode: 'Off', mfa_for_staff: false };
-    const accMode = el('select', null, [['Off', 'Off'], ['Optional', 'Optional'], ['RequiredForStaff', 'Required for staff'], ['Required', 'Required for everyone']].map(([v, l]) => el('option', { value: v, selected: v === pol.mode }, l)));
+    const accMode = el('select', null, [['Off', 'Off'], ['Optional', 'Optional'], ['RequiredForStaff', T('Required for staff')], ['Required', T('Required for everyone')]].map(([v, l]) => el('option', { value: v, selected: v === pol.mode }, l)));
     const accMfa = el('input', { type: 'checkbox', checked: pol.mfa_for_staff });
     let limits = null;
     S.wait.FileLimits = (v) => { limits = v; upload.value = String(v.max_upload_mb); quota.value = String(v.channel_quota_mb); };
     send('GetFileLimits');
-    dialog('Edit virtual server', el('div', { class: 'form' },
-      field('Server name', name),
-      field('Welcome message', welcome),
-      field('Host message', host),
-      field('Max clients', maxc),
-      field('Password', el('div', { style: 'display:flex;gap:10px;align-items:center' }, pw, s.has_password ? el('label', { style: 'display:flex;gap:4px;white-space:nowrap;color:var(--text)' }, pwClear, 'Remove') : null)),
-      field('Default server group', dsg),
-      field('Default channel group', dcg),
-      field('Channel admin group', cag),
-      field('Keep chat history', retention, 'Days; 0 keeps messages forever.'),
-      field('Auto away after', away, 'Minutes without input before people are set away (0 = never, at most 30).'),
-      S.accountPolicy ? [el('div', { class: 'section full' }, 'Accounts & security'),
-        field('Accounts', accMode, 'Accounts add a username and password (and optionally an authenticator app) on top of each identity. People who must sign in only get Guest permissions until they do.'),
-        field('MFA', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, accMfa, 'Staff must also use an authenticator app'),
-          'Forgotten passwords: a recovery code, or right-click the person ▸ Reset Account Password.')] : null,
-      el('div', { class: 'section full' }, 'File browser'),
-      field('Largest upload (MB)', upload, '0 = unlimited'),
-      field('Storage per channel (MB)', quota, '0 = unlimited')), [
-      { label: 'Cancel' },
-      { label: 'Save', primary: true, onClick: () => {
+    dialog(T('Edit virtual server'), el('div', { class: 'form' },
+      field(T('Server name'), name),
+      field(T('Welcome message'), welcome),
+      field(T('Host message'), host),
+      field(T('Max clients'), maxc),
+      field(T('Password'), el('div', { style: 'display:flex;gap:10px;align-items:center' }, pw, s.has_password ? el('label', { style: 'display:flex;gap:4px;white-space:nowrap;color:var(--text)' }, pwClear, 'Remove') : null)),
+      field(T('Default server group'), dsg),
+      field(T('Default channel group'), dcg),
+      field(T('Channel admin group'), cag),
+      field(T('Keep chat history'), retention, T('Days; 0 keeps messages forever.')),
+      field(T('Auto away after'), away, T('Minutes without input before people are set away (0 = never, at most 30).')),
+      S.accountPolicy ? [el('div', { class: 'section full' }, T('Accounts & security')),
+        field(T('Accounts'), accMode, T('Accounts add a username and password (and optionally an authenticator app) on top of each identity. People who must sign in only get Guest permissions until they do.')),
+        field(T('MFA'), el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, accMfa, T('Staff must also use an authenticator app')),
+          T('Forgotten passwords: a recovery code, or right-click the person ▸ Reset Account Password.'))] : null,
+      el('div', { class: 'section full' }, T('File browser')),
+      field(T('Largest upload (MB)'), upload, '0 = unlimited'),
+      field(T('Storage per channel (MB)'), quota, '0 = unlimited')), [
+      { label: T('Cancel') },
+      { label: T('Save'), primary: true, onClick: () => {
         send({ EditServer: {
           name: name.value.trim() || s.name, welcome_message: welcome.value, host_message: host.value,
           max_clients: Math.max(1, Number(maxc.value) || s.max_clients),
@@ -2075,7 +2129,7 @@
     const rows = PERM_NAMES.map(([b, label]) => [label, el('label', null,
       el('input', { type: 'checkbox', checked: (p & bit(b)) !== 0n, onchange: (e) => { p = e.target.checked ? p | bit(b) : p & ~bit(b); onChange(p); } }), label)]);
     const count = el('span', { class: 'dim small' });
-    const none = el('div', { class: 'dim small' }, 'No permission matches.');
+    const none = el('div', { class: 'dim small' }, T('No permission matches.'));
     const apply = () => {
       let shown = 0;
       for (const [label, row] of rows) {
@@ -2086,7 +2140,7 @@
       count.textContent = permQuery.trim() ? shown + ' of ' + rows.length : '';
       none.style.display = shown ? 'none' : '';
     };
-    const search = el('input', { type: 'search', class: 'perm-search', placeholder: '🔍 Search permissions', value: permQuery, oninput: (e) => { permQuery = e.target.value; apply(); } });
+    const search = el('input', { type: 'search', class: 'perm-search', placeholder: T('🔍 Search permissions'), value: permQuery, oninput: (e) => { permQuery = e.target.value; apply(); } });
     apply();
     return el('div', null, el('div', { class: 'perm-search-row' }, search, count), el('div', { class: 'checks' }, rows.map(([, row]) => row), none));
   }
@@ -2100,49 +2154,49 @@
       if (!selected || !S.groups.has(selected)) selected = groups[0] ? groups[0].id : null;
       const item = (g) => el('div', { class: 'li' + (g.id === selected ? ' on' : ''), onclick: () => { selected = g.id; draw(); } }, g.name, g.builtin ? el('span', { class: 'small', style: 'opacity:.7' }, '(built-in)') : null);
       put(list, 
-        el('div', { class: 'lh' }, 'Server groups'), groups.filter((g) => g.kind === 'Server').map(item),
-        el('div', { class: 'lh' }, 'Channel groups'), groups.filter((g) => g.kind === 'Channel').map(item),
+        el('div', { class: 'lh' }, T('Server groups')), groups.filter((g) => g.kind === 'Server').map(item),
+        el('div', { class: 'lh' }, T('Channel groups')), groups.filter((g) => g.kind === 'Channel').map(item),
         el('div', { style: 'display:flex;gap:4px;padding:8px 4px;flex-wrap:wrap' },
           el('button', { class: 'btn small', onclick: () => newGroup('Server') }, '+ Server group'),
           el('button', { class: 'btn small', onclick: () => newGroup('Channel') }, '+ Channel group')));
       const g = S.groups.get(selected);
-      if (!g) { put(editor, el('span', { class: 'dim' }, 'No group selected')); return; }
+      if (!g) { put(editor, el('span', { class: 'dim' }, T('No group selected'))); return; }
       const name = el('input', { type: 'text', value: g.name, maxlength: '40' });
       const talk = el('input', { type: 'number', value: String(g.talk_power) });
       const join = el('input', { type: 'number', value: String(g.join_power) });
       const sort = el('input', { type: 'number', value: String(g.sort) });
       const show = el('input', { type: 'checkbox', checked: g.show_name });
       let perms = BigInt(g.perms);
-      const members = el('div', { class: 'list', style: 'max-height:160px;margin-top:6px' }, el('span', { class: 'dim small' }, 'Loading…'));
+      const members = el('div', { class: 'list', style: 'max-height:160px;margin-top:6px' }, el('span', { class: 'dim small' }, T('Loading…')));
       S.wait.GroupMembers = (v) => {
         if (v.group !== g.id) return;
         put(members, ...(v.members.length ? v.members.map((m) => el('div', { class: 'li', style: 'cursor:default' },
           el('span', { style: 'flex:1' }, m.name || m.uid, m.online ? el('span', { style: 'color:var(--green)' }, ' ●') : null),
-          g.kind === 'Server' && can(P.GROUP_ASSIGN_SERVER) ? el('button', { class: 'btn small danger', onclick: () => { send({ SetServerGroup: { uid: m.uid, group: g.id, add: false } }); setTimeout(() => send({ GroupMembers: g.id }), 300); } }, 'Remove') : null)) : [el('span', { class: 'dim small' }, 'No members')]));
+          g.kind === 'Server' && can(P.GROUP_ASSIGN_SERVER) ? el('button', { class: 'btn small danger', onclick: () => { send({ SetServerGroup: { uid: m.uid, group: g.id, add: false } }); setTimeout(() => send({ GroupMembers: g.id }), 300); } }, T('Remove')) : null)) : [el('span', { class: 'dim small' }, T('No members'))]));
       };
       send({ GroupMembers: g.id });
       put(editor, 
         el('div', { class: 'form' },
-          field('Name', name), field('Talk power', talk), field('Join power', join, 'Compared with a channel\'s needed join power.'), field('Sort order', sort),
-          field('Show name', el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, show, 'Show the group name next to members'))),
-        el('div', { class: 'section' }, 'Permissions'),
+          field(T('Name'), name), field(T('Talk power'), talk), field(T('Join power'), join, T('Compared with a channel\'s needed join power.')), field(T('Sort order'), sort),
+          field(T('Show name'), el('label', { style: 'display:flex;gap:6px;color:var(--text)' }, show, T('Show the group name next to members')))),
+        el('div', { class: 'section' }, T('Permissions')),
         permChecks(perms, (p) => { perms = p; }),
         el('div', { class: 'actions-row' },
-          el('button', { class: 'btn primary', onclick: () => send({ EditGroup: { id: g.id, kind: g.kind, name: name.value.trim() || g.name, perms: Number(perms), talk_power: Number(talk.value) || 0, join_power: Number(join.value) || 0, sort: Number(sort.value) || 0, builtin: g.builtin, show_name: show.checked } }) }, 'Save group'),
-          !g.builtin ? el('button', { class: 'btn danger', onclick: () => confirmDialog('Delete group', 'Delete the group "' + g.name + '"? Its members lose it.', 'Delete', true).then((ok) => ok && send({ DeleteGroup: g.id })) }, 'Delete group') : null),
-        el('div', { class: 'section' }, 'Members'), members);
+          el('button', { class: 'btn primary', onclick: () => send({ EditGroup: { id: g.id, kind: g.kind, name: name.value.trim() || g.name, perms: Number(perms), talk_power: Number(talk.value) || 0, join_power: Number(join.value) || 0, sort: Number(sort.value) || 0, builtin: g.builtin, show_name: show.checked } }) }, T('Save group')),
+          !g.builtin ? el('button', { class: 'btn danger', onclick: () => confirmDialog(T('Delete group'), T('Delete the group "') + g.name + '"? Its members lose it.', 'Delete', true).then((ok) => ok && send({ DeleteGroup: g.id })) }, T('Delete group')) : null),
+        el('div', { class: 'section' }, T('Members')), members);
     };
     const newGroup = (kind) => {
-      promptDialog('New ' + kind.toLowerCase() + ' group', 'Name', '', 'Create', { max: 40, note: selected && S.groups.get(selected)?.kind === kind ? 'Starts as a copy of "' + S.groups.get(selected).name + '".' : null })
+      promptDialog(T('New ') + kind.toLowerCase() + ' group', 'Name', '', 'Create', { max: 40, note: selected && S.groups.get(selected)?.kind === kind ? T('Starts as a copy of "') + S.groups.get(selected).name + '".' : null })
         .then((n) => n && n.trim() && send({ CreateGroup: { kind, name: n.trim(), copy_from: selected && S.groups.get(selected)?.kind === kind ? selected : null } }));
     };
     draw();
     S.wait.GroupsUpdated = () => draw();
-    dialog('Groups & permissions', el('div', { class: 'split' }, list, editor), [{ label: 'Close' }], { wide: true, onClose: () => { delete S.wait.GroupsUpdated; delete S.wait.GroupMembers; } });
+    dialog(T('Groups & permissions'), el('div', { class: 'split' }, list, editor), [{ label: T('Close') }], { wide: true, onClose: () => { delete S.wait.GroupsUpdated; delete S.wait.GroupMembers; } });
   }
 
   function banListDialog() {
-    const table = el('div', null, el('span', { class: 'dim' }, 'Loading…'));
+    const table = el('div', null, el('span', { class: 'dim' }, T('Loading…')));
     let last = [];
     S.wait.BannedHardware = () => S.wait.BanList(last);
     S.wait.BanList = (bans) => {
@@ -2150,41 +2204,41 @@
       put(table, bans.length ? el('table', { class: 'grid' },
         el('tr', null, ['Banned', 'Reason', 'By', 'Since', 'Expires', ''].map((h) => el('th', null, h))),
         bans.map((b) => el('tr', null,
-          el('td', null, b.name || '', b.uid ? el('div', { class: 'dim small', style: 'font-family:Consolas,monospace' }, b.uid) : null, b.ip ? el('div', { class: 'dim small' }, b.ip) : null, S.hwBans && S.hwBans.has(b.id) ? el('div', { class: 'dim small' }, '🖥 hardware') : null),
+          el('td', null, b.name || '', b.uid ? el('div', { class: 'dim small', style: 'font-family:Consolas,monospace' }, b.uid) : null, b.ip ? el('div', { class: 'dim small' }, b.ip) : null, S.hwBans && S.hwBans.has(b.id) ? el('div', { class: 'dim small' }, T('🖥 hardware')) : null),
           el('td', null, b.reason), el('td', null, b.by), el('td', null, fmtDate(b.created)),
           el('td', null, b.expires ? fmtDate(b.expires) : 'never'),
-          el('td', null, el('button', { class: 'btn small', onclick: () => { send({ Unban: b.id }); setTimeout(() => send('BanList'), 300); } }, 'Unban'))))) : el('span', { class: 'dim' }, 'Nobody is banned.'));
+          el('td', null, el('button', { class: 'btn small', onclick: () => { send({ Unban: b.id }); setTimeout(() => send('BanList'), 300); } }, T('Unban')))))) : el('span', { class: 'dim' }, T('Nobody is banned.')));
     };
     send('BanList');
-    const kind = el('select', null, el('option', { value: 'Uid' }, 'Unique ID'), el('option', { value: 'Ip' }, 'IP address'));
-    const value = el('input', { type: 'text', placeholder: 'Unique ID or address' });
+    const kind = el('select', null, el('option', { value: 'Uid' }, T('Unique ID')), el('option', { value: 'Ip' }, T('IP address')));
+    const value = el('input', { type: 'text', placeholder: T('Unique ID or address') });
     const dur = durationSelect();
-    const reason = el('input', { type: 'text', placeholder: 'Reason', maxlength: '80' });
+    const reason = el('input', { type: 'text', placeholder: T('Reason'), maxlength: '80' });
     const add = el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-top:14px' }, kind, value, dur, reason,
       el('button', { class: 'btn', onclick: () => {
         if (!value.value.trim()) return;
         send({ Ban: { target: { [kind.value]: value.value.trim() }, duration_secs: Number(dur.value) || null, reason: reason.value } });
         value.value = ''; reason.value = '';
         setTimeout(() => send('BanList'), 300);
-      } }, 'Add ban'));
-    dialog('Ban list', el('div', null, table, el('div', { class: 'section' }, 'Add a ban'), add), [{ label: 'Close' }], { wide: true, onClose: () => { delete S.wait.BanList; delete S.wait.BannedHardware; } });
+      } }, T('Add ban')));
+    dialog(T('Ban list'), el('div', null, table, el('div', { class: 'section' }, T('Add a ban')), add), [{ label: T('Close') }], { wide: true, onClose: () => { delete S.wait.BanList; delete S.wait.BannedHardware; } });
   }
 
   function privilegeKeyDialog() {
-    const group = el('select', null, [...S.groups.values()].sort((a, b) => (a.kind > b.kind ? -1 : a.kind < b.kind ? 1 : a.sort - b.sort)).map((g) => el('option', { value: String(g.id) }, (g.kind === 'Server' ? 'Server group: ' : 'Channel group: ') + g.name)));
+    const group = el('select', null, [...S.groups.values()].sort((a, b) => (a.kind > b.kind ? -1 : a.kind < b.kind ? 1 : a.sort - b.sort)).map((g) => el('option', { value: String(g.id) }, (g.kind === 'Server' ? T('Server group: ') : T('Channel group: ')) + g.name)));
     const chSel = el('select', null, [...S.channels.values()].filter((c) => !spacer(c.name)).sort((a, b) => a.name.localeCompare(b.name)).map((c) => el('option', { value: String(c.id), selected: c.id === myChannel() }, c.name)));
-    const chRow = el('div', { style: 'display:contents' }, field('Channel', chSel));
+    const chRow = el('div', { style: 'display:contents' }, field(T('Channel'), chSel));
     const upd = () => { chRow.style.display = S.groups.get(Number(group.value))?.kind === 'Channel' ? 'contents' : 'none'; };
     group.addEventListener('change', upd);
     upd();
     const desc = el('input', { type: 'text', maxlength: '80' });
     const out = el('div');
     S.wait.PrivilegeKeyCreated = (key) => {
-      put(out, el('div', { class: 'section' }, 'Privilege key'), el('div', { class: 'key' }, key), el('div', { class: 'actions-row' }, el('button', { class: 'btn', onclick: () => copy(key) }, '📋 Copy')), el('p', { class: 'dim small' }, 'Give this key to the person; they use it once (server menu ▸ Use Privilege Key) to join the group.'));
+      put(out, el('div', { class: 'section' }, T('Privilege key')), el('div', { class: 'key' }, key), el('div', { class: 'actions-row' }, el('button', { class: 'btn', onclick: () => copy(key) }, T('📋 Copy'))), el('p', { class: 'dim small' }, T('Give this key to the person; they use it once (server menu ▸ Use Privilege Key) to join the group.')));
     };
-    dialog('Create privilege key', el('div', null, el('div', { class: 'form' }, field('Group', group), chRow, field('Description', desc)), out), [
-      { label: 'Close' },
-      { label: 'Create key', primary: true, onClick: () => {
+    dialog(T('Create privilege key'), el('div', null, el('div', { class: 'form' }, field(T('Group'), group), chRow, field(T('Description'), desc)), out), [
+      { label: T('Close') },
+      { label: T('Create key'), primary: true, onClick: () => {
         const g = S.groups.get(Number(group.value));
         send({ CreatePrivilegeKey: { group: g.id, channel: g.kind === 'Channel' ? Number(chSel.value) : null, description: desc.value } });
         return false;
@@ -2192,7 +2246,7 @@
     ], { onClose: () => { delete S.wait.PrivilegeKeyCreated; } });
   }
   function usePrivilegeKey() {
-    promptDialog('Use privilege key', 'Key', '', 'Use key').then((k) => k && k.trim() && send({ UsePrivilegeKey: k.trim() }));
+    promptDialog(T('Use privilege key'), 'Key', '', T('Use key')).then((k) => k && k.trim() && send({ UsePrivilegeKey: k.trim() }));
   }
 
   function serverGroupsDialog(c) {
@@ -2204,28 +2258,28 @@
     };
     draw();
     S.wait.ClientUpdated = (v) => { if (v.id === c.id) draw(); };
-    dialog('Server groups of ' + c.nickname, box, [{ label: 'Close' }], { onClose: () => { delete S.wait.ClientUpdated; } });
+    dialog(T('Server groups of ') + c.nickname, box, [{ label: T('Close') }], { onClose: () => { delete S.wait.ClientUpdated; } });
   }
   function channelGroupDialog(c) {
     const ch = S.channels.get(c.channel);
     const sel = groupSelect('Channel', c.channel_group);
-    dialog('Channel group of ' + c.nickname, el('div', { class: 'form' }, field('In channel', el('span', null, ch ? ch.name : '')), field('Channel group', sel)), [
-      { label: 'Cancel' },
-      { label: 'Save', primary: true, onClick: () => send({ SetChannelGroup: { uid: c.uid, channel: c.channel, group: Number(sel.value) } }) },
+    dialog(T('Channel group of ') + c.nickname, el('div', { class: 'form' }, field(T('In channel'), el('span', null, ch ? ch.name : '')), field(T('Channel group'), sel)), [
+      { label: T('Cancel') },
+      { label: T('Save'), primary: true, onClick: () => send({ SetChannelGroup: { uid: c.uid, channel: c.channel, group: Number(sel.value) } }) },
     ]);
   }
   function clientPermsDialog(c) {
     let perms = null;
-    const box = el('div', null, el('span', { class: 'dim' }, 'Loading…'));
+    const box = el('div', null, el('span', { class: 'dim' }, T('Loading…')));
     S.wait.ClientPerms = (v) => {
       if (v.uid !== c.uid) return;
       perms = BigInt(v.perms);
-      put(box, el('p', { class: 'dim small', style: 'margin-top:0' }, 'Granted to ' + c.nickname + ' on top of their groups.'), permChecks(perms, (p) => { perms = p; }));
+      put(box, el('p', { class: 'dim small', style: 'margin-top:0' }, T('Granted to ') + c.nickname + T(' on top of their groups.')), permChecks(perms, (p) => { perms = p; }));
     };
     send({ GetClientPerms: c.uid });
-    dialog('Permissions of ' + c.nickname, box, [
-      { label: 'Cancel' },
-      { label: 'Save', primary: true, onClick: () => { if (perms != null) send({ SetClientPerms: { uid: c.uid, perms: Number(perms) } }); } },
+    dialog(T('Permissions of ') + c.nickname, box, [
+      { label: T('Cancel') },
+      { label: T('Save'), primary: true, onClick: () => { if (perms != null) send({ SetClientPerms: { uid: c.uid, perms: Number(perms) } }); } },
     ], { wide: true, onClose: () => { delete S.wait.ClientPerms; } });
   }
 

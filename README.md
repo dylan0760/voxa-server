@@ -55,6 +55,8 @@ Open it from the Start menu (**Voxa Server Manager**) or from its tray icon. It 
   **Use Privilege Key** and paste it to become admin;
 * buttons for the data folder, `server.toml` and the log, plus a live log view;
 * **🌐 Open Web Admin**, which opens the [web admin page](#web-admin-page);
+* **🌐 Language** (1.30.0) at the top right: the Manager in any of Voxa's 41 languages (it
+  starts in Windows' language; the choice is kept per Windows user);
 * **Backups**: settings, **Back up now**, the last and next backup, and **Restore** (see
   [Backups](#backups));
 * **Startup**: whether the manager opens in the system tray when you sign in to Windows
@@ -119,6 +121,9 @@ a picker with a preview of every theme, the solid ones (including Mustard, Slate
 Obsidian) and the two-tone ones where one colour blends into another.
 
 * **Open it:** `http://<server>:9980/`, or **🌐 Open Web Admin** in Voxa Server Manager.
+* **Languages** (1.30.0): the page uses your browser's language when Voxa has it (41
+  languages); 🌐 (on the sign-in page and at the bottom left) picks another one, kept in
+  this browser. The server serves the same translations Voxa uses (`/i18n/`).
 * **Sign in** with a Voxa identity. You get exactly the rights that identity has: an
   admin identity can do everything, a normal one only what normal users can.
   * **🎧 Sign in with Voxa** (Voxa 1.20.0+ on this PC): Voxa pops up, shows the web
@@ -219,7 +224,15 @@ their update window by themselves. To allow older clients, set
 `require_latest_client = false` and restart the server.
 
 ## Features
-* **Channels:**
+* **Languages** (1.30.0, Voxa 1.38.0): Voxa, Voxa Server Manager and the web admin page
+  come in 41 languages. The server's usual messages (errors such as "Insufficient
+  permissions", notices) are shown in each person's own language by their Voxa.
+* **View as** (1.30.0, Voxa 1.38.0): people who may manage groups can preview the server
+  as other server groups (e.g. Guest). The server really treats them as those groups
+  (permissions, hidden channels, talk and join power, the default channel group) until
+  they press ✖ Stop or disconnect. Only groups that give no more than their own
+  permissions can be picked, and it never gives more than they really have (even if
+  those groups get more permissions meanwhile).* **Channels:**
   * Permanent, semi-permanent and temporary channels, with sub-channels, passwords, max
     clients, topic and description, and moderation (talk power).
   * Drag & drop ordering, and **Clone Channel**.

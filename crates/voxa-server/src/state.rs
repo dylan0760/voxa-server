@@ -84,6 +84,8 @@ pub struct Session {
     pub calendar_subs: HashSet<ChannelId>,
     /// Signed in to the identity's account (1.25.0+), and with the authenticator app (or a
     /// remembered device that was).
+    /// "View as" (1.30.0+): the server groups this person previews the server as.
+    pub view_as: Option<Vec<GroupId>>,
     pub signed_in: bool,
     pub mfa_ok: bool,
     /// Signed in with a temporary password from an administrator's reset (1.25.1+).
@@ -333,7 +335,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.37.0";
+pub const MIN_CLIENT_VERSION: &str = "1.38.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -531,10 +533,12 @@ impl State {
     /// Guest's while the account rules want them to sign in (see `limited`).
     pub fn server_perms(&self, s: &Session) -> u64 {
         let raw = self.raw_server_perms(s);
-        if self.limit_reason(s, raw).is_some() {
-            self.group_perms(GROUP_GUEST)
-        } else {
-            raw
+        let real = if self.limit_reason(s, raw).is_some() { self.group_perms(GROUP_GUEST) } else { raw };
+        // "View as" (1.30.0+): what those groups give, nothing of one's own, and never more
+        // than one really has (even if someone gives those groups more meanwhile).
+        match &s.view_as {
+            Some(v) => v.iter().fold(0, |a, g| a | self.group_perms(*g)) & real,
+            None => real,
         }
     }
 
@@ -582,6 +586,9 @@ impl State {
 
     /// The server groups that count for hiding channels: only Guest while limited.
     fn view_groups<'a>(&self, s: &'a Session) -> std::borrow::Cow<'a, [GroupId]> {
+        if let Some(v) = &s.view_as {
+            return std::borrow::Cow::Borrowed(v);
+        }
         if self.limited(s) {
             std::borrow::Cow::Owned(vec![GROUP_GUEST])
         } else {
@@ -723,7 +730,15 @@ impl State {
         }
     }
 
+    /// The highest talk / join power of some server groups plus a channel group.
+    fn join_or_talk(&self, groups: &[GroupId], cg: GroupId, f: impl Fn(&GroupInfo) -> i32) -> i32 {
+        groups.iter().chain(std::iter::once(&cg)).filter_map(|g| self.groups.get(g)).map(f).max().unwrap_or(0)
+    }
+
     pub fn talk_power(&self, s: &Session) -> i32 {
+        if let Some(v) = &s.view_as {
+            return self.join_or_talk(v, self.settings.default_channel_group, |g| g.talk_power);
+        }
         // Limited to Guest until signing in (accounts): Guest's talk power too.
         if self.limited(s) {
             return self.groups.get(&GROUP_GUEST).map(|g| g.talk_power).unwrap_or(0);
@@ -988,11 +1003,18 @@ impl Server {
         if !st.sees_channel(s, ch) {
             return 0;
         }
-        if st.limited(s) {
-            return st.server_perms(s);
+        let real = if st.limited(s) {
+            st.group_perms(GROUP_GUEST)
+        } else {
+            let cg = if s.info.channel == ch { s.info.channel_group } else { self.channel_group_for(st, &s.info.uid, ch) };
+            st.raw_server_perms(s) | st.group_perms(cg)
+        };
+        // Viewing as groups: the server's default channel group, not one's own (and never
+        // more than one really has there).
+        if s.view_as.is_some() {
+            return (st.server_perms(s) | st.group_perms(st.settings.default_channel_group)) & real;
         }
-        let cg = if s.info.channel == ch { s.info.channel_group } else { self.channel_group_for(st, &s.info.uid, ch) };
-        st.server_perms(s) | st.group_perms(cg)
+        real
     }
 
     /// The client version a Hello must have, or an `UPDATE_REQUIRED` refusal.
@@ -1385,6 +1407,7 @@ impl Server {
                 camera: None,
                 last_camera_key_req: None,
                 calendar_subs: HashSet::new(),
+                view_as: None,
                 signed_in: false,
                 mfa_ok: false,
                 must_change: false,
@@ -2018,6 +2041,7 @@ impl Server {
                 Ok(())
             }),
             C2S::ForgetClient(uid) => self.forget_client(st, me, uid),
+            C2S::ViewAs(groups) => self.view_as(st, me, groups),
             msg @ (C2S::SetChannelHidden { .. }
             | C2S::SetAccountPolicy(_)
             | C2S::CreateAccount { .. }
@@ -2269,7 +2293,11 @@ impl Server {
         }
         if c.info.needed_join_power > 0 && p & perm::CHANNEL_JOIN_IGNORE_POWER == 0 {
             let cg = self.channel_group_for(st, &s.info.uid, ch);
-            let have = if st.limited(s) { st.join_power(&[GROUP_GUEST], GROUP_GUEST) } else { st.join_power(&s.info.server_groups, cg) };
+            let have = match &s.view_as {
+                Some(v) => st.join_power(v, st.settings.default_channel_group),
+                None if st.limited(s) => st.join_power(&[GROUP_GUEST], GROUP_GUEST),
+                None => st.join_power(&s.info.server_groups, cg),
+            };
             if have < c.info.needed_join_power {
                 return Err(format!(
                     "Your group cannot join \"{}\" (needs join power {}, you have {have})",
@@ -3844,6 +3872,47 @@ impl Server {
         Ok(())
     }
 
+    /// "View as" (1.30.0+): previewing the server as some server groups, or back to
+    /// oneself. Needs "Manage groups" (one's real permissions), and the groups together
+    /// may not give more than one has.
+    fn view_as(&self, st: &mut State, me: ClientId, groups: Option<Vec<GroupId>>) -> Res {
+        let s = st.session(me)?;
+        // One's real permissions (Guest's while the account rules want a sign-in).
+        let raw = st.raw_server_perms(s);
+        let real = if st.limit_reason(s, raw).is_some() { st.group_perms(GROUP_GUEST) } else { raw };
+        let name = s.info.nickname.clone();
+        let groups = match groups {
+            None => None,
+            Some(mut g) => {
+                self.need(real, perm::GROUP_MANAGE)?;
+                g.sort();
+                g.dedup();
+                if g.is_empty() || g.len() > 16 {
+                    return Err("Pick one or more server groups to view the server as".into());
+                }
+                if g.iter().any(|id| !st.groups.get(id).is_some_and(|x| x.kind == GroupKind::Server)) {
+                    return Err("Group not found".into());
+                }
+                let theirs = g.iter().fold(0, |a, id| a | st.group_perms(*id));
+                if theirs & !real != 0 {
+                    return Err("You cannot view the server as groups with permissions you do not have".into());
+                }
+                Some(g)
+            }
+        };
+        let names: Vec<String> = groups.iter().flatten().filter_map(|g| st.groups.get(g).map(|x| x.name.clone())).collect();
+        if let Some(s) = st.sessions.get_mut(&me) {
+            s.view_as = groups.clone();
+        }
+        if names.is_empty() {
+            info!("{name} stopped viewing the server as other groups");
+        } else {
+            info!("{name} views the server as {}", names.join(", "));
+        }
+        st.send_if_supported(me, "1.38.0", S2C::ViewingAs(groups));
+        Ok(())
+    }
+
     /// Tells everyone (Voxa 1.29.0+) that `id` turned their camera on or off.
     fn camera_changed(&self, st: &mut State, id: ClientId) {
         let Some(sub) = st.sessions.get(&id) else { return };
@@ -4026,6 +4095,7 @@ fn affects_visibility(msg: &C2S) -> bool {
             | C2S::ResetPassword { .. }
             | C2S::ChangePassword { .. }
             | C2S::ResetAccount { .. }
+            | C2S::ViewAs(_)
     )
 }
 

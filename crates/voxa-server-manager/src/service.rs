@@ -1,5 +1,6 @@
 //! Control of the `VoxaServer` Windows service.
 
+use crate::i18n::tf;
 use std::time::{Duration, Instant};
 
 use windows_service::service::{ServiceAccess, ServiceState};
@@ -40,7 +41,7 @@ fn describe(e: windows_service::Error) -> String {
         Some(1060) => "The VoxaServer service is not installed.".into(),
         Some(1056) => "The service is already running.".into(),
         Some(1062) => "The service is not running.".into(),
-        _ => format!("Service control failed: {e}"),
+        _ => tf!("Service control failed: {e}"; e = e),
     }
 }
 

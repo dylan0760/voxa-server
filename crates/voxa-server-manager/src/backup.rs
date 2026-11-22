@@ -2,6 +2,7 @@
 //! "Back up now"); the manager shows `backup.json` / `backup-status.json` and changes the
 //! settings or restores through `voxa-server.exe` run as administrator (a UAC prompt).
 
+use crate::i18n::tf;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -52,7 +53,7 @@ pub const WEEKDAYS: [&str; 7] = ["Monday", "Tuesday", "Wednesday", "Thursday", "
 
 pub fn describe_schedule(s: &Settings) -> String {
     let when = if s.weekly { format!("every {} at {:02}:00", WEEKDAYS[(s.weekday as usize).min(6)], s.hour) } else { format!("every day at {:02}:00", s.hour) };
-    let keep = if s.keep == 0 { "keeping all".to_string() } else { format!("keeping the last {}", s.keep) };
+    let keep = if s.keep == 0 { "keeping all".to_string() } else { tf!("keeping the last {}", s.keep) };
     format!("{when}, {keep}")
 }
 
@@ -80,7 +81,7 @@ pub fn run_job(data_dir: &Path, flag: &str, job: serde_json::Value) -> Result<St
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let path = std::env::temp_dir().join(format!("voxa-job-{}-{nanos}.json", std::process::id()));
     let result_path = PathBuf::from(format!("{}.result", path.display()));
-    std::fs::write(&path, job.to_string()).map_err(|e| format!("Could not prepare the request: {e}"))?;
+    std::fs::write(&path, job.to_string()).map_err(|e| tf!("Could not prepare the request: {e}"; e = e))?;
     let args = format!("--data \"{}\" {flag} \"{}\"", data_dir.display(), path.display());
     let ran = run_elevated(&server_exe(), &args);
     let _ = std::fs::remove_file(&path);
@@ -127,7 +128,7 @@ fn run_elevated(exe: &Path, args: &str) -> Result<u32, String> {
     };
     if let Err(e) = unsafe { ShellExecuteExW(&mut info) } {
         // ERROR_CANCELLED: the administrator prompt was declined.
-        return Err(if e.code().0 as u32 == 0x800704C7 { "Cancelled: administrator rights are needed for this.".into() } else { format!("Could not start Voxa Server: {}", e.message()) });
+        return Err(if e.code().0 as u32 == 0x800704C7 { "Cancelled: administrator rights are needed for this.".into() } else { tf!("Could not start Voxa Server: {}", e.message()) });
     }
     let mut code = 0u32;
     unsafe {

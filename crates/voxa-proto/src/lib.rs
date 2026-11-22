@@ -4,6 +4,7 @@
 //! control/bulk messages, the Noise based secure stream used for TCP traffic and the
 //! encrypted UDP voice packet format.
 
+pub mod i18n;
 pub mod identity;
 pub mod lossless;
 pub mod model;

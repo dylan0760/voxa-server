@@ -203,6 +203,12 @@ pub enum C2S {
     ServerGifs { query: String, next: Option<String> },
     /// Removes a GIF from the server's library (needs "Manage server GIFs").
     RemoveServerGif(String),
+
+    // --- added in 1.30.0; only sent to servers that are 1.30.0 or newer ---
+    /// Previews the server as members of these server groups only (`None`: back to your
+    /// own permissions). Needs "Manage groups"; never more than your own permissions.
+    /// Ends by itself when you disconnect. Answered with `ViewingAs`.
+    ViewAs(Option<Vec<GroupId>>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -360,6 +366,10 @@ pub enum S2C {
     // --- added in 1.28.0; only sent to clients that are 1.36.0 or newer ---
     /// A page of the server's GIF library, its categories and how many GIFs matched.
     ServerGifs { query: String, items: Vec<GifInfo>, categories: Vec<String>, next: Option<String>, total: u32 },
+
+    // --- added in 1.30.0; only sent to clients that are 1.38.0 or newer ---
+    /// You now see the server as these groups (`None`: as yourself again).
+    ViewingAs(Option<Vec<GroupId>>),
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
