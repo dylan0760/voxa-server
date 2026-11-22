@@ -364,7 +364,11 @@ their update window by themselves. To allow older clients, set
   * **Add a whole heap at once:** copy `.gif` files into
     `%ProgramData%\Voxa Server\gifs`. Sub-folders become categories (up to 3 levels),
     and file names are what people search for (`happy-cat_dance.gif` is found as "happy
-    cat dance"). New files show up by themselves within 30 seconds; no restart needed.
+    cat dance").
+  * **Tags** (1.29.0): extra search words go in a text file with the same name next to
+    the GIF (`happy-cat_dance.gif` + `happy-cat_dance.txt`, one word or phrase per line,
+    or separated by commas). GIFs added from a link in Voxa 1.37.0 get one with the tags
+    of their GIPHY / Tenor / KLIPY page. New files show up by themselves within 30 seconds; no restart needed.
   * **From Voxa:** people with the new **Manage server GIFs** permission (every group
     with *Edit virtual server* gets it on update) can add GIF files (**⬆ Add GIFs…** in
     the 📚 Server tab, with an optional category), add any GIF from the chat (**📚 Add to
@@ -374,7 +378,8 @@ their update window by themselves. To allow older clients, set
   * **From GIPHY:** Voxa 1.36.1's picker has a 🌐 GIPHY button. Copy a GIF's link there
     (a GIPHY page or its `media.giphy.com/…/giphy.gif` address), paste it into the
     📚 Server tab's link box, give it a name if you like, and press Add. The admin's Voxa
-    downloads it and adds it to the library.
+    downloads it and adds it to the library, with the tags and title of its GIPHY page
+    (1.29.0, Voxa 1.37.0).
   * Limits: GIF files up to 10 MB, 50 000 GIFs, and adding from Voxa stops at 5 GB.
     Small previews for the picker are made the first time they are needed and kept in
     `gif-previews`.

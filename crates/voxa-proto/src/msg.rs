@@ -399,6 +399,10 @@ pub enum BulkC2S {
     /// Adds a GIF to the server's library (needs "Manage server GIFs"); answered with
     /// `ServerGifAdded` carrying the same id.
     AddServerGif { id: u32, category: String, name: String, data: Vec<u8> },
+
+    // --- added in 1.29.0; only sent to servers that are 1.29.0 or newer ---
+    /// `AddServerGif` with search words (e.g. the tags of the GIF's page on GIPHY).
+    AddServerGifTagged { id: u32, category: String, name: String, tags: Vec<String>, data: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

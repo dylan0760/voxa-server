@@ -396,12 +396,17 @@ async fn bulk(
                         .await;
                 });
             }
-            BulkC2S::AddServerGif { id: tid, category, name, data } => {
+            m @ (BulkC2S::AddServerGif { .. } | BulkC2S::AddServerGifTagged { .. }) => {
+                let (tid, category, name, tags, data) = match m {
+                    BulkC2S::AddServerGifTagged { id, category, name, tags, data } => (id, category, name, tags, data),
+                    BulkC2S::AddServerGif { id, category, name, data } => (id, category, name, Vec::new(), data),
+                    _ => unreachable!(),
+                };
                 let Ok(slot) = image_jobs.clone().acquire_owned().await else { break };
                 let (srv, tx) = (server.clone(), btx.clone());
                 tokio::spawn(async move {
                     let _slot = slot;
-                    let r = tokio::task::spawn_blocking(move || srv.add_server_gif(id, &category, &name, &data)).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let r = tokio::task::spawn_blocking(move || srv.add_server_gif(id, &category, &name, &tags, &data)).await.unwrap_or_else(|e| Err(e.to_string()));
                     let _ = tx.send(BulkS2C::ServerGifAdded { id: tid, error: r.err() }).await;
                 });
             }

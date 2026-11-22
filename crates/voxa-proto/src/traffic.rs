@@ -108,7 +108,8 @@ pub fn bulk_c2s(m: &BulkC2S) -> Cat {
         | BulkC2S::ChatImage { .. }
         | BulkC2S::GetImage(_)
         | BulkC2S::GifPreview(_)
-        | BulkC2S::AddServerGif { .. } => Cat::Files,
+        | BulkC2S::AddServerGif { .. }
+        | BulkC2S::AddServerGifTagged { .. } => Cat::Files,
     }
 }
 

@@ -780,6 +780,10 @@ pub struct GifInfo {
     pub height: u32,
 }
 
+/// Search words kept per GIF in the server's library, and the longest one.
+pub const MAX_GIF_TAGS: usize = 40;
+pub const MAX_GIF_TAG_LEN: usize = 40;
+
 /// Longest GIF search text.
 pub const MAX_GIF_QUERY: usize = 100;
 

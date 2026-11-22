@@ -2,6 +2,10 @@
 //! folder (sub-folders are categories, file names are what people search for), plus GIFs
 //! people with "Manage server GIFs" add from Voxa. Shown in the picker's 📚 Server tab.
 //!
+//! Search words (tags) for a GIF can sit next to it in a text file with the same name
+//! (`happy dance.gif` + `happy dance.txt`, words separated by lines or commas): Voxa
+//! writes one with the tags of a GIF's GIPHY page, and admins can write their own.
+//!
 //! The folder is read again at most every 30 seconds when someone looks, so GIFs dropped
 //! in appear by themselves. Small previews are made on first use and kept in
 //! `gif-previews`. Everything here blocks (files): call it from a blocking thread.
@@ -11,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use voxa_proto::{GifInfo, MAX_CHAT_IMAGE, MAX_GIF_QUERY};
+use voxa_proto::{GifInfo, MAX_CHAT_IMAGE, MAX_GIF_QUERY, MAX_GIF_TAGS, MAX_GIF_TAG_LEN};
 
 /// GIFs per page, GIFs in the library at most, and how deep categories go.
 const PAGE: usize = 48;
@@ -170,8 +174,8 @@ impl Library {
         Ok(small)
     }
 
-    /// Adds a GIF (from Voxa) to a category folder. Returns its name.
-    pub fn add(&self, category: &str, name: &str, data: &[u8]) -> Result<String, String> {
+    /// Adds a GIF (from Voxa) to a category folder, with its search words. Returns its name.
+    pub fn add(&self, category: &str, name: &str, tags: &[String], data: &[u8]) -> Result<String, String> {
         if data.len() > MAX_CHAT_IMAGE {
             return Err(format!("GIFs can be at most {} MB", MAX_CHAT_IMAGE / (1024 * 1024)));
         }
@@ -207,6 +211,10 @@ impl Library {
             n += 1;
         }
         std::fs::write(&path, data).map_err(|e| e.to_string())?;
+        let tags = clean_tags(tags);
+        if !tags.is_empty() {
+            let _ = std::fs::write(path.with_extension("txt"), tags.join("\n"));
+        }
         self.rescan();
         Ok(display_name(&path.file_stem().unwrap_or_default().to_string_lossy()))
     }
@@ -218,6 +226,10 @@ impl Library {
             return Err("That GIF cannot be removed".into());
         }
         std::fs::remove_file(&p).map_err(|e| format!("Could not remove it: {e}"))?;
+        let tags = p.with_extension("txt");
+        if !crate::files::is_link(&tags) {
+            let _ = std::fs::remove_file(tags);
+        }
         let _ = std::fs::remove_file(self.previews.join(format!("{id}.gif")));
         self.rescan();
         Ok(g.info.title)
@@ -256,9 +268,37 @@ fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<LibGif>, bytes: &mu
         let rel = rel.to_string_lossy().replace('\\', "/");
         let category = rel.rsplit_once('/').map(|(c, _)| c.replace('/', " / ")).unwrap_or_default();
         let title = display_name(&p.file_stem().unwrap_or_default().to_string_lossy());
-        let words = format!("{} {}", title.to_lowercase(), category.to_lowercase());
+        let tags = read_tags(&p.with_extension("txt"));
+        let words = format!("{} {} {}", title.to_lowercase(), category.to_lowercase(), tags.join(" ").to_lowercase());
         out.push(LibGif { info: GifInfo { id: format!("s{:016x}", fnv(&rel.to_lowercase())), title, width: w, height: h }, rel, category, words });
     }
+}
+
+/// Search words: at most MAX_GIF_TAGS, each at most MAX_GIF_TAG_LEN characters, no
+/// control characters, no repeats (any case).
+pub fn clean_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags {
+        let t: String = t.chars().filter(|c| !c.is_control()).take(MAX_GIF_TAG_LEN).collect::<String>().trim().to_string();
+        if !t.is_empty() && !out.iter().any(|o| o.eq_ignore_ascii_case(&t)) {
+            out.push(t);
+        }
+        if out.len() >= MAX_GIF_TAGS {
+            break;
+        }
+    }
+    out
+}
+
+/// The search words in a GIF's text file (lines or commas; at most 8 KB read).
+fn read_tags(p: &Path) -> Vec<String> {
+    if crate::files::is_link(p) {
+        return Vec::new();
+    }
+    let Ok(f) = std::fs::File::open(p) else { return Vec::new() };
+    let mut s = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::Read::take(f, 8 * 1024), &mut s);
+    clean_tags(&s.split(['\n', ',']).map(String::from).collect::<Vec<_>>())
 }
 
 /// A small copy of a GIF for the picker (at most PREVIEW_SIDE, PREVIEW_FRAMES frames).
@@ -329,13 +369,20 @@ mod tests {
 
         // Adding: names cleaned, never over another file, only GIFs.
         // Only the file name counts, and "../" goes nowhere.
-        assert_eq!(lib.add("../Memes", "..\\evil/../zap.gif", &gif(10, 10, 2)).unwrap(), "zap");
+        assert_eq!(lib.add("../Memes", "..\\evil/../zap.gif", &["Will Smith".into(), "will smith".into(), "MIB\u{7}".into()], &gif(10, 10, 2)).unwrap(), "zap");
+        assert_eq!(std::fs::read_to_string(d.join("gifs/Memes/zap.txt")).unwrap(), "Will Smith\nMIB");
+        assert_eq!(lib.search("smith mib", None).0.len(), 1, "tags are searched");
+        // A text file written by hand next to a GIF in the folder works too.
+        std::fs::write(d.join("gifs/wave.txt"), "hello, goodbye").unwrap();
+        lib.rescan();
+        assert_eq!(lib.search("goodbye", None).0.len(), 1);
         assert!(d.join("gifs/Memes/zap.gif").exists());
-        assert_eq!(lib.add("Memes", "zap", &gif(10, 10, 2)).unwrap(), "zap 2");
-        assert!(lib.add("Memes", "a", b"PNG...").is_err());
+        assert_eq!(lib.add("Memes", "zap", &[], &gif(10, 10, 2)).unwrap(), "zap 2");
+        assert!(lib.add("Memes", "a", &[], b"PNG...").is_err());
         let (hits, ..) = lib.search("zap", None);
         assert_eq!(hits.len(), 2);
         assert_eq!(lib.remove(&hits[0].id).unwrap(), "zap");
+        assert!(!d.join("gifs/Memes/zap.txt").exists(), "its tags go with it");
         assert_eq!(lib.search("zap", None).0.len(), 1);
         let _ = std::fs::remove_dir_all(&d);
     }

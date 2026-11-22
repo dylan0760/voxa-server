@@ -333,7 +333,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.36.0";
+pub const MIN_CLIENT_VERSION: &str = "1.37.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -4110,7 +4110,7 @@ impl Server {
 
     /// Adds a GIF to the server's library from Voxa (bulk connection; needs "Manage server
     /// GIFs"). Blocking (writes a file).
-    pub fn add_server_gif(&self, me: ClientId, category: &str, name: &str, data: &[u8]) -> Res {
+    pub fn add_server_gif(&self, me: ClientId, category: &str, name: &str, tags: &[String], data: &[u8]) -> Res {
         let by = {
             let mut st = self.state.lock();
             let s = st.sessions.get_mut(&me).ok_or("Client not found")?;
@@ -4121,7 +4121,7 @@ impl Server {
             self.need(st.server_perms(s), perm::GIF_MANAGE)?;
             s.info.nickname.clone()
         };
-        let name = self.gif_library.add(category, name, data)?;
+        let name = self.gif_library.add(category, name, tags, data)?;
         info!("{by} added the GIF \"{name}\" to the server's library");
         Ok(())
     }

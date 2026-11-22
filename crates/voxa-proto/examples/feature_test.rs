@@ -80,7 +80,7 @@ async fn main() {
         old = Some(hello(&addr, "Old", "1.15.0").await.expect("compat mode: the server must allow old clients"));
         println!("1. compat mode: Voxa 1.15.0 allowed (require_latest_client = false)");
     } else {
-        let err = hello(&addr, "Old", "1.35.0").await.err().expect("an old client was let in");
+        let err = hello(&addr, "Old", "1.36.1").await.err().expect("an old client was let in");
         assert!(err.starts_with(UPDATE_REQUIRED), "{err}");
         println!("1. Voxa 1.26.0 refused: \"{}\"", err.trim_start_matches(UPDATE_REQUIRED));
     }
