@@ -179,6 +179,8 @@ pub struct Server {
     /// GIF search (1.27.0+), and how many GIF jobs (searches, downloads) run at once.
     pub gifs: crate::gifs::Gifs,
     gif_jobs: tokio::sync::Semaphore,
+    /// The server's own GIF library (1.28.0+).
+    pub gif_library: crate::gif_library::Library,
 }
 
 pub type Res<T = ()> = Result<T, String>;
@@ -331,7 +333,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.35.0";
+pub const MIN_CLIENT_VERSION: &str = "1.36.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -874,6 +876,7 @@ impl Server {
             channels.insert(id, ChannelRec { info, password_hash: None });
         }
         let gifs = crate::gifs::Gifs::new(&cfg);
+        let gif_library = crate::gif_library::Library::new(&data_dir);
         let srv = Server {
             state: Mutex::new(State {
                 settings,
@@ -905,6 +908,7 @@ impl Server {
             argon_slots: tokio::sync::Semaphore::new(2),
             gifs,
             gif_jobs: tokio::sync::Semaphore::new(6),
+            gif_library,
         };
         srv.ensure_admin_key()?;
         Ok(srv)
@@ -2028,7 +2032,7 @@ impl Server {
             | C2S::ResetPassword { .. }
             | C2S::ResetAccount { .. }) => self.dispatch_accounts(st, me, msg),
             // Handled in their own task (net.rs); the web page sends them like this.
-            C2S::SearchGifs { .. } | C2S::SendGif { .. } => Err("GIFs are not available here".into()),
+            C2S::SearchGifs { .. } | C2S::SendGif { .. } | C2S::ServerGifs { .. } | C2S::RemoveServerGif(_) => Err("GIFs are not available here".into()),
             C2S::ClearChat(target) => {
                 let s = st.session(me)?;
                 let ch = match target {
@@ -4045,7 +4049,8 @@ impl Server {
             }
             // Where it goes is checked again when it is posted; this spares a download.
             if let C2S::SendGif { target, id } = &msg {
-                if !s.gif_ids.contains(id) {
+                // Library GIFs (`s…`) are everyone's; search results only their searcher's.
+                if !id.starts_with('s') && !s.gif_ids.contains(id) {
                     return Err("That GIF is no longer available: search again".into());
                 }
                 match target {
@@ -4074,8 +4079,27 @@ impl Server {
                 st.send(me, S2C::Gifs { query, items, next });
                 Ok(())
             }
+            C2S::ServerGifs { query, next } => {
+                let q = query.clone();
+                let (items, categories, next, total) = tokio::task::spawn_blocking(move || srv.gif_library.search(&q, next.as_deref())).await.map_err(|e| e.to_string())?;
+                let query: String = query.chars().take(MAX_GIF_QUERY).collect();
+                self.state.lock().send(me, S2C::ServerGifs { query, items, categories, next, total });
+                Ok(())
+            }
+            C2S::RemoveServerGif(id) => {
+                let by = {
+                    let st = self.state.lock();
+                    let s = st.session(me)?;
+                    self.need(st.server_perms(s), perm::GIF_MANAGE)?;
+                    s.info.nickname.clone()
+                };
+                let name = tokio::task::spawn_blocking(move || srv.gif_library.remove(&id)).await.map_err(|e| e.to_string())??;
+                info!("{by} removed the GIF \"{name}\" from the server's library");
+                self.state.lock().send(me, S2C::Notice(format!("Removed \"{name}\" from the server's GIFs")));
+                Ok(())
+            }
             C2S::SendGif { target, id } => tokio::task::spawn_blocking(move || {
-                let (data, name, w, h) = srv.gifs.full(&id)?;
+                let (data, name, w, h) = if id.starts_with('s') { srv.gif_library.full(&id)? } else { srv.gifs.full(&id)? };
                 srv.post_image(me, target, &name, w, h, data)
             })
             .await
@@ -4084,15 +4108,37 @@ impl Server {
         }
     }
 
+    /// Adds a GIF to the server's library from Voxa (bulk connection; needs "Manage server
+    /// GIFs"). Blocking (writes a file).
+    pub fn add_server_gif(&self, me: ClientId, category: &str, name: &str, data: &[u8]) -> Res {
+        let by = {
+            let mut st = self.state.lock();
+            let s = st.sessions.get_mut(&me).ok_or("Client not found")?;
+            if !spend(&mut s.gif_budget, GIF_BURST, GIF_RATE) {
+                return Err("You are adding GIFs too fast. Please wait a moment.".into());
+            }
+            let s = st.session(me)?;
+            self.need(st.server_perms(s), perm::GIF_MANAGE)?;
+            s.info.nickname.clone()
+        };
+        let name = self.gif_library.add(category, name, data)?;
+        info!("{by} added the GIF \"{name}\" to the server's library");
+        Ok(())
+    }
+
     /// A GIF search result's preview, for the bulk connection (empty if not allowed /
     /// not available).
     pub fn gif_preview(&self, me: ClientId, id: &str) -> Vec<u8> {
         {
             let mut st = self.state.lock();
             let Some(s) = st.sessions.get_mut(&me) else { return Vec::new() };
-            if !s.gif_ids.contains(id) || !spend(&mut s.gif_preview_budget, GIF_PREVIEW_BURST, GIF_PREVIEW_RATE) {
+            let library = id.starts_with('s');
+            if (!library && !s.gif_ids.contains(id)) || !spend(&mut s.gif_preview_budget, GIF_PREVIEW_BURST, GIF_PREVIEW_RATE) {
                 return Vec::new();
             }
+        }
+        if id.starts_with('s') {
+            return self.gif_library.preview(id).unwrap_or_default();
         }
         self.gifs.preview(id).map(|d| d.to_vec()).unwrap_or_default()
     }

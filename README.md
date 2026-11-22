@@ -71,8 +71,8 @@ signs in and when the manager is closed.
 A backup is **one password-protected file** (`Voxa Server backup 2026-11-15 030000.voxabackup`)
 with everything the server needs: `server.toml`, the settings, channels, groups,
 permissions, bans, people, chat history, chat images, avatars, the server's keys (so
-clients still recognise it and the history stays readable), the initial admin key and
-every uploaded channel file.
+clients still recognise it and the history stays readable), the initial admin key,
+every uploaded channel file and the GIF library (`gifs`, 1.28.0+).
 
 * **Set it up:** Voxa Server Manager ▸ **Backups ▸ ⚙ Settings…** (asks for administrator
   rights):
@@ -359,6 +359,21 @@ their update window by themselves. To allow older clients, set
     a minute to the service. Picking a GIF makes the server download it and post it like
     a picture (stored encrypted, plays for everyone, and doesn't depend on the service
     keeping it).
+* **The server's own GIF library** (1.28.0, Voxa 1.36.0): GIFs you collect, shown to
+  everyone under **📚 Server** in Voxa's GIF picker. It needs no GIF service or key.
+  * **Add a whole heap at once:** copy `.gif` files into
+    `%ProgramData%\Voxa Server\gifs`. Sub-folders become categories (up to 3 levels),
+    and file names are what people search for (`happy-cat_dance.gif` is found as "happy
+    cat dance"). New files show up by themselves within 30 seconds; no restart needed.
+  * **From Voxa:** people with the new **Manage server GIFs** permission (every group
+    with *Edit virtual server* gets it on update) can add GIF files (**⬆ Add GIFs…** in
+    the 📚 Server tab, with an optional category), add any GIF from the chat (**📚 Add to
+    server GIFs** in its full-size view) and remove GIFs (right-click). Added GIFs go into
+    a category folder in `gifs` (default "Added in Voxa"); a name already taken gets a
+    number.
+  * Limits: GIF files up to 10 MB, 50 000 GIFs, and adding from Voxa stops at 5 GB.
+    Small previews for the picker are made the first time they are needed and kept in
+    `gif-previews`.
 * **Server-relayed screen sharing** with sound, up to 60 fps. Only viewers in the same
   channel receive it.
 * **Video calls** (1.21.0, Voxa 1.29.0 on Windows and Android): people turn their camera
@@ -500,6 +515,11 @@ their update window by themselves. To allow older clients, set
   * Only https GIF addresses on named hosts are downloaded (no IP addresses or
     localhost), only real GIF files are accepted (10 MB per GIF, 2 MB per preview), and
     posted GIFs go through the same permission checks as pictures.
+* **GIF library** (1.28.0): only GIF files are read or accepted. Links and junctions in
+  the `gifs` folder are skipped, so nothing outside it is ever shown. Names given in Voxa
+  are cleaned: no folder separators or `..`, and Windows device names like `CON` are
+  changed. Files are never overwritten. Adding and removing need *Manage server GIFs*,
+  and adding is rate limited.
 * **Limits against overload:**
   * at most 64 connections per address;
   * small messages until a client has logged in;
@@ -563,7 +583,7 @@ their update window by themselves. To allow older clients, set
 
 ## Data & configuration
 Everything lives in `%ProgramData%\Voxa Server`: `server.toml`, `voxa.db`,
-`identity.key`, `chat.key`, `files\`, `logs\`, `status.json`, `web_origin.txt` (the web
+`identity.key`, `chat.key`, `files\`, `gifs\` (the GIF library), `gif-previews\`, `logs\`, `status.json`, `web_origin.txt` (the web
 page's remembered address), and the backup settings
 (`backup.json`, `backup.key`, `backup-status.json`).
 * Use [Backups](#backups) rather than copying the folder: the `.key` files only work on

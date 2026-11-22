@@ -176,7 +176,7 @@ async fn control(
             r = timeout(Duration::from_secs(45), reader.recv::<C2S>()) => match r.inspect(|m| if m.is_ok() { TRAFFIC.received(Cat::Chat, reader.last_size) }) {
                 Ok(Ok(C2S::Disconnect(msg))) => break LeaveReason::Disconnected(state_trunc(&msg)),
                 // GIF searches and sends wait on the GIF service: in their own task (1.27.0+).
-                Ok(Ok(msg @ (C2S::SearchGifs { .. } | C2S::SendGif { .. }))) => {
+                Ok(Ok(msg @ (C2S::SearchGifs { .. } | C2S::SendGif { .. } | C2S::ServerGifs { .. } | C2S::RemoveServerGif(_)))) => {
                     bad = 0;
                     tokio::spawn(server.clone().gif_message(id, msg));
                 }
@@ -394,6 +394,15 @@ async fn bulk(
                             Err(message) => BulkS2C::TransferError { id: tid, message },
                         })
                         .await;
+                });
+            }
+            BulkC2S::AddServerGif { id: tid, category, name, data } => {
+                let Ok(slot) = image_jobs.clone().acquire_owned().await else { break };
+                let (srv, tx) = (server.clone(), btx.clone());
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let r = tokio::task::spawn_blocking(move || srv.add_server_gif(id, &category, &name, &data)).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let _ = tx.send(BulkS2C::ServerGifAdded { id: tid, error: r.err() }).await;
                 });
             }
             BulkC2S::GifPreview(gif) => {

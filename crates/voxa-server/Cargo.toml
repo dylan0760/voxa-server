@@ -15,6 +15,8 @@ anyhow = "1.0.104"
 argon2 = "0.5"
 hmac = "0.12"
 sha1 = "0.10"
+# The GIF library's small previews (1.28.0+).
+image = { version = "0.25.10", default-features = false, features = ["gif"] }
 ureq = { version = "3.5.1", default-features = false, features = ["native-tls"] }
 base64 = "0.22"
 bincode = "1"

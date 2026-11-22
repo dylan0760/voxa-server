@@ -23,7 +23,7 @@ pub const MAX_DEPTH: usize = 32;
 pub const MAX_NAME_LEN: usize = 255;
 
 /// True if the path exists and is a symbolic link, junction or other reparse point.
-fn is_link(p: &Path) -> bool {
+pub fn is_link(p: &Path) -> bool {
     let Ok(m) = std::fs::symlink_metadata(p) else { return false };
     #[cfg(windows)]
     {

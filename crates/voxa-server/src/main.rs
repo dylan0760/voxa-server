@@ -6,6 +6,7 @@ mod acl;
 mod backup;
 mod config;
 mod files;
+mod gif_library;
 mod gifs;
 mod names;
 mod net;

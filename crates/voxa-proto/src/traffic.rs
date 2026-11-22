@@ -107,7 +107,8 @@ pub fn bulk_c2s(m: &BulkC2S) -> Cat {
         | BulkC2S::Cancel { .. }
         | BulkC2S::ChatImage { .. }
         | BulkC2S::GetImage(_)
-        | BulkC2S::GifPreview(_) => Cat::Files,
+        | BulkC2S::GifPreview(_)
+        | BulkC2S::AddServerGif { .. } => Cat::Files,
     }
 }
 

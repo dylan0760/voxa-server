@@ -2,7 +2,7 @@
 //! runs on 127.0.0.1:9979 (the server's `gif_api_base`): the server announces the service,
 //! searches for its people (caching answers), only posts GIFs it handed out itself, and
 //! limits how fast people search.
-//! `cargo run -p voxa-proto --example gif_test -- 127.0.0.1:9988`
+//! `cargo run -p voxa-proto --example gif_test -- 127.0.0.1:9988 <server data dir>`
 //! The server needs `gif_api_key = "test-key"` and `gif_api_base = "http://127.0.0.1:9979"`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -159,5 +159,51 @@ async fn main() {
     }
     let slow = wait(&mut u, 20, |m| if let S2C::Error(e) = m { e.contains("too fast").then_some(e) } else { None }).await.expect("no rate limit");
     println!("5. searching too fast: \"{slow}\"");
+
+    // The server's own library (1.28.0+): GIFs dropped into the data folder's gifs folder.
+    let dir = std::path::PathBuf::from(std::env::args().nth(2).expect("server data dir"));
+    let gif = |frames: usize| {
+        let mut buf = vec![];
+        buf.extend_from_slice(b"GIF89a");
+        buf.extend_from_slice(&[4, 0, 3, 0, 0, 0, 0]);
+        // Image descriptor + 1 tiny LZW block per frame, then the trailer.
+        for _ in 0..frames {
+            buf.extend_from_slice(&[0x2C, 0, 0, 0, 0, 4, 0, 3, 0, 0x80, 0, 0, 0, 255, 255, 255, 2, 2, 0x44, 0x01, 0]);
+        }
+        buf.push(0x3B);
+        buf
+    };
+    std::fs::create_dir_all(dir.join("gifs/Reactions")).unwrap();
+    std::fs::write(dir.join("gifs/Reactions/thumbs-up.gif"), gif(2)).unwrap();
+    std::fs::write(dir.join("gifs/Reactions/happy_dance.gif"), gif(2)).unwrap();
+    std::fs::write(dir.join("gifs/wave.gif"), gif(1)).unwrap();
+    std::fs::write(dir.join("gifs/not-a-gif.gif"), b"hello").unwrap();
+    let mut lib = login(&addr, "Library fan").await;
+    lib.w.send(&C2S::ServerGifs { query: String::new(), next: None }).await.unwrap();
+    let (items, cats, total) = wait(&mut lib, 20, |m| if let S2C::ServerGifs { items, categories, total, .. } = m { Some((items, categories, total)) } else { None }).await.expect("no library");
+    assert_eq!((items.len(), total), (3, 3), "{items:?}");
+    assert_eq!(cats, vec!["Reactions".to_string()]);
+    println!("6. the server's library: {total} GIFs ({}), categories {cats:?}", items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>().join(", "));
+    lib.w.send(&C2S::ServerGifs { query: "Dance REACTIONS".into(), next: None }).await.unwrap();
+    let hits = wait(&mut lib, 20, |m| if let S2C::ServerGifs { items, .. } = m { Some(items) } else { None }).await.expect("no search");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].title, "happy dance");
+    lib.w.send(&C2S::SendGif { target: TextTarget::Channel(lib.channel), id: hits[0].id.clone() }).await.unwrap();
+    let posted = wait(&mut lib, 20, |m| if let S2C::Text(t) = m { ImageRef::parse(&t.text) } else { None }).await.expect("the library GIF was not posted");
+    assert_eq!(posted.name, "happy dance.gif");
+    println!("7. searching \"dance reactions\" found \"{}\", posted as {}", hits[0].title, posted.name);
+    lib.w.send(&C2S::RemoveServerGif(hits[0].id.clone())).await.unwrap();
+    println!("8. removing a GIF without \"Manage server GIFs\": \"{}\"", error(&mut lib).await);
+    assert!(dir.join("gifs/Reactions/happy_dance.gif").exists());
+    let key = std::fs::read_to_string(dir.join("privilege_key.txt"))
+        .ok()
+        .and_then(|t| t.lines().map(str::trim).find(|l| l.len() >= 20 && !l.contains(' ')).map(String::from))
+        .expect("privilege key");
+    lib.w.send(&C2S::UsePrivilegeKey(key)).await.unwrap();
+    wait(&mut lib, 5, |m| matches!(m, S2C::Notice(_)).then_some(())).await;
+    lib.w.send(&C2S::RemoveServerGif(hits[0].id.clone())).await.unwrap();
+    let n = wait(&mut lib, 20, |m| if let S2C::Notice(n) = m { Some(n) } else { None }).await.expect("not removed");
+    assert!(!dir.join("gifs/Reactions/happy_dance.gif").exists());
+    println!("8. an admin removed it: \"{n}\"");
     println!("GIF TEST PASSED");
 }

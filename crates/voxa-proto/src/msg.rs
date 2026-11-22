@@ -196,6 +196,13 @@ pub enum C2S {
     /// Posts a GIF from search results to a chat: the server downloads it and posts it
     /// like a picture (so nobody's device contacts the GIF service).
     SendGif { target: TextTarget, id: String },
+
+    // --- added in 1.28.0; only sent to servers that are 1.28.0 or newer ---
+    /// Lists / searches the server's own GIF library (`query` empty: everything). Answered
+    /// with `ServerGifs`. `SendGif` and `BulkC2S::GifPreview` take its ids too.
+    ServerGifs { query: String, next: Option<String> },
+    /// Removes a GIF from the server's library (needs "Manage server GIFs").
+    RemoveServerGif(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -349,6 +356,10 @@ pub enum S2C {
     GifSearch(Option<String>),
     /// GIF search results (previews come over the bulk connection, `GifPreview`).
     Gifs { query: String, items: Vec<GifInfo>, next: Option<String> },
+
+    // --- added in 1.28.0; only sent to clients that are 1.36.0 or newer ---
+    /// A page of the server's GIF library, its categories and how many GIFs matched.
+    ServerGifs { query: String, items: Vec<GifInfo>, categories: Vec<String>, next: Option<String>, total: u32 },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
@@ -383,6 +394,11 @@ pub enum BulkC2S {
     // --- added in 1.27.0; only sent to servers that are 1.27.0 or newer ---
     /// A small animated preview of a GIF search result (answered with `GifPreview`).
     GifPreview(String),
+
+    // --- added in 1.28.0; only sent to servers that are 1.28.0 or newer ---
+    /// Adds a GIF to the server's library (needs "Manage server GIFs"); answered with
+    /// `ServerGifAdded` carrying the same id.
+    AddServerGif { id: u32, category: String, name: String, data: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -415,6 +431,10 @@ pub enum BulkS2C {
     // --- added in 1.27.0; only sent to clients that are 1.35.0 or newer ---
     /// A GIF search result's preview (`data` empty: it could not be loaded).
     GifPreview { id: String, data: Vec<u8> },
+
+    // --- added in 1.28.0; only sent to clients that are 1.36.0 or newer ---
+    /// The answer to `AddServerGif` (`error` None: added).
+    ServerGifAdded { id: u32, error: Option<String> },
 }
 
 pub const FILE_CHUNK: usize = 256 * 1024;

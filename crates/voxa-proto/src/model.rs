@@ -127,8 +127,10 @@ pub mod perm {
     /// in; a channel's "Hidden from" groups do not see that channel (and its sub-channels,
     /// people and chat).
     pub const CHANNEL_VIEW: u64 = 1 << 42;
+    /// Add and remove GIFs in the server's GIF library (servers 1.28.0+).
+    pub const GIF_MANAGE: u64 = 1 << 43;
 
-    pub const ALL: u64 = (1 << 43) - 1;
+    pub const ALL: u64 = (1 << 44) - 1;
 
     pub const NAMES: &[(u64, &str)] = &[
         (SERVER_EDIT, "Edit virtual server settings"),
@@ -138,6 +140,7 @@ pub mod perm {
         (CHANNEL_EDIT, "Edit channels"),
         (CHANNEL_DELETE, "Delete channels"),
         (CHANNEL_VIEW, "See channels"),
+        (GIF_MANAGE, "Manage server GIFs"),
         (CHANNEL_JOIN, "Join / switch channels"),
         (CHANNEL_JOIN_IGNORE_POWER, "Join channels regardless of join power"),
         (CHANNEL_JOIN_IGNORE_PASSWORD, "Join channels without password"),

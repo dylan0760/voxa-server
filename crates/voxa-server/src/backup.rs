@@ -384,11 +384,12 @@ fn put_dir(w: &mut impl Write, prefix: &str, dir: &Path) -> io::Result<u64> {
     Ok(n)
 }
 
-/// Names a backup may contain: fixed files, and channel files below `files/`.
+/// Names a backup may contain: fixed files, channel files below `files/` and the GIF
+/// library below `gifs/` (1.28.0+).
 fn allowed_name(name: &str) -> bool {
     match name {
         "manifest.json" | "server.toml" | "voxa.db" | "keys/identity" | "keys/chat" | "privilege_key.txt" => true,
-        _ => name.strip_prefix("files/").is_some_and(|rest| {
+        _ => name.strip_prefix("files/").or_else(|| name.strip_prefix("gifs/")).is_some_and(|rest| {
             !rest.is_empty()
                 && rest.split('/').all(|c| {
                     !c.is_empty() && c != "." && c != ".." && c.len() <= 255 && !c.ends_with(['.', ' ']) && !c.contains(['\\', ':', '\0', '<', '>', '"', '|', '?', '*'])
@@ -502,6 +503,11 @@ pub fn create(server: &Server, lock: bool) -> anyhow::Result<(PathBuf, u64)> {
                 }
                 let files = dir.join("files");
                 let channel_files = if files.is_dir() { put_dir(&mut w, "files", &files)? } else { 0 };
+                // The GIF library (its previews are made again when needed).
+                let gifs = dir.join("gifs");
+                if gifs.is_dir() {
+                    put_dir(&mut w, "gifs", &gifs)?;
+                }
                 let manifest = Manifest {
                     format: FORMAT,
                     created: now,
@@ -687,7 +693,7 @@ mod svc {
 }
 
 /// What can be restored, in place of what.
-const RESTORED: &[&str] = &["server.toml", "voxa.db", "identity.key", "chat.key", "privilege_key.txt", "files"];
+const RESTORED: &[&str] = &["server.toml", "voxa.db", "identity.key", "chat.key", "privilege_key.txt", "files", "gifs"];
 
 /// Restores a backup into `dir` (run as administrator). The current data is moved to
 /// `before-restore` first. `service`: stop the Windows service first and start it again.
@@ -733,7 +739,7 @@ pub fn restore(dir: &Path, file: &Path, password: &str, service: bool, lock: boo
         fs::write(dir.join("identity.key"), crate::secrets::wrap(&fs::read(keys.join("identity"))?))?;
         fs::write(dir.join("chat.key"), crate::secrets::wrap(&fs::read(keys.join("chat"))?))?;
         fs::rename(staging.join("voxa.db"), dir.join("voxa.db"))?;
-        for name in ["server.toml", "privilege_key.txt", "files"] {
+        for name in ["server.toml", "privilege_key.txt", "files", "gifs"] {
             if staging.join(name).exists() {
                 fs::rename(staging.join(name), dir.join(name))?;
             }
@@ -889,10 +895,10 @@ mod tests {
 
     #[test]
     fn entry_names_cannot_escape() {
-        for ok in ["voxa.db", "keys/chat", "files/channel_1/a.txt", "files/channel_2/sub dir/b.png"] {
+        for ok in ["voxa.db", "keys/chat", "files/channel_1/a.txt", "files/channel_2/sub dir/b.png", "gifs/Reactions/wave.gif"] {
             assert!(allowed_name(ok), "{ok}");
         }
-        for bad in ["../x", "files/../voxa.db", "files/", "files//a", "files/a/..", "C:/x", "files/C:x", "files/a\\..\\b", "identity.key", "files/a.", "files/nul\0"] {
+        for bad in ["../x", "files/../voxa.db", "files/", "files//a", "files/a/..", "C:/x", "files/C:x", "files/a\\..\\b", "identity.key", "files/a.", "files/nul\0", "gifs/../voxa.db", "gifs/", "gif-previews/a.gif"] {
             assert!(!allowed_name(bad), "{bad}");
         }
     }

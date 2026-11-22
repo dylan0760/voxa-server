@@ -177,12 +177,12 @@
     GROUP_ASSIGN_CHANNEL: 20, TALK_POWER_GRANT: 21, PRIVILEGE_KEY_CREATE: 22, FILE_BROWSE: 23, FILE_UPLOAD: 24,
     FILE_DOWNLOAD: 25, FILE_DELETE: 26, SCREEN_SHARE: 27, CHANNEL_COMMANDER: 28, CHAT_HISTORY: 29,
     CLIENT_DESCRIPTION_EDIT: 30, IGNORE_SERVER_MAXCLIENTS: 31, CHANNEL_JOIN: 32, CHANNEL_JOIN_IGNORE_POWER: 33,
-    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37, CALENDAR_VIEW: 38, CALENDAR_RSVP: 39, CALENDAR_EVENTS: 40, CALENDAR_MANAGE: 41, CHANNEL_VIEW: 42,
+    CHAT_CLEAR: 34, CHAT_PIN: 35, CHAT_EDIT_OWN: 36, SERVER_EVENTS: 37, CALENDAR_VIEW: 38, CALENDAR_RSVP: 39, CALENDAR_EVENTS: 40, CALENDAR_MANAGE: 41, CHANNEL_VIEW: 42, GIF_MANAGE: 43,
   };
   const PERM_NAMES = [
     [P.SERVER_EDIT, 'Edit virtual server settings'], [P.CHANNEL_CREATE_PERMANENT, 'Create permanent channels'],
     [P.CHANNEL_CREATE_SEMI_PERMANENT, 'Create semi-permanent channels'], [P.CHANNEL_CREATE_TEMPORARY, 'Create temporary channels'],
-    [P.CHANNEL_EDIT, 'Edit channels'], [P.CHANNEL_DELETE, 'Delete channels'], [P.CHANNEL_VIEW, 'See channels'], [P.CHANNEL_JOIN, 'Join / switch channels'],
+    [P.CHANNEL_EDIT, 'Edit channels'], [P.CHANNEL_DELETE, 'Delete channels'], [P.CHANNEL_VIEW, 'See channels'], [P.GIF_MANAGE, 'Manage server GIFs'], [P.CHANNEL_JOIN, 'Join / switch channels'],
     [P.CHANNEL_JOIN_IGNORE_POWER, 'Join channels regardless of join power'], [P.CHANNEL_JOIN_IGNORE_PASSWORD, 'Join channels without password'],
     [P.CHANNEL_JOIN_IGNORE_MAXCLIENTS, 'Join full channels'], [P.CLIENT_MOVE, 'Move clients'], [P.CLIENT_KICK_CHANNEL, 'Kick clients from channel'],
     [P.CLIENT_KICK_SERVER, 'Kick clients from server'], [P.CLIENT_BAN, 'Ban clients'], [P.BAN_LIST, 'View and edit ban list'],

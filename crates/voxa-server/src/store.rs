@@ -346,7 +346,7 @@ impl Store {
     /// (before 1.8.0) had no "pin messages" permission; schema 3 (before 1.15.0) had no
     /// "edit own chat messages" permission; schema 4 (before 1.21.0) had no calendar.
     fn migrate(&self) -> R<()> {
-        const SCHEMA: u64 = 6;
+        const SCHEMA: u64 = 7;
         let current = {
             let r = self.db.begin_read()?;
             let t = r.open_table(META)?;
@@ -474,6 +474,19 @@ impl Store {
                 };
                 if add != 0 && g.perms & add != add {
                     g.perms |= add;
+                    self.save_group(&g)?;
+                }
+            }
+            let w = self.db.begin_write()?;
+            w.open_table(META)?.insert("schema", SCHEMA.to_le_bytes().as_slice())?;
+            w.commit()?;
+            tracing::info!("database migrated to schema {SCHEMA}");
+        }
+        if current < 7 {
+            // 1.28.0: "Manage server GIFs" for the groups that may edit the server (admins).
+            for mut g in self.load_groups()? {
+                if g.kind == GroupKind::Server && g.perms & perm::SERVER_EDIT != 0 && g.perms & perm::GIF_MANAGE == 0 {
+                    g.perms |= perm::GIF_MANAGE;
                     self.save_group(&g)?;
                 }
             }
