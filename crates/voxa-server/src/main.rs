@@ -6,6 +6,7 @@ mod acl;
 mod backup;
 mod config;
 mod files;
+mod gifs;
 mod names;
 mod net;
 mod secrets;

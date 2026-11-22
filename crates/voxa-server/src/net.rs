@@ -175,6 +175,11 @@ async fn control(
         tokio::select! {
             r = timeout(Duration::from_secs(45), reader.recv::<C2S>()) => match r.inspect(|m| if m.is_ok() { TRAFFIC.received(Cat::Chat, reader.last_size) }) {
                 Ok(Ok(C2S::Disconnect(msg))) => break LeaveReason::Disconnected(state_trunc(&msg)),
+                // GIF searches and sends wait on the GIF service: in their own task (1.27.0+).
+                Ok(Ok(msg @ (C2S::SearchGifs { .. } | C2S::SendGif { .. }))) => {
+                    bad = 0;
+                    tokio::spawn(server.clone().gif_message(id, msg));
+                }
                 Ok(Ok(msg)) => {
                     bad = 0;
                     // Password checks are slow on purpose; they run before the state is locked.
@@ -389,6 +394,21 @@ async fn bulk(
                             Err(message) => BulkS2C::TransferError { id: tid, message },
                         })
                         .await;
+                });
+            }
+            BulkC2S::GifPreview(gif) => {
+                let Ok(slot) = image_jobs.clone().acquire_owned().await else { break };
+                let (srv, tx) = (server.clone(), btx.clone());
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let g = gif.chars().take(40).collect::<String>();
+                    let data = tokio::task::spawn_blocking({
+                        let g = g.clone();
+                        move || srv.gif_preview(id, &g)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let _ = tx.send(BulkS2C::GifPreview { id: g, data }).await;
                 });
             }
             BulkC2S::GetImage(image) => {

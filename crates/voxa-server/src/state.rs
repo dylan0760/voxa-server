@@ -62,6 +62,12 @@ pub struct Session {
     pub extra_perms: u64,
     /// Chat rate limit: (tokens left, last refill).
     pub chat_budget: (f32, Instant),
+    /// GIF searches / sends and GIF previews (1.27.0+): bursts, then a steady rate.
+    pub gif_budget: (f32, Instant),
+    pub gif_preview_budget: (f32, Instant),
+    /// GIF result ids this person was given (they may only preview / post those: ids are
+    /// numbered, and other people's searches are none of their business).
+    pub gif_ids: HashSet<String>,
     /// Signed in through the web admin page (no voice; may run next to the same
     /// identity's desktop client).
     pub web: bool,
@@ -89,6 +95,24 @@ pub struct Session {
 /// Chat messages, images and pokes: bursts of this many, then `CHAT_RATE` per second.
 const CHAT_BURST: f32 = 10.0;
 const CHAT_RATE: f32 = 2.0;
+/// GIF searches and sends: bursts of this many, then one a second. Previews: a page
+/// or two at once, then a few a second.
+const GIF_BURST: f32 = 8.0;
+const GIF_RATE: f32 = 1.0;
+const GIF_PREVIEW_BURST: f32 = 60.0;
+const GIF_PREVIEW_RATE: f32 = 6.0;
+
+fn spend(budget: &mut (f32, Instant), burst: f32, rate: f32) -> bool {
+    let (tokens, last) = budget;
+    *tokens = (*tokens + last.elapsed().as_secs_f32() * rate).min(burst);
+    *last = Instant::now();
+    if *tokens >= 1.0 {
+        *tokens -= 1.0;
+        true
+    } else {
+        false
+    }
+}
 
 impl Session {
     /// Takes one token from the chat budget; false when the client sends too fast.
@@ -152,6 +176,9 @@ pub struct Server {
     pub min_client: Mutex<String>,
     /// Argon2 runs at most this many at once, so password floods cannot use every core.
     argon_slots: tokio::sync::Semaphore,
+    /// GIF search (1.27.0+), and how many GIF jobs (searches, downloads) run at once.
+    pub gifs: crate::gifs::Gifs,
+    gif_jobs: tokio::sync::Semaphore,
 }
 
 pub type Res<T = ()> = Result<T, String>;
@@ -304,7 +331,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.33.1";
+pub const MIN_CLIENT_VERSION: &str = "1.35.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -846,6 +873,7 @@ impl Server {
             store.save_channel(&StoredChannel { info: info.clone(), password_hash: None })?;
             channels.insert(id, ChannelRec { info, password_hash: None });
         }
+        let gifs = crate::gifs::Gifs::new(&cfg);
         let srv = Server {
             state: Mutex::new(State {
                 settings,
@@ -875,6 +903,8 @@ impl Server {
             reserved: Mutex::new(HashMap::new()),
             min_client: Mutex::new(MIN_CLIENT_VERSION.to_string()),
             argon_slots: tokio::sync::Semaphore::new(2),
+            gifs,
+            gif_jobs: tokio::sync::Semaphore::new(6),
         };
         srv.ensure_admin_key()?;
         Ok(srv)
@@ -1359,12 +1389,19 @@ impl Server {
                 last_keyframe_req: None,
                 extra_perms,
                 chat_budget: (CHAT_BURST, Instant::now()),
+                gif_budget: (GIF_BURST, Instant::now()),
+                gif_preview_budget: (GIF_PREVIEW_BURST, Instant::now()),
+                gif_ids: HashSet::new(),
                 web,
                 hardware: Vec::new(),
                 hardware_due,
                 presence,
             },
         );
+        // Which GIF service this server searches (1.35.0+ clients).
+        if st.sessions[&id].client_at_least("1.35.0") {
+            st.sessions[&id].tx.send(Out::Msg(S2C::GifSearch(self.gifs.provider().map(|p| p.name().to_string()))));
+        }
         // Account rules and state, and hidden channels for those who edit channels (1.33.1+).
         if st.sessions[&id].client_at_least("1.33.1") {
             let s = &st.sessions[&id];
@@ -1990,6 +2027,8 @@ impl Server {
             | C2S::NewRecoveryCodes { .. }
             | C2S::ResetPassword { .. }
             | C2S::ResetAccount { .. }) => self.dispatch_accounts(st, me, msg),
+            // Handled in their own task (net.rs); the web page sends them like this.
+            C2S::SearchGifs { .. } | C2S::SendGif { .. } => Err("GIFs are not available here".into()),
             C2S::ClearChat(target) => {
                 let s = st.session(me)?;
                 let ch = match target {
@@ -3984,6 +4023,79 @@ fn affects_visibility(msg: &C2S) -> bool {
             | C2S::ChangePassword { .. }
             | C2S::ResetAccount { .. }
     )
+}
+
+// ---------------------------------------------------------------------- GIFs (1.27.0+)
+
+impl Server {
+    /// GIF searches and sends: they wait on the GIF service, so they run in their own task
+    /// (never under the state lock, and never holding up the person's other messages).
+    pub async fn gif_message(self: Arc<Self>, me: ClientId, msg: C2S) {
+        if let Err(e) = self.gif_message_inner(me, msg).await {
+            self.state.lock().send(me, S2C::Error(e));
+        }
+    }
+
+    async fn gif_message_inner(self: &Arc<Self>, me: ClientId, msg: C2S) -> Res {
+        {
+            let mut st = self.state.lock();
+            let s = st.sessions.get_mut(&me).ok_or("Client not found")?;
+            if !spend(&mut s.gif_budget, GIF_BURST, GIF_RATE) {
+                return Err("You are searching GIFs too fast. Please wait a moment.".into());
+            }
+            // Where it goes is checked again when it is posted; this spares a download.
+            if let C2S::SendGif { target, id } = &msg {
+                if !s.gif_ids.contains(id) {
+                    return Err("That GIF is no longer available: search again".into());
+                }
+                match target {
+                    TextTarget::Server => return Err(SERVER_TAB_READ_ONLY.into()),
+                    TextTarget::Channel(ch) if *ch != s.info.channel || *ch == NO_CHANNEL => {
+                        return Err("You can only post to the channel you are in".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let _slot = self.gif_jobs.acquire().await.map_err(|_| "Server is shutting down".to_string())?;
+        let srv = self.clone();
+        match msg {
+            C2S::SearchGifs { query, next } => {
+                let q = query.clone();
+                let (items, next) = tokio::task::spawn_blocking(move || srv.gifs.search(&q, next.as_deref())).await.map_err(|e| e.to_string())??;
+                let query: String = query.chars().take(MAX_GIF_QUERY).collect();
+                let mut st = self.state.lock();
+                if let Some(s) = st.sessions.get_mut(&me) {
+                    if s.gif_ids.len() > 3_000 {
+                        s.gif_ids.clear();
+                    }
+                    s.gif_ids.extend(items.iter().map(|i| i.id.clone()));
+                }
+                st.send(me, S2C::Gifs { query, items, next });
+                Ok(())
+            }
+            C2S::SendGif { target, id } => tokio::task::spawn_blocking(move || {
+                let (data, name, w, h) = srv.gifs.full(&id)?;
+                srv.post_image(me, target, &name, w, h, data)
+            })
+            .await
+            .map_err(|e| e.to_string())?,
+            _ => Ok(()),
+        }
+    }
+
+    /// A GIF search result's preview, for the bulk connection (empty if not allowed /
+    /// not available).
+    pub fn gif_preview(&self, me: ClientId, id: &str) -> Vec<u8> {
+        {
+            let mut st = self.state.lock();
+            let Some(s) = st.sessions.get_mut(&me) else { return Vec::new() };
+            if !s.gif_ids.contains(id) || !spend(&mut s.gif_preview_budget, GIF_PREVIEW_BURST, GIF_PREVIEW_RATE) {
+                return Vec::new();
+            }
+        }
+        self.gifs.preview(id).map(|d| d.to_vec()).unwrap_or_default()
+    }
 }
 
 /// Remembered devices sign in by themselves for this long.

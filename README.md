@@ -338,7 +338,27 @@ their update window by themselves. To allow older clients, set
     sending text there.
   * Only people who can see that chat can open them: people with *See server events* for older Server tab pictures, channel
     members for a channel, and the two participants for a private chat.
-  * PNG, JPEG, GIF, WebP and BMP, up to 10 MB each.
+  * PNG, JPEG, GIF, WebP and BMP, up to 10 MB each. Animated GIFs play in Voxa 1.35.0+
+    and on the web page.
+* **GIF search** (1.27.0, Voxa 1.35.0): the GIF button in Voxa searches GIFs through the
+  server, like WhatsApp's picker.
+  * Set it up in `server.toml`: `gif_provider = "klipy"` (or `"giphy"`) and
+    `gif_api_key = "<your key>"`, then restart. Without a key there is no search; people
+    still have their ⭐ favourites, recent GIFs and pasted GIFs.
+  * **Which service:** Tenor closed its API on 30 June 2026.
+    * [KLIPY](https://klipy.com/developers), from Tenor's founders, has a free key.
+      Test keys allow 100 searches an hour; ask for production access in their Partner
+      Panel. KLIPY's terms ask integrations that search through a server (as Voxa
+      does) to get their approval first: email developers@klipy.com.
+    * [GIPHY](https://developers.giphy.com) free beta keys allow 100 calls an hour;
+      production use is paid.
+  * `gif_content_filter`: KLIPY `off` / `low` / `medium` (default) / `high`; GIPHY `g`,
+    `pg`, `pg-13` or `r`.
+  * The server searches on people's behalf: their searches and addresses never reach the
+    GIF service. Answers are cached for 10 minutes, and the server makes at most 60 calls
+    a minute to the service. Picking a GIF makes the server download it and post it like
+    a picture (stored encrypted, plays for everyone, and doesn't depend on the service
+    keeping it).
 * **Server-relayed screen sharing** with sound, up to 60 fps. Only viewers in the same
   channel receive it.
 * **Video calls** (1.21.0, Voxa 1.29.0 on Windows and Android): people turn their camera
@@ -471,6 +491,15 @@ their update window by themselves. To allow older clients, set
     on that connection, with the authenticator app if the account has one. A stolen
     password alone can't make new recovery codes to get around MFA.
   * Messages carrying passwords are never logged.
+* **GIF search** (1.27.0):
+  * Searches and downloads run in their own tasks, never holding up the server, with at
+    most 6 at once. Each person may search or post 8 GIFs in a burst, then 1 a second.
+  * Results get the server's own ids. People only get the GIF service's addresses
+    through the server, and can only preview or post results of their own searches (so
+    nobody can make the server fetch an address, or see what others searched for).
+  * Only https GIF addresses on named hosts are downloaded (no IP addresses or
+    localhost), only real GIF files are accepted (10 MB per GIF, 2 MB per preview), and
+    posted GIFs go through the same permission checks as pictures.
 * **Limits against overload:**
   * at most 64 connections per address;
   * small messages until a client has logged in;
@@ -556,6 +585,9 @@ page's remembered address), and the backup settings
 | `web_bind` | `0.0.0.0` | Address the web admin page listens on |
 | `web_port` | `9980` | TCP port of the web admin page |
 | `web_allowed_origins` | `[]` | Web addresses the page may be signed in from (empty = the first administrator's address, kept in `web_origin.txt`) |
+| `gif_provider` | `klipy` | GIF search service: `klipy` or `giphy` |
+| `gif_api_key` | `""` | That service's API key (empty = no GIF search) |
+| `gif_content_filter` | `medium` | KLIPY `off`/`low`/`medium`/`high`; GIPHY `g`/`pg`/`pg-13`/`r` |
 
 Restart the server after editing.
 

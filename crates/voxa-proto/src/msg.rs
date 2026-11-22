@@ -188,6 +188,14 @@ pub enum C2S {
     /// temporary password, which they must change after signing in. `remove_mfa`: also
     /// turns off their authenticator app (e.g. a lost phone).
     ResetAccount { uid: String, remove_mfa: bool },
+
+    // --- added in 1.27.0; only sent to servers that are 1.27.0 or newer ---
+    /// Searches the server's GIF service (`query` empty: trending). `next`: the page
+    /// after an earlier answer's `next`. Answered with `Gifs`.
+    SearchGifs { query: String, next: Option<String> },
+    /// Posts a GIF from search results to a chat: the server downloads it and posts it
+    /// like a picture (so nobody's device contacts the GIF service).
+    SendGif { target: TextTarget, id: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -335,6 +343,12 @@ pub enum S2C {
     /// To the administrator who reset someone's password: the temporary password to give
     /// them (shown once; they must change it after signing in).
     AccountReset { uid: String, username: String, password: String },
+
+    // --- added in 1.27.0; only sent to clients that are 1.35.0 or newer ---
+    /// The GIF service this server searches (`None`: no GIF search here). After Welcome.
+    GifSearch(Option<String>),
+    /// GIF search results (previews come over the bulk connection, `GifPreview`).
+    Gifs { query: String, items: Vec<GifInfo>, next: Option<String> },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
@@ -365,6 +379,10 @@ pub enum BulkC2S {
     CameraFrame(StreamFrame),
     /// Asks the camera of this person for a full picture (e.g. after joining).
     RequestCameraKeyframe(ClientId),
+
+    // --- added in 1.27.0; only sent to servers that are 1.27.0 or newer ---
+    /// A small animated preview of a GIF search result (answered with `GifPreview`).
+    GifPreview(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -393,6 +411,10 @@ pub enum BulkS2C {
     CameraFrame { from: ClientId, frame: StreamFrame },
     /// Someone needs a full picture of your camera.
     CameraKeyframeRequested,
+
+    // --- added in 1.27.0; only sent to clients that are 1.35.0 or newer ---
+    /// A GIF search result's preview (`data` empty: it could not be loaded).
+    GifPreview { id: String, data: Vec<u8> },
 }
 
 pub const FILE_CHUNK: usize = 256 * 1024;

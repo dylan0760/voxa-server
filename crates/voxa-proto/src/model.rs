@@ -767,6 +767,19 @@ pub struct AccountState {
     pub reason: String,
 }
 
+/// A GIF search result (servers 1.27.0+).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GifInfo {
+    /// The server's id for it (only valid on that server, for a while).
+    pub id: String,
+    pub title: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Longest GIF search text.
+pub const MAX_GIF_QUERY: usize = 100;
+
 /// Usernames: 3 to 32 letters, digits, `.`, `_` or `-`.
 pub fn valid_username(u: &str) -> bool {
     (3..=32).contains(&u.chars().count()) && u.chars().all(|c| c.is_alphanumeric() || ".-_".contains(c))

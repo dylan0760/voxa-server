@@ -28,6 +28,15 @@ pub struct Config {
     /// Web addresses the page may be signed in from, e.g. `["https://voxa.example.org"]`.
     /// Empty: whatever address the page was opened with (as the browser / proxy reports it).
     pub web_allowed_origins: Vec<String>,
+    /// GIF search (1.27.0+): `klipy` or `giphy`, with that service's API key. The server
+    /// searches for its people (their searches and addresses never reach the service).
+    /// Empty key: no GIF search (favourites and pasted GIFs still work).
+    pub gif_provider: String,
+    pub gif_api_key: String,
+    /// KLIPY: `off`, `low`, `medium` or `high`; GIPHY: `g`, `pg`, `pg-13` or `r`.
+    pub gif_content_filter: String,
+    /// The service's address (only for tests; empty: the real one).
+    pub gif_api_base: String,
 }
 
 impl Default for Config {
@@ -43,6 +52,10 @@ impl Default for Config {
             web_bind: "0.0.0.0".into(),
             web_port: 9980,
             web_allowed_origins: Vec::new(),
+            gif_provider: "klipy".into(),
+            gif_api_key: String::new(),
+            gif_content_filter: "medium".into(),
+            gif_api_base: String::new(),
         }
     }
 }
