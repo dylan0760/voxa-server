@@ -371,6 +371,10 @@ their update window by themselves. To allow older clients, set
     server GIFs** in its full-size view) and remove GIFs (right-click). Added GIFs go into
     a category folder in `gifs` (default "Added in Voxa"); a name already taken gets a
     number.
+  * **From GIPHY:** Voxa 1.36.1's picker has a 🌐 GIPHY button. Copy a GIF's link there
+    (a GIPHY page or its `media.giphy.com/…/giphy.gif` address), paste it into the
+    📚 Server tab's link box, give it a name if you like, and press Add. The admin's Voxa
+    downloads it and adds it to the library.
   * Limits: GIF files up to 10 MB, 50 000 GIFs, and adding from Voxa stops at 5 GB.
     Small previews for the picker are made the first time they are needed and kept in
     `gif-previews`.
