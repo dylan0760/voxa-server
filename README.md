@@ -251,6 +251,10 @@ their update window by themselves. To allow older clients, set
   * **Opus Music** (stereo, up to 192 kbit/s);
   * **Lossless** (16-bit 48 kHz stereo, bit exact). The server only forwards lossless
     audio to clients that can play it.
+* **Music in voice channels:** listeners on Voxa 1.39.0+ can right-click a music user
+  and enable **Audio ducking**. Their client lowers that user's voice and shared audio
+  during conversation. Each listener sets the level in **Options ▸ Playback**; the
+  server relays the original audio and needs no configuration change.
 * **Unique names** (1.26.0): each nickname belongs to one identity on the server, also
   while its owner is offline, so nobody can take or imitate someone else's name.
   * Names are compared ignoring case, accents, spaces and separators (`_ - .`), and
