@@ -55,8 +55,9 @@ Open it from the Start menu (**Voxa Server Manager**) or from its tray icon. It 
   **Use Privilege Key** and paste it to become admin;
 * buttons for the data folder, `server.toml` and the log, plus a live log view;
 * **🌐 Open Web Admin**, which opens the [web admin page](#web-admin-page);
-* **🌐 Language** (1.30.0) at the top right: the Manager in any of Voxa's 41 languages (it
-  starts in Windows' language; the choice is kept per Windows user);
+* **🌐 Language** (1.30.0) at the top right: the Manager in any of Voxa's 41 languages,
+  each with its flag icon and own name (1.30.1; starts in Windows' language, kept per
+  Windows user);
 * **Backups**: settings, **Back up now**, the last and next backup, and **Restore** (see
   [Backups](#backups));
 * **Startup**: whether the manager opens in the system tray when you sign in to Windows
@@ -122,8 +123,9 @@ Obsidian) and the two-tone ones where one colour blends into another.
 
 * **Open it:** `http://<server>:9980/`, or **🌐 Open Web Admin** in Voxa Server Manager.
 * **Languages** (1.30.0): the page uses your browser's language when Voxa has it (41
-  languages); 🌐 (on the sign-in page and at the bottom left) picks another one, kept in
-  this browser. The server serves the same translations Voxa uses (`/i18n/`).
+  languages); 🌐 (on the sign-in page and at the bottom left) opens a list with flag
+  icons and each language's own name (1.30.1), kept in this browser. The server serves
+  the same translations and flag icons Voxa uses (`/i18n/`).
 * **Sign in** with a Voxa identity. You get exactly the rights that identity has: an
   admin identity can do everything, a normal one only what normal users can.
   * **🎧 Sign in with Voxa** (Voxa 1.20.0+ on this PC): Voxa pops up, shows the web
@@ -230,9 +232,11 @@ their update window by themselves. To allow older clients, set
 * **View as** (1.30.0, Voxa 1.38.0): people who may manage groups can preview the server
   as other server groups (e.g. Guest). The server really treats them as those groups
   (permissions, hidden channels, talk and join power, the default channel group) until
-  they press ✖ Stop or disconnect. Only groups that give no more than their own
-  permissions can be picked, and it never gives more than they really have (even if
-  those groups get more permissions meanwhile).* **Channels:**
+  they press ✖ Stop or disconnect. Only groups with no more permissions, talk power or
+  join power than their own can be picked, it never reveals channels hidden from their
+  own groups, and it cancels automatically if the previewed group is deleted or the user
+  loses *Manage groups* (1.30.1).
+* **Channels:**
   * Permanent, semi-permanent and temporary channels, with sub-channels, passwords, max
     clients, topic and description, and moderation (talk power).
   * Drag & drop ordering, and **Clone Channel**.
@@ -535,8 +539,9 @@ their update window by themselves. To allow older clients, set
     through the server, and can only preview or post results of their own searches (so
     nobody can make the server fetch an address, or see what others searched for).
   * Only https GIF addresses on named hosts are downloaded (no IP addresses or
-    localhost), only real GIF files are accepted (10 MB per GIF, 2 MB per preview), and
-    posted GIFs go through the same permission checks as pictures.
+    localhost, checked again on every redirect hop), only real GIF files are accepted
+    (10 MB per GIF, 2 MB per preview), and posted GIFs go through the same permission
+    checks as pictures.
 * **GIF library** (1.28.0): only GIF files are read or accepted. Links and junctions in
   the `gifs` folder are skipped, so nothing outside it is ever shown. Names given in Voxa
   are cleaned: no folder separators or `..`, and Windows device names like `CON` are

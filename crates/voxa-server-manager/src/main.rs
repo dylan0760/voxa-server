@@ -740,14 +740,24 @@ impl eframe::App for ManagerApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // The language (saved for this Windows user).
                     let mut lang = i18n::saved();
-                    let shown = lang.as_deref().and_then(voxa_proto::i18n::lang).map(|l| l.name).unwrap_or("🌐");
+                    let sys_code = i18n::chosen(None);
+                    let sys_lang = voxa_proto::i18n::lang(&sys_code).unwrap_or(&voxa_proto::i18n::LANGS[0]);
+                    let (sel_code, sel_text) = match lang.as_deref().and_then(voxa_proto::i18n::lang) {
+                        Some(l) => (l.code, if l.rtl { i18n::shape(l.name) } else { l.name.to_string() }),
+                        None => (sys_lang.code, String::new()),
+                    };
                     let before = lang.clone();
-                    egui::ComboBox::from_id_salt("language").selected_text(format!("🌐 {shown}")).height(400.0).show_ui(ui, |ui| {
-                        ui.selectable_value(&mut lang, None, t!("System language"));
-                        for l in voxa_proto::i18n::LANGS {
-                            ui.selectable_value(&mut lang, Some(l.code.to_string()), l.name).on_hover_text(l.english);
-                        }
-                    });
+                    egui::ComboBox::from_id_salt("language")
+                        .selected_text((i18n::flag_atom(sel_code), sel_text))
+                        .height(400.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut lang, None, (i18n::flag_atom(sys_lang.code), t!("System language")));
+                            for l in voxa_proto::i18n::LANGS {
+                                let name = if l.rtl { i18n::shape(l.name) } else { l.name.to_string() };
+                                ui.selectable_value(&mut lang, Some(l.code.to_string()), (i18n::flag_atom(l.code), name))
+                                    .on_hover_text(l.english);
+                            }
+                        });
                     if lang != before {
                         i18n::save(lang.as_deref());
                         i18n::apply(&i18n::chosen(lang.as_deref()), ui.ctx());
@@ -1017,8 +1027,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     }
     if let Some(script) = voxa_proto::i18n::lang(voxa_proto::i18n::current()).map(|l| l.script) {
         if let Some((bytes, index)) = voxa_proto::i18n::system_font(script) {
-            let mut data = egui::FontData::from_owned(bytes);
-            data.index = index;
+            let data = egui::FontData::from_blob(bytes, index);
             fonts.font_data.insert("language".to_owned(), Arc::new(data));
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 if let Some(list) = fonts.families.get_mut(&fam) {
@@ -1028,4 +1037,5 @@ pub fn install_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+    ctx.set_font_providers(vec![i18n::script_font_provider(vec![egui::FontFamily::Proportional, egui::FontFamily::Monospace])]);
 }

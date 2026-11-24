@@ -271,19 +271,70 @@ fn get(url: &str, limit: usize) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
-/// Downloads a GIF from an address a search result gave, refusing anything else.
-fn get_gif(url: &str, limit: usize) -> Result<Vec<u8>, String> {
-    if !safe_media_url(url) {
-        return Err("The GIF service gave an address Voxa does not load".into());
+fn media_agent() -> ureq::Agent {
+    let cfg = ureq::Agent::config_builder()
+        .tls_config(voxa_proto::update::tls_config(true))
+        .https_only(true)
+        .timeout_global(Some(Duration::from_secs(15)))
+        .max_redirects(0)
+        .user_agent(format!("Voxa-Server/{}", env!("CARGO_PKG_VERSION")))
+        .build();
+    ureq::Agent::new_with_config(cfg)
+}
+
+fn resolve_https_redirect(base: &str, loc: &str) -> Option<String> {
+    let loc = loc.trim();
+    if loc.starts_with("https://") {
+        Some(loc.to_string())
+    } else if loc.starts_with("//") {
+        Some(format!("https:{loc}"))
+    } else if loc.starts_with('/') {
+        let rest = base.strip_prefix("https://")?;
+        let origin = rest.split('/').next()?;
+        Some(format!("https://{origin}{loc}"))
+    } else {
+        None
     }
-    let data = get(url, limit).map_err(|e| {
-        if e == "too large" {
-            format!("That GIF is larger than {} MB", limit / (1024 * 1024))
-        } else {
-            tracing::warn!("GIF download failed: {e}");
-            "The GIF could not be downloaded: try another one".into()
+}
+
+/// Downloads a GIF from an address a search result gave, refusing anything else (including
+/// redirects to non-https or local addresses).
+fn get_gif(url: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let a = media_agent();
+    let mut cur = url.to_string();
+    let data = 'hops: {
+        for _ in 0..=3 {
+            if !safe_media_url(&cur) {
+                return Err("The GIF service gave an address Voxa does not load".into());
+            }
+            let resp = a.get(&cur).call().map_err(|e| {
+                tracing::warn!("GIF download failed: {e}");
+                "The GIF could not be downloaded: try another one".to_string()
+            })?;
+            if (300..400).contains(&resp.status().as_u16()) {
+                let next = resp.headers().get("location").and_then(|v| v.to_str().ok()).and_then(|l| resolve_https_redirect(&cur, l));
+                cur = next.ok_or_else(|| "The GIF service gave an address Voxa does not load".to_string())?;
+                continue;
+            }
+            let mut buf = Vec::new();
+            use std::io::Read;
+            resp.into_body()
+                .into_with_config()
+                .limit(limit as u64 + 1)
+                .reader()
+                .take(limit as u64 + 1)
+                .read_to_end(&mut buf)
+                .map_err(|e| {
+                    tracing::warn!("GIF download failed: {e}");
+                    "The GIF could not be downloaded: try another one".to_string()
+                })?;
+            if buf.len() > limit {
+                return Err(format!("That GIF is larger than {} MB", limit / (1024 * 1024)));
+            }
+            break 'hops buf;
         }
-    })?;
+        return Err("The GIF could not be downloaded: try another one".into());
+    };
     if !data.starts_with(b"GIF87a") && !data.starts_with(b"GIF89a") {
         return Err("The GIF service did not send a GIF".into());
     }

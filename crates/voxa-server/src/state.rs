@@ -335,7 +335,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.38.0";
+pub const MIN_CLIENT_VERSION: &str = "1.38.1";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -529,11 +529,17 @@ impl State {
         self.groups.get(&g).map(|g| g.perms).unwrap_or(0)
     }
 
+    /// Real server-wide permissions (only Guest's while account rules want a sign-in),
+    /// ignoring "View as".
+    pub fn real_server_perms(&self, s: &Session) -> u64 {
+        let raw = self.raw_server_perms(s);
+        if self.limit_reason(s, raw).is_some() { self.group_perms(GROUP_GUEST) } else { raw }
+    }
+
     /// Server-wide permissions: all server groups plus the user's own permissions, or only
     /// Guest's while the account rules want them to sign in (see `limited`).
     pub fn server_perms(&self, s: &Session) -> u64 {
-        let raw = self.raw_server_perms(s);
-        let real = if self.limit_reason(s, raw).is_some() { self.group_perms(GROUP_GUEST) } else { raw };
+        let real = self.real_server_perms(s);
         // "View as" (1.30.0+): what those groups give, nothing of one's own, and never more
         // than one really has (even if someone gives those groups more meanwhile).
         match &s.view_as {
@@ -584,11 +590,8 @@ impl State {
         self.limit_reason(s, self.raw_server_perms(s)).is_some()
     }
 
-    /// The server groups that count for hiding channels: only Guest while limited.
-    fn view_groups<'a>(&self, s: &'a Session) -> std::borrow::Cow<'a, [GroupId]> {
-        if let Some(v) = &s.view_as {
-            return std::borrow::Cow::Borrowed(v);
-        }
+    /// The user's real server groups (only Guest while limited), ignoring "View as".
+    fn real_groups<'a>(&self, s: &'a Session) -> std::borrow::Cow<'a, [GroupId]> {
         if self.limited(s) {
             std::borrow::Cow::Owned(vec![GROUP_GUEST])
         } else {
@@ -596,15 +599,49 @@ impl State {
         }
     }
 
+    /// Drops deleted groups from every session's "View as" and stops "View as" for anyone
+    /// who lost `Manage groups` (e.g. demoted or signed out), notifying those clients.
+    pub fn prune_view_as(&mut self) {
+        let mut updates: Vec<(ClientId, Option<Vec<GroupId>>)> = Vec::new();
+        let ids: Vec<ClientId> = self.sessions.keys().copied().collect();
+        for id in ids {
+            let Some(s) = self.sessions.get(&id) else { continue };
+            let Some(v) = &s.view_as else { continue };
+            let can = self.real_server_perms(s) & perm::GROUP_MANAGE != 0;
+            let next = if can {
+                let kept: Vec<GroupId> = v.iter().copied().filter(|g| self.groups.get(g).is_some_and(|x| x.kind == GroupKind::Server)).collect();
+                (!kept.is_empty()).then_some(kept)
+            } else {
+                None
+            };
+            if next != s.view_as {
+                if let Some(sm) = self.sessions.get_mut(&id) {
+                    sm.view_as = next.clone();
+                }
+                updates.push((id, next));
+            }
+        }
+        for (id, next) in updates {
+            self.send_if_supported(id, "1.38.0", S2C::ViewingAs(next));
+        }
+    }
+
     /// Whether someone sees a channel (1.25.0+): always the one they are in; administrators
     /// (`Edit virtual server`) all; others need "See channels" and none of their server
-    /// groups in the channel's (or a parent's) "Hidden from" list.
+    /// groups in the channel's (or a parent's) "Hidden from" list. While "View as" is on,
+    /// a channel is visible only if BOTH the user's real self AND the previewed groups see it.
     pub fn sees_channel(&self, s: &Session, ch: ChannelId) -> bool {
         if ch == NO_CHANNEL || s.info.channel == ch {
             return true;
         }
-        let perms = self.server_perms(s);
-        self.channel_visible_to(&self.view_groups(s), perms, ch)
+        let real = self.real_server_perms(s);
+        if !self.channel_visible_to(&self.real_groups(s), real, ch) {
+            return false;
+        }
+        match &s.view_as {
+            Some(v) => self.channel_visible_to(v, self.server_perms(s), ch),
+            None => true,
+        }
     }
 
     /// `sees_channel` for given server groups and permissions (also before a session exists).
@@ -640,11 +677,20 @@ impl State {
             .map(|v| {
                 // The same as `sees_channel` / `sees`, with the viewer's rights worked out once.
                 let limited = self.limited(v);
+                let real_perms = self.real_server_perms(v);
+                let real_groups = self.real_groups(v);
                 let perms = self.server_perms(v);
                 let admin = perms & perm::SERVER_EDIT != 0;
-                let groups = self.view_groups(v);
-                let chans: HashSet<ChannelId> =
-                    self.channels.keys().copied().filter(|c| v.info.channel == *c || self.channel_visible_to(&groups, perms, *c)).collect();
+                let chans: HashSet<ChannelId> = self
+                    .channels
+                    .keys()
+                    .copied()
+                    .filter(|c| {
+                        v.info.channel == *c
+                            || (self.channel_visible_to(&real_groups, real_perms, *c)
+                                && v.view_as.as_ref().is_none_or(|vg| self.channel_visible_to(vg, perms, *c)))
+                    })
+                    .collect();
                 let people = self
                     .sessions
                     .values()
@@ -735,22 +781,20 @@ impl State {
         groups.iter().chain(std::iter::once(&cg)).filter_map(|g| self.groups.get(g)).map(f).max().unwrap_or(0)
     }
 
-    pub fn talk_power(&self, s: &Session) -> i32 {
-        if let Some(v) = &s.view_as {
-            return self.join_or_talk(v, self.settings.default_channel_group, |g| g.talk_power);
-        }
-        // Limited to Guest until signing in (accounts): Guest's talk power too.
+    /// Real talk power (Guest's while limited), ignoring "View as".
+    pub fn real_talk_power(&self, s: &Session) -> i32 {
         if self.limited(s) {
             return self.groups.get(&GROUP_GUEST).map(|g| g.talk_power).unwrap_or(0);
         }
-        s.info
-            .server_groups
-            .iter()
-            .chain(std::iter::once(&s.info.channel_group))
-            .filter_map(|g| self.groups.get(g))
-            .map(|g| g.talk_power)
-            .max()
-            .unwrap_or(0)
+        self.join_or_talk(&s.info.server_groups, s.info.channel_group, |g| g.talk_power)
+    }
+
+    pub fn talk_power(&self, s: &Session) -> i32 {
+        let real = self.real_talk_power(s);
+        if let Some(v) = &s.view_as {
+            return self.join_or_talk(v, self.settings.default_channel_group, |g| g.talk_power).min(real);
+        }
+        real
     }
 
     /// Highest join power of the given server groups plus a channel group.
@@ -1595,6 +1639,7 @@ impl Server {
             st.send(me, S2C::Error(e));
         }
         if let Some(b) = before {
+            st.prune_view_as();
             st.apply_visibility(b, |st, s| self.account_state(st, s));
         }
         drop(st);
@@ -1791,7 +1836,15 @@ impl Server {
                 // Talk / join power can be raised only up to my own.
                 if mine != perm::ALL {
                     let my_talk = st.talk_power(s);
-                    let my_join = st.join_power(&s.info.server_groups, s.info.channel_group);
+                    let real_join = if st.limited(s) {
+                        st.join_power(&[GROUP_GUEST], GROUP_GUEST)
+                    } else {
+                        st.join_power(&s.info.server_groups, s.info.channel_group)
+                    };
+                    let my_join = match &s.view_as {
+                        Some(v) => st.join_power(v, st.settings.default_channel_group).min(real_join),
+                        None => real_join,
+                    };
                     if (g.talk_power > old.talk_power && g.talk_power > my_talk) || (g.join_power > old.join_power && g.join_power > my_join) {
                         return Err("You cannot give a group more talk or join power than you have".into());
                     }
@@ -2293,10 +2346,14 @@ impl Server {
         }
         if c.info.needed_join_power > 0 && p & perm::CHANNEL_JOIN_IGNORE_POWER == 0 {
             let cg = self.channel_group_for(st, &s.info.uid, ch);
+            let real_join = if st.limited(s) {
+                st.join_power(&[GROUP_GUEST], GROUP_GUEST)
+            } else {
+                st.join_power(&s.info.server_groups, cg)
+            };
             let have = match &s.view_as {
-                Some(v) => st.join_power(v, st.settings.default_channel_group),
-                None if st.limited(s) => st.join_power(&[GROUP_GUEST], GROUP_GUEST),
-                None => st.join_power(&s.info.server_groups, cg),
+                Some(v) => st.join_power(v, st.settings.default_channel_group).min(real_join),
+                None => real_join,
             };
             if have < c.info.needed_join_power {
                 return Err(format!(
@@ -3877,9 +3934,13 @@ impl Server {
     /// may not give more than one has.
     fn view_as(&self, st: &mut State, me: ClientId, groups: Option<Vec<GroupId>>) -> Res {
         let s = st.session(me)?;
-        // One's real permissions (Guest's while the account rules want a sign-in).
-        let raw = st.raw_server_perms(s);
-        let real = if st.limit_reason(s, raw).is_some() { st.group_perms(GROUP_GUEST) } else { raw };
+        let real = st.real_server_perms(s);
+        let real_talk = st.real_talk_power(s);
+        let real_join = if st.limited(s) {
+            st.join_power(&[GROUP_GUEST], GROUP_GUEST)
+        } else {
+            st.join_power(&s.info.server_groups, s.info.channel_group)
+        };
         let name = s.info.nickname.clone();
         let groups = match groups {
             None => None,
@@ -3894,7 +3955,9 @@ impl Server {
                     return Err("Group not found".into());
                 }
                 let theirs = g.iter().fold(0, |a, id| a | st.group_perms(*id));
-                if theirs & !real != 0 {
+                let their_talk = g.iter().filter_map(|id| st.groups.get(id)).map(|x| x.talk_power).max().unwrap_or(0);
+                let their_join = g.iter().filter_map(|id| st.groups.get(id)).map(|x| x.join_power).max().unwrap_or(0);
+                if theirs & !real != 0 || (real != perm::ALL && (their_talk > real_talk || their_join > real_join)) {
                     return Err("You cannot view the server as groups with permissions you do not have".into());
                 }
                 Some(g)

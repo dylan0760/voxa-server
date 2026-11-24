@@ -7,7 +7,8 @@
 //! text is filled in by the program (the translation keeps the same number of them).
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 /// The writing system: which extra font a language needs (most need none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -284,32 +285,58 @@ pub fn trf(english: &'static str, args: &[&dyn std::fmt::Display]) -> String {
     displayed(english, out)
 }
 
+/// Reads a system font file once per process and shares its bytes (`Arc<Vec<u8>>`) across
+/// TTC face indices and language switches.
+fn read_font_cached(path: PathBuf) -> Option<Arc<Vec<u8>>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<Arc<Vec<u8>>>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().ok()?.get(&path) {
+        return hit.clone();
+    }
+    let loaded = std::fs::read(&path).ok().map(Arc::new);
+    if let Ok(mut g) = cache.lock() {
+        g.insert(path, loaded.clone());
+    }
+    loaded
+}
+
+#[cfg(windows)]
+fn font_path(file: &str) -> PathBuf {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    PathBuf::from(windir).join("Fonts").join(file)
+}
+
+#[cfg(target_os = "android")]
+fn font_path(file: &str) -> PathBuf {
+    PathBuf::from("/system/fonts").join(file)
+}
+
 /// A font file of the system with the letters of a script (Chinese, Japanese, Korean,
-/// Arabic, Devanagari, Bengali, Thai): (bytes, index in a font collection). None for the
-/// scripts the built-in fonts already have.
-pub fn system_font(script: Script) -> Option<(Vec<u8>, u32)> {
+/// Arabic, Devanagari, Bengali, Thai): (shared bytes, index in a font collection). None
+/// for scripts the built-in fonts already cover.
+pub fn system_font(script: Script) -> Option<(Arc<Vec<u8>>, u32)> {
     #[cfg(windows)]
     let candidates: &[(&str, u32)] = match script {
-        ChineseSimplified => &[("C:\\Windows\\Fonts\\msyh.ttc", 0), ("C:\\Windows\\Fonts\\simsun.ttc", 0)],
-        ChineseTraditional => &[("C:\\Windows\\Fonts\\msjh.ttc", 0), ("C:\\Windows\\Fonts\\mingliub.ttc", 0)],
-        Japanese => &[("C:\\Windows\\Fonts\\YuGothM.ttc", 0), ("C:\\Windows\\Fonts\\meiryo.ttc", 0), ("C:\\Windows\\Fonts\\msgothic.ttc", 0)],
-        Korean => &[("C:\\Windows\\Fonts\\malgun.ttf", 0), ("C:\\Windows\\Fonts\\gulim.ttc", 0)],
-        Arabic => &[("C:\\Windows\\Fonts\\arial.ttf", 0), ("C:\\Windows\\Fonts\\tahoma.ttf", 0)],
-        Devanagari | Bengali => &[("C:\\Windows\\Fonts\\Nirmala.ttc", 0), ("C:\\Windows\\Fonts\\Nirmala.ttf", 0)],
-        Thai => &[("C:\\Windows\\Fonts\\LeelawUI.ttf", 0), ("C:\\Windows\\Fonts\\tahoma.ttf", 0)],
+        ChineseSimplified => &[("msyh.ttc", 0), ("simsun.ttc", 0)],
+        ChineseTraditional => &[("msjh.ttc", 0), ("mingliub.ttc", 0)],
+        Japanese => &[("YuGothM.ttc", 0), ("meiryo.ttc", 0), ("msgothic.ttc", 0)],
+        Korean => &[("malgun.ttf", 0), ("gulim.ttc", 0)],
+        Arabic => &[("segoeui.ttf", 0), ("arial.ttf", 0), ("tahoma.ttf", 0)],
+        Devanagari | Bengali => &[("Nirmala.ttc", 0), ("Nirmala.ttf", 0)],
+        Thai => &[("LeelawUI.ttf", 0), ("tahoma.ttf", 0)],
         _ => &[],
     };
     #[cfg(target_os = "android")]
     let candidates: &[(&str, u32)] = match script {
         // NotoSansCJK collections: Japanese, Korean, Simplified, Traditional Chinese.
-        ChineseSimplified => &[("/system/fonts/NotoSansCJK-Regular.ttc", 2), ("/system/fonts/NotoSansSC-Regular.otf", 0)],
-        ChineseTraditional => &[("/system/fonts/NotoSansCJK-Regular.ttc", 3), ("/system/fonts/NotoSansTC-Regular.otf", 0)],
-        Japanese => &[("/system/fonts/NotoSansCJK-Regular.ttc", 0), ("/system/fonts/NotoSansJP-Regular.otf", 0)],
-        Korean => &[("/system/fonts/NotoSansCJK-Regular.ttc", 1), ("/system/fonts/NotoSansKR-Regular.otf", 0)],
-        Arabic => &[("/system/fonts/NotoNaskhArabic-Regular.ttf", 0), ("/system/fonts/NotoSansArabic-Regular.ttf", 0), ("/system/fonts/DroidNaskh-Regular.ttf", 0)],
-        Devanagari => &[("/system/fonts/NotoSansDevanagari-Regular.otf", 0), ("/system/fonts/NotoSansDevanagari-Regular.ttf", 0), ("/system/fonts/NotoSansDevanagari-VF.ttf", 0)],
-        Bengali => &[("/system/fonts/NotoSansBengali-Regular.otf", 0), ("/system/fonts/NotoSansBengali-Regular.ttf", 0), ("/system/fonts/NotoSansBengali-VF.ttf", 0)],
-        Thai => &[("/system/fonts/NotoSansThai-Regular.ttf", 0), ("/system/fonts/NotoSansThai-Regular.otf", 0)],
+        ChineseSimplified => &[("NotoSansCJK-Regular.ttc", 2), ("NotoSansSC-Regular.otf", 0)],
+        ChineseTraditional => &[("NotoSansCJK-Regular.ttc", 3), ("NotoSansTC-Regular.otf", 0)],
+        Japanese => &[("NotoSansCJK-Regular.ttc", 0), ("NotoSansJP-Regular.otf", 0)],
+        Korean => &[("NotoSansCJK-Regular.ttc", 1), ("NotoSansKR-Regular.otf", 0)],
+        Arabic => &[("NotoNaskhArabic-Regular.ttf", 0), ("NotoSansArabic-Regular.ttf", 0), ("DroidNaskh-Regular.ttf", 0)],
+        Devanagari => &[("NotoSansDevanagari-Regular.otf", 0), ("NotoSansDevanagari-Regular.ttf", 0), ("NotoSansDevanagari-VF.ttf", 0)],
+        Bengali => &[("NotoSansBengali-Regular.otf", 0), ("NotoSansBengali-Regular.ttf", 0), ("NotoSansBengali-VF.ttf", 0)],
+        Thai => &[("NotoSansThai-Regular.ttf", 0), ("NotoSansThai-Regular.otf", 0)],
         _ => &[],
     };
     #[cfg(not(any(windows, target_os = "android")))]
@@ -317,7 +344,59 @@ pub fn system_font(script: Script) -> Option<(Vec<u8>, u32)> {
         let _ = script;
         &[]
     };
-    candidates.iter().find_map(|(p, i)| std::fs::read(p).ok().map(|b| (b, *i)))
+    #[cfg(any(windows, target_os = "android"))]
+    {
+        candidates.iter().find_map(|(f, i)| read_font_cached(font_path(f)).map(|b| (b, *i)))
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
+    {
+        let _ = candidates;
+        let _ = read_font_cached;
+        None
+    }
+}
+
+/// System fallback font for extended Latin (e.g. Vietnamese), Greek or Cyrillic characters
+/// missing from the built-in font.
+fn extended_latin_font() -> Option<(Arc<Vec<u8>>, u32)> {
+    #[cfg(windows)]
+    let candidates: &[(&str, u32)] = &[("segoeui.ttf", 0), ("arial.ttf", 0)];
+    #[cfg(target_os = "android")]
+    let candidates: &[(&str, u32)] = &[("Roboto-Regular.ttf", 0), ("NotoSans-Regular.ttf", 0)];
+    #[cfg(not(any(windows, target_os = "android")))]
+    let candidates: &[(&str, u32)] = &[];
+    #[cfg(any(windows, target_os = "android"))]
+    {
+        candidates.iter().find_map(|(f, i)| read_font_cached(font_path(f)).map(|b| (b, *i)))
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
+    {
+        let _ = candidates;
+        None
+    }
+}
+
+/// On-demand system font lookup for a character not covered by the installed fonts (used
+/// by egui's `FontProvider` so the language list and chat show every script cleanly without
+/// loading unused fonts at startup).
+pub fn fallback_font_for_char(c: char) -> Option<(&'static str, Arc<Vec<u8>>, u32)> {
+    match c {
+        '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}' | '\u{08A0}'..='\u{08FF}' | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}' => {
+            system_font(Arabic).map(|(b, i)| ("script_arabic", b, i))
+        }
+        '\u{0900}'..='\u{097F}' => system_font(Devanagari).map(|(b, i)| ("script_devanagari", b, i)),
+        '\u{0980}'..='\u{09FF}' => system_font(Bengali).map(|(b, i)| ("script_bengali", b, i)),
+        '\u{0E00}'..='\u{0E7F}' => system_font(Thai).map(|(b, i)| ("script_thai", b, i)),
+        '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' => system_font(Korean).map(|(b, i)| ("script_korean", b, i)),
+        '\u{3040}'..='\u{30FF}' => system_font(Japanese).map(|(b, i)| ("script_japanese", b, i)),
+        '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{3000}'..='\u{303F}' | '\u{FF00}'..='\u{FFEF}' => {
+            system_font(ChineseSimplified).or_else(|| system_font(ChineseTraditional)).map(|(b, i)| ("script_cjk", b, i))
+        }
+        '\u{0100}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}' | '\u{0370}'..='\u{052F}' => {
+            extended_latin_font().map(|(b, i)| ("script_latin_ext", b, i))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

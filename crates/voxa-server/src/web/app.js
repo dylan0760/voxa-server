@@ -41,18 +41,74 @@
     }
   } catch (_) { /* an older server, or offline: English */ }
   const T = (s) => (Object.prototype.hasOwnProperty.call(TR, s) ? TR[s] : s);
+  function flagSvg(shapes) {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('class', 'flag');
+    svg.setAttribute('viewBox', '0 0 30 20');
+    svg.setAttribute('aria-hidden', 'true');
+    const hex = (c) => (typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c) ? c : '#888888');
+    for (const s of Array.isArray(shapes) ? shapes : []) {
+      if (!Array.isArray(s)) continue;
+      if (s[0] === 'r' && s.length === 6) {
+        const e = document.createElementNS(NS, 'rect');
+        e.setAttribute('x', String(Number(s[1]) * 30));
+        e.setAttribute('y', String(Number(s[2]) * 20));
+        e.setAttribute('width', String(Number(s[3]) * 30));
+        e.setAttribute('height', String(Number(s[4]) * 20));
+        e.setAttribute('fill', hex(s[5]));
+        svg.append(e);
+      } else if (s[0] === 'c' && s.length === 5) {
+        const e = document.createElementNS(NS, 'circle');
+        e.setAttribute('cx', String(Number(s[1]) * 30));
+        e.setAttribute('cy', String(Number(s[2]) * 20));
+        e.setAttribute('r', String(Number(s[3]) * 20));
+        e.setAttribute('fill', hex(s[4]));
+        svg.append(e);
+      } else if (s[0] === 'p' && s.length === 3 && Array.isArray(s[1])) {
+        const pts = [];
+        for (let i = 0; i + 1 < s[1].length; i += 2) pts.push((Number(s[1][i]) * 30).toFixed(2) + ',' + (Number(s[1][i + 1]) * 20).toFixed(2));
+        const e = document.createElementNS(NS, 'polygon');
+        e.setAttribute('points', pts.join(' '));
+        e.setAttribute('fill', hex(s[2]));
+        svg.append(e);
+      }
+    }
+    return svg;
+  }
+  function browserLang() {
+    for (const l of navigator.languages || [navigator.language]) {
+      const c = langFromLocale(l);
+      if (c !== 'en') return c;
+    }
+    return 'en';
+  }
   function languageDialog() {
     let saved = null;
     try { saved = localStorage.getItem(LANG_KEY); } catch (_) { /* */ }
-    const sel = el('select', null,
-      el('option', { value: '', selected: !saved }, T('System language')),
-      LANGS.map((l) => el('option', { value: l.code, selected: saved === l.code, title: l.english }, l.name)));
-    dialog(T('Language'), el('div', { class: 'form' }, sel), [
+    let picked = saved || '';
+    const sys = LANGS.find((l) => l.code === browserLang()) || LANGS[0];
+    const rows = [];
+    const applyPick = (val) => {
+      try { if (val) localStorage.setItem(LANG_KEY, val); else localStorage.removeItem(LANG_KEY); } catch (_) { /* */ }
+      location.reload();
+    };
+    const row = (val, flag, name, sub) => {
+      const b = el('button', {
+        type: 'button',
+        class: 'lang-row' + (picked === val ? ' on' : ''),
+        onclick: () => { picked = val; for (const x of rows) x.classList.toggle('on', x === b); },
+        ondblclick: () => applyPick(val),
+      }, flagSvg(flag), el('span', { class: 'lang-name' }, name), sub && sub !== name ? el('span', { class: 'lang-sub' }, sub) : null);
+      rows.push(b);
+      return b;
+    };
+    const list = el('div', { class: 'lang-list' },
+      row('', sys ? sys.flag : [], T('System language') + (sys ? ' (' + sys.name + ')' : ''), ''),
+      LANGS.map((l) => row(l.code, l.flag, l.name, l.english)));
+    dialog(T('Language'), list, [
       { label: T('Cancel') },
-      { label: T('OK'), primary: true, onClick: () => {
-        try { if (sel.value) localStorage.setItem(LANG_KEY, sel.value); else localStorage.removeItem(LANG_KEY); } catch (_) { /* */ }
-        location.reload();
-      } },
+      { label: T('OK'), primary: true, onClick: () => applyPick(picked) },
     ]);
   }
 

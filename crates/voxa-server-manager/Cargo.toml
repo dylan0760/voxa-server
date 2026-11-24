@@ -10,7 +10,6 @@ name = "voxa-server-manager"
 path = "src/main.rs"
 
 [dependencies]
-ar-reshaper = "1.5.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "clipboard"] }
 egui = "0.37.0"

@@ -21,10 +21,12 @@ struct User {
     r: SecureReader<R>,
     w: SecureWriter<W>,
     id: ClientId,
+    uid: String,
 }
 
 async fn login(addr: &str, nick: &str) -> User {
     let kp = KeyPair::generate();
+    let uid = voxa_proto::identity::uid_from_public(&kp.public);
     let s = TcpStream::connect(addr).await.unwrap();
     let (r, w) = s.into_split();
     let sec = transport::connect(r, w, &kp.private).await.unwrap();
@@ -43,7 +45,7 @@ async fn login(addr: &str, nick: &str) -> User {
     let S2C::Welcome { your_id, .. } = r.recv::<S2C>().await.unwrap() else { panic!("refused") };
     w.send(&C2S::Hardware(vec![hardware_token("x", nick)])).await.unwrap();
     while let Ok(Ok(_)) = timeout(Duration::from_millis(400), r.recv::<S2C>()).await {}
-    User { r, w, id: your_id }
+    User { r, w, id: your_id, uid }
 }
 
 async fn wait<T>(u: &mut User, secs: u64, mut f: impl FnMut(S2C) -> Option<T>) -> Option<T> {
@@ -141,6 +143,85 @@ async fn main() {
     println!("4. viewing as no group at all: \"{}\"", error(&mut admin).await);
     admin.w.send(&C2S::ViewAs(Some(vec![9999]))).await.unwrap();
     println!("4. viewing as a group that does not exist: \"{}\"", error(&mut admin).await);
+
+    // Security checks (1.30.1+): talk/join power escalation, hidden channel bypass, and
+    // deleting a group that someone is viewing as.
+    admin.w.send(&C2S::ViewAs(None)).await.unwrap();
+    wait(&mut admin, 5, |m| matches!(m, S2C::ViewingAs(None)).then_some(())).await.expect("stop");
+    // Create a Mod group (GROUP_MANAGE, low talk/join power) and a VIP group (fewer perms, high talk/join power).
+    admin.w.send(&C2S::CreateGroup { kind: GroupKind::Server, name: "Mod".into(), copy_from: Some(GUEST) }).await.unwrap();
+    let mut mod_g = wait(&mut admin, 5, |m| match m {
+        S2C::GroupsUpdated(gs) => gs.into_iter().find(|g| g.name == "Mod"),
+        _ => None,
+    })
+    .await
+    .expect("Mod group");
+    mod_g.perms |= perm::CHANNEL_VIEW | perm::CHANNEL_JOIN | perm::GROUP_MANAGE;
+    mod_g.talk_power = 20;
+    mod_g.join_power = 20;
+    admin.w.send(&C2S::EditGroup(mod_g.clone())).await.unwrap();
+    wait(&mut admin, 5, |m| matches!(m, S2C::GroupsUpdated(_)).then_some(())).await;
+
+    admin.w.send(&C2S::CreateGroup { kind: GroupKind::Server, name: "VIP".into(), copy_from: None }).await.unwrap();
+    let mut vip_g = wait(&mut admin, 5, |m| match m {
+        S2C::GroupsUpdated(gs) => gs.into_iter().find(|g| g.name == "VIP"),
+        _ => None,
+    })
+    .await
+    .expect("VIP group");
+    vip_g.perms = perm::CHANNEL_VIEW | perm::CHANNEL_JOIN;
+    vip_g.talk_power = 90;
+    vip_g.join_power = 90;
+    admin.w.send(&C2S::EditGroup(vip_g.clone())).await.unwrap();
+    wait(&mut admin, 5, |m| matches!(m, S2C::GroupsUpdated(_)).then_some(())).await;
+
+    // Hide `secret` from Mod (not from Guest!), and assign `member` to Mod.
+    admin.w.send(&C2S::SetChannelHidden { channel: secret, groups: vec![mod_g.id] }).await.unwrap();
+    wait(&mut admin, 5, |m| matches!(m, S2C::HiddenChannels(_)).then_some(())).await;
+    admin.w.send(&C2S::SetServerGroup { uid: member.uid.clone(), group: mod_g.id, add: true }).await.unwrap();
+    while let Ok(Ok(_)) = timeout(Duration::from_millis(300), member.r.recv::<S2C>()).await {}
+
+    // Mod cannot view as VIP (higher talk/join power).
+    member.w.send(&C2S::ViewAs(Some(vec![vip_g.id]))).await.unwrap();
+    println!("5. mod viewing as higher talk/join power VIP: \"{}\"", error(&mut member).await);
+
+    // Mod views as Guest: must NOT see `secret` (which is hidden from Mod!).
+    member.w.send(&C2S::ViewAs(Some(vec![GUEST]))).await.unwrap();
+    let mut leaked = false;
+    let saw_va = wait(&mut member, 5, |m| {
+        if let S2C::ChannelsVisible { shown, .. } = &m {
+            if shown.iter().any(|c| c.id == secret) {
+                leaked = true;
+            }
+        }
+        matches!(m, S2C::ViewingAs(Some(_))).then_some(())
+    })
+    .await;
+    assert!(saw_va.is_some(), "mod could not view as Guest");
+    assert!(!leaked, "ViewAs leaked a channel hidden from the viewer's own group!");
+    member.w.send(&C2S::SwitchChannel { channel: secret, password: None }).await.unwrap();
+    println!("6. mod viewing as Guest trying hidden channel: \"{}\"", error(&mut member).await);
+
+    // Deleting a group someone is viewing as stops their preview cleanly.
+    admin.w.send(&C2S::CreateGroup { kind: GroupKind::Server, name: "Temp".into(), copy_from: Some(GUEST) }).await.unwrap();
+    let temp_g = wait(&mut admin, 5, |m| match m {
+        S2C::GroupsUpdated(gs) => gs.into_iter().find(|g| g.name == "Temp"),
+        _ => None,
+    })
+    .await
+    .expect("Temp group");
+    member.w.send(&C2S::ViewAs(Some(vec![temp_g.id]))).await.unwrap();
+    wait(&mut member, 5, |m| matches!(m, S2C::ViewingAs(Some(v)) if v == vec![temp_g.id]).then_some(())).await.expect("mod view as Temp");
+    admin.w.send(&C2S::DeleteGroup(temp_g.id)).await.unwrap();
+    wait(&mut member, 5, |m| matches!(m, S2C::ViewingAs(None)).then_some(())).await.expect("deleting group did not cancel ViewAs");
+    println!("7. deleting the viewed-as group cancelled ViewAs automatically");
+
+    // Demoting `member` (removing Mod) cancels their ViewAs(Guest) automatically.
+    member.w.send(&C2S::ViewAs(Some(vec![GUEST]))).await.unwrap();
+    wait(&mut member, 5, |m| matches!(m, S2C::ViewingAs(Some(_))).then_some(())).await.expect("mod view as Guest again");
+    admin.w.send(&C2S::SetServerGroup { uid: member.uid.clone(), group: mod_g.id, add: false }).await.unwrap();
+    wait(&mut member, 5, |m| matches!(m, S2C::ViewingAs(None)).then_some(())).await.expect("demoting did not cancel ViewAs");
+    println!("8. demoting a member cancelled their ViewAs automatically");
 
     // Disconnecting ends it: a new connection is the admin again.
     drop(admin);

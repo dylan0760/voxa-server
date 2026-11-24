@@ -375,6 +375,13 @@ table.grid td { padding: 5px 6px; border-bottom: 1px solid var(--card); vertical
 .lightbox { position: fixed; inset: 0; background: rgba(0,0,0,.8); z-index: 70; display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
 .lightbox img { max-width: 95%; max-height: 95%; }
 .banner { position: fixed; top: 0; left: 0; right: 0; background: var(--yellow); color: #000; text-align: center; padding: 4px; z-index: 30; font-size: 13px; }
+.flag { width: 21px; height: 14px; border-radius: 2px; flex: none; box-shadow: 0 0 0 1px rgba(128,128,128,.35); display: block; }
+.lang-list { display: flex; flex-direction: column; gap: 2px; max-height: 400px; overflow-y: auto; }
+.lang-row { display: flex; align-items: center; gap: 10px; width: 100%; padding: 6px 10px; border: 0; border-radius: 6px; background: transparent; color: var(--text); font: inherit; text-align: left; cursor: pointer; }
+.lang-row:hover { background: var(--hover); }
+.lang-row.on { background: var(--accent); color: #fff; }
+.lang-row .lang-name { flex: 1; }
+.lang-row .lang-sub { font-size: 12px; opacity: .7; }
 
 @media (max-width: 1100px) {
   .app { grid-template-columns: 60px 250px 1fr; }

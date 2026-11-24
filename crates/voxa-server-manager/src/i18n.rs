@@ -2,6 +2,8 @@
 //! the chosen language (🌐 in the header, else Windows' language). The translations are
 //! Voxa's (voxa-proto `i18n/<code>.json`).
 
+use std::sync::Arc;
+
 /// The translation of an English text literal.
 macro_rules! t {
     ($s:literal) => {
@@ -19,7 +21,7 @@ macro_rules! tf {
 }
 pub(crate) use tf;
 
-/// The language to use: the one chosen in Options, or the system's.
+/// The language to use: the one chosen in the Manager, or Windows'.
 pub fn chosen(setting: Option<&str>) -> String {
     match setting.filter(|s| !s.is_empty()) {
         Some(code) => voxa_proto::i18n::lang(code).map(|l| l.code).unwrap_or("en").to_string(),
@@ -62,19 +64,137 @@ pub fn save(code: Option<&str>) {
     }
 }
 
-/// Right-to-left text (Arabic, Persian, Urdu) prepared for Voxa's left-to-right drawing:
-/// letters joined (the forms they take inside words) and each line put in visual order.
+/// Right-to-left text (Arabic, Persian, Urdu) prepared for egui's left-to-right run layout:
+/// `unicode-bidi` puts runs in visual left-to-right order, and within each RTL run words
+/// are ordered right-to-left while keeping each Arabic word's characters in logical order
+/// so egui's HarfBuzz shaper (`harfrust`) joins letters and renders each word RTL.
 pub fn shape(s: &str) -> String {
     s.split('\n').map(shape_line).collect::<Vec<_>>().join("\n")
 }
 
-fn shape_line(line: &str) -> String {
-    let joined = ar_reshaper::reshape_line(line);
-    let info = unicode_bidi::BidiInfo::new(&joined, Some(unicode_bidi::Level::rtl()));
-    match info.paragraphs.first() {
-        Some(para) => info.reorder_line(para, para.range.clone()).into_owned(),
-        None => joined,
+fn is_arabic_script(c: char) -> bool {
+    matches!(c, '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}' | '\u{08A0}'..='\u{08FF}')
+}
+
+fn mirror_bracket(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '<' => '>',
+        '>' => '<',
+        _ => c,
     }
+}
+
+fn reverse_rtl_chunks(run: &str) -> String {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut chars = run.chars().peekable();
+    while let Some(c) = chars.next() {
+        if is_arabic_script(c) {
+            let mut word = String::new();
+            word.push(c);
+            while let Some(&n) = chars.peek() {
+                if is_arabic_script(n) {
+                    word.push(chars.next().unwrap());
+                } else {
+                    break;
+                }
+            }
+            chunks.push(word);
+        } else {
+            let mut item = String::new();
+            item.push(mirror_bracket(c));
+            while let Some(&n) = chars.peek() {
+                if matches!(n, '\u{FE00}'..='\u{FE0F}' | '\u{200D}' | '\u{0300}'..='\u{036F}') {
+                    item.push(chars.next().unwrap());
+                    if n == '\u{200D}' {
+                        if let Some(next) = chars.next() {
+                            item.push(next);
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+            chunks.push(item);
+        }
+    }
+    chunks.reverse();
+    chunks.concat()
+}
+
+fn shape_line(line: &str) -> String {
+    let info = unicode_bidi::BidiInfo::new(line, Some(unicode_bidi::Level::rtl()));
+    let Some(para) = info.paragraphs.first() else {
+        return line.to_string();
+    };
+    let (levels, runs) = info.visual_runs(para, para.range.clone());
+    let mut out = String::with_capacity(line.len());
+    for run in runs {
+        let slice = &line[run.clone()];
+        if levels[run.start].is_rtl() {
+            out.push_str(&reverse_rtl_chunks(slice));
+        } else {
+            out.push_str(slice);
+        }
+    }
+    out
+}
+
+/// On-demand system font provider for egui so the Language list shows every script cleanly.
+pub fn script_font_provider(families: Vec<egui::FontFamily>) -> Arc<dyn egui::FontProvider> {
+    use egui::epaint::text::{FallbackRequest, FontInsert, FontPriority, InsertFontFamily};
+    Arc::new(move |req: &FallbackRequest<'_>| {
+        let c = req.cluster.chars().next()?;
+        let (name, bytes, index) = voxa_proto::i18n::fallback_font_for_char(c)?;
+        let fams = families.iter().cloned().map(|family| InsertFontFamily { family, priority: FontPriority::Lowest }).collect();
+        Some(FontInsert::new(name, egui::FontData::from_blob(bytes, index), fams))
+    })
+}
+
+/// Paints a small 3:2 flag icon for a language code inside `rect`.
+pub fn paint_flag(painter: &egui::Painter, rect: egui::Rect, code: &str) {
+    use egui::{Color32, CornerRadius, Pos2, Rect, Shape, Stroke};
+    use voxa_proto::flags::{flag, star_points, FlagShape};
+
+    let p = painter.with_clip_rect(rect);
+    let pt = |x: f32, y: f32| Pos2::new(rect.left() + x * rect.width(), rect.top() + y * rect.height());
+    let col = |[r, g, b]: [u8; 3]| Color32::from_rgb(r, g, b);
+    let aspect = if rect.height() > 0.0 { rect.width() / rect.height() } else { 1.5 };
+
+    for shape in flag(code) {
+        match *shape {
+            FlagShape::Rect(x, y, w, h, rgb) => {
+                p.rect_filled(Rect::from_min_max(pt(x, y), pt(x + w, y + h)), CornerRadius::ZERO, col(rgb));
+            }
+            FlagShape::Poly(pts, rgb) => {
+                let mapped: Vec<Pos2> = pts.iter().map(|&(x, y)| pt(x, y)).collect();
+                p.add(Shape::convex_polygon(mapped, col(rgb), Stroke::NONE));
+            }
+            FlagShape::Circle(cx, cy, r, rgb) => {
+                p.circle_filled(pt(cx, cy), r * rect.height(), col(rgb));
+            }
+            FlagShape::Star(cx, cy, r, rgb) => {
+                let c = col(rgb);
+                let center = pt(cx, cy);
+                let v = star_points(cx, cy, r, aspect);
+                for k in 0..5 {
+                    let kite = vec![center, pt(v[(2 * k + 9) % 10].0, v[(2 * k + 9) % 10].1), pt(v[2 * k].0, v[2 * k].1), pt(v[2 * k + 1].0, v[2 * k + 1].1)];
+                    p.add(Shape::convex_polygon(kite, c, Stroke::NONE));
+                }
+            }
+        }
+    }
+    painter.rect_stroke(rect, CornerRadius::same(1), Stroke::new(1.0, Color32::from_rgba_unmultiplied(128, 128, 128, 110)), egui::StrokeKind::Inside);
+}
+
+/// An egui `Atom` that draws the flag icon for `code`.
+pub fn flag_atom(code: &'static str) -> egui::Atom<'static> {
+    egui::Atom::paint(egui::vec2(21.0, 14.0), move |ui, args| {
+        paint_flag(ui.painter(), args.rect, code);
+    })
 }
 
 /// The system's language, like `de-DE`.
@@ -91,21 +211,7 @@ pub fn system_locale() -> String {
     }
 }
 
-/// Android: the system's language from its properties.
-#[cfg(target_os = "android")]
-pub fn system_locale() -> String {
-    for prop in ["persist.sys.locale", "ro.product.locale", "persist.sys.language"] {
-        if let Ok(out) = std::process::Command::new("/system/bin/getprop").arg(prop).output() {
-            let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    "en".into()
-}
-
-#[cfg(not(any(windows, target_os = "android")))]
+#[cfg(not(windows))]
 pub fn system_locale() -> String {
     std::env::var("LANG").unwrap_or_else(|_| "en".into())
 }
@@ -115,15 +221,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arabic_is_joined_and_reversed() {
-        // "سلام" (four letters) becomes presentation forms (lam + alef join into one),
-        // drawn right to left: the meem (alone, alef does not join forward) comes first.
-        let s = shape("سلام");
-        assert_eq!(s.chars().count(), 3);
-        assert_eq!(s.chars().next(), Some('\u{FEE1}'));
-        assert!(s.chars().all(|c| ('\u{FB50}'..='\u{FEFF}').contains(&c)), "{s:?}");
-        // Numbers and Latin words keep their own direction.
-        let mixed = shape("Voxa 1.38");
-        assert_eq!(mixed, "Voxa 1.38");
+    fn rtl_reorders_words_and_keeps_harfbuzz_logical_words() {
+        assert_eq!(shape("العربية"), "العربية");
+        assert_eq!(shape("إظهار الطوابع الزمنية"), "الزمنية الطوابع إظهار");
+        assert_eq!(shape("مرحباً بك في Voxa Server"), "Voxa Server في بك مرحباً");
+        assert_eq!(shape("Voxa 1.38"), "Voxa 1.38");
     }
 }
