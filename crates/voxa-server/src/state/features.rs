@@ -14,9 +14,6 @@ pub(super) struct PrivateShare {
     accepted: bool,
     started: Instant,
     last: Option<Instant>,
-    sequence: u32,
-    // Only the latest picture for a web viewer. Native viewers use bounded bulk queues.
-    jpeg: Option<Arc<Vec<u8>>>,
 }
 
 impl State {
@@ -188,12 +185,16 @@ impl Server {
 
     fn media_allowed(&self, st: &State, from: ClientId, to: ClientId) -> Res {
         self.dm_pair(st, from, to)?;
-        let s = st.session(from)?;
-        if from == to || !st.sees(st.session(to)?, s) {
+        let (s, peer) = (st.session(from)?, st.session(to)?);
+        if from == to || !st.sees(peer, s) {
             return Err("Private media unavailable".into());
         }
+        // The web page is an administration tool without capture or live viewing.
+        if s.web || peer.web {
+            return Err("Private screen and camera sharing are only available in the Voxa app".into());
+        }
         self.need(st.server_perms(s), perm::SCREEN_SHARE)?;
-        if !st.session(to)?.client_at_least("1.40.0") {
+        if !peer.client_at_least("1.40.0") {
             return Err("The recipient needs Voxa 1.40 or newer".into());
         }
         Ok(())
@@ -205,8 +206,7 @@ impl Server {
         if let Some(old) = &st.session(from)?.private_share {
             st.end_media(from, old.peer, old.stream);
         }
-        st.sessions.get_mut(&from).unwrap().private_share =
-            Some(PrivateShare { peer: to, stream, accepted: false, started: Instant::now(), last: None, sequence: 0, jpeg: None });
+        st.sessions.get_mut(&from).unwrap().private_share = Some(PrivateShare { peer: to, stream, accepted: false, started: Instant::now(), last: None });
         st.send(to, S2C::MediaOffer { from, stream, camera });
         Ok(())
     }
@@ -232,7 +232,6 @@ impl Server {
     pub fn direct_frame(&self, from: ClientId, to: ClientId, stream: u32, jpeg: Vec<u8>) -> Res {
         let mut st = self.state.lock();
         self.media_allowed(&st, from, to)?;
-        let web = st.session(to)?.web;
         let share = st
             .sessions
             .get_mut(&from)
@@ -246,25 +245,12 @@ impl Server {
             return Err("Invalid private video frame".into());
         }
         share.last = Some(Instant::now());
-        share.sequence = share.sequence.wrapping_add(1);
-        if web {
-            share.jpeg = Some(Arc::new(jpeg));
-        } else if let Some(tx) = &st.session(to)?.bulk_tx {
+        if let Some(tx) = &st.session(to)?.bulk_tx {
             if tx.capacity() >= 44 {
                 let _ = tx.try_send(BulkS2C::DirectFrame { from, stream, jpeg });
             }
         }
         Ok(())
-    }
-
-    pub fn web_frame(&self, me: ClientId, from: ClientId, stream: u32, after: u32) -> Option<(u32, Arc<Vec<u8>>)> {
-        let st = self.state.lock();
-        self.media_allowed(&st, from, me).ok()?;
-        let m = st.sessions.get(&from)?.private_share.as_ref()?;
-        if !m.accepted || m.peer != me || m.stream != stream || m.sequence == after {
-            return None;
-        }
-        Some((m.sequence, m.jpeg.clone()?))
     }
 
     pub fn video_message(&self, me: ClientId, uid: &str, data: &[u8]) -> Res {
@@ -330,24 +316,35 @@ mod tests {
             let mut cfg = Config::default();
             cfg.transfers.uploads = 2;
             let srv = Server::new(cfg, dir.clone(), db, KeyPair::generate()).unwrap();
-            let login = |uid: &str| {
+            let login = |uid: &str, web: bool| {
                 let (tx, rx) = mpsc::channel(128);
                 let close = Arc::new(Notify::new());
                 let hello = C2S::Hello {
                     protocol: PROTOCOL_VERSION,
                     version: MIN_CLIENT_VERSION.into(),
-                    platform: "Web".into(),
+                    platform: if web { "Web" } else { "Windows" }.into(),
                     nickname: uid.into(),
                     server_password: None,
                     default_channel: None,
                     default_channel_password: None,
                 };
-                let id = srv.login(uid.into(), "127.0.0.1".parse().unwrap(), hello, Outbox { tx, close: close.clone() }, close, true).unwrap();
+                let id = srv.login(uid.into(), "127.0.0.1".parse().unwrap(), hello, Outbox { tx, close: close.clone() }, close, web).unwrap();
                 (id, rx)
             };
-            let (alice, _a) = login("Alice");
-            let (bob, mut b) = login("Bob");
-            let (chris, mut c) = login("Chris");
+            let frames = |id: ClientId| {
+                let (tx, rx) = mpsc::channel(48);
+                srv.state.lock().sessions.get_mut(&id).unwrap().bulk_tx = Some(tx);
+                rx
+            };
+            let (alice, _a) = login("Alice", false);
+            let (bob, mut b) = login("Bob", false);
+            let (chris, mut c) = login("Chris", false);
+            let (admin, _w) = login("Admin", true);
+            let (mut bob_frames, mut chris_frames) = (frames(bob), frames(chris));
+            // The web admin page can neither send nor receive private live media.
+            srv.handle(alice, C2S::OfferMedia { to: admin, stream: 7, camera: true });
+            srv.handle(admin, C2S::OfferMedia { to: bob, stream: 8, camera: true });
+            assert!([alice, admin].iter().all(|id| srv.state.lock().session(*id).unwrap().private_share.is_none()));
             // An expired invitation cannot be revived by a late answer.
             srv.handle(chris, C2S::OfferMedia { to: bob, stream: 99, camera: true });
             {
@@ -385,8 +382,8 @@ mod tests {
             assert!(srv.direct_frame(alice, bob, 41, jpeg.clone()).is_err());
             srv.handle(bob, C2S::AnswerMedia { from: alice, stream: 41, accept: true });
             srv.direct_frame(alice, bob, 41, jpeg.clone()).unwrap();
-            assert_eq!(&*srv.web_frame(bob, alice, 41, 0).unwrap().1, &jpeg);
-            assert!(srv.web_frame(chris, alice, 41, 0).is_none());
+            assert!(matches!(bob_frames.try_recv(), Ok(BulkS2C::DirectFrame { from, stream: 41, jpeg: ref sent }) if from == alice && *sent == jpeg));
+            assert!(chris_frames.try_recv().is_err());
             assert_eq!(srv.state.lock().session(alice).unwrap().info.channel, initial_channel);
             let mut clip = b"VXC1".to_vec();
             for n in [1u32, 0, jpeg.len() as u32] {
@@ -416,12 +413,12 @@ mod tests {
             assert!(srv.send_text(&mut srv.state.lock(), alice, TextTarget::Private(bob), "hello".into()).is_err());
             srv.remove_session(bob, LeaveReason::Disconnected(String::new()));
             assert!(srv.send_offline(&mut srv.state.lock(), alice, "Bob".into(), "hello".into()).is_err());
-            let (bob, _b) = login("Bob");
+            let (bob, _b) = login("Bob", false);
             srv.handle(bob, C2S::BlockDm { uid: "Alice".into(), block: false });
             assert!(srv.send_text(&mut srv.state.lock(), alice, TextTarget::Private(bob), "hello".into()).is_ok());
             srv.remove_session(bob, LeaveReason::Disconnected(String::new()));
             srv.video_message(alice, "Bob", &clip).unwrap();
-            let (bob, mut inbox) = login("Bob");
+            let (bob, mut inbox) = login("Bob", false);
             let mut delivered = None;
             while let Ok(Out::Msg(msg)) = inbox.try_recv() {
                 if let S2C::OfflineMessages(notes) = msg {
@@ -436,6 +433,57 @@ mod tests {
             restored.expire_clips(now_unix()+1).unwrap();
             assert!(restored.image_data(image).unwrap().is_none());
             assert_eq!(restored.preference::<u64>("video_bytes").unwrap(), 0);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn private_shares_end_when_the_viewer_leaves_or_loses_sight() {
+        let dir = std::env::temp_dir().join(format!("voxa-shares-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let db = Store::open(&dir.join("data.redb"), &[4u8; 32]).unwrap();
+            let srv = Server::new(Config::default(), dir.clone(), db, KeyPair::generate()).unwrap();
+            let login = |uid: &str| {
+                let (tx, rx) = mpsc::channel(128);
+                let close = Arc::new(Notify::new());
+                let hello = C2S::Hello {
+                    protocol: PROTOCOL_VERSION,
+                    version: MIN_CLIENT_VERSION.into(),
+                    platform: "Windows".into(),
+                    nickname: uid.into(),
+                    server_password: None,
+                    default_channel: None,
+                    default_channel_password: None,
+                };
+                let id = srv.login(uid.into(), "127.0.0.1".parse().unwrap(), hello, Outbox { tx, close: close.clone() }, close, false).unwrap();
+                (id, rx)
+            };
+            let (alice, mut a) = login("Alice");
+            let (bob, mut b) = login("Bob");
+            let share = |stream: u32| {
+                srv.handle(alice, C2S::OfferMedia { to: bob, stream, camera: false });
+                srv.handle(bob, C2S::AnswerMedia { from: alice, stream, accept: true });
+                assert!(srv.state.lock().session(alice).unwrap().private_share.as_ref().is_some_and(|s| s.accepted && s.stream == stream));
+            };
+            let ended = |rx: &mut mpsc::Receiver<Out>, n: u32| {
+                let mut seen = false;
+                while let Ok(Out::Msg(m)) = rx.try_recv() {
+                    seen |= matches!(m, S2C::MediaEnded { stream, .. } if stream == n);
+                }
+                seen
+            };
+            share(1);
+            // Invisible outside a channel: the viewer can no longer see the sender.
+            srv.handle(alice, C2S::SwitchChannel { channel: NO_CHANNEL, password: None });
+            srv.handle(alice, C2S::SetPresence(Presence::Invisible));
+            assert!(srv.state.lock().session(alice).unwrap().private_share.is_none());
+            assert!(ended(&mut b, 1));
+            srv.handle(alice, C2S::SetPresence(Presence::Online));
+            share(2);
+            srv.remove_session(bob, LeaveReason::Disconnected(String::new()));
+            assert!(srv.state.lock().session(alice).unwrap().private_share.is_none());
+            assert!(ended(&mut a, 2));
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -356,8 +356,10 @@
     connected: false, msgDirty: true, presences: new Map(),
   };
   let es = null;
-  S.blocks=new Set(); S.games=new Map();
-  const media=globalThis.VoxaMedia({el,dialog,send,T,report:m=>toast(m,'bad'),openDm:c=>{openDm(c.uid,c.nickname);activateTab('dm:'+c.uid);}});
+  S.blocks = new Set();
+  S.games = new Map();
+  // Server 1.31.0 kept browser camera and manual game settings; the admin page no longer uses them.
+  try { for (const k of ['voxa-camera-rotation', 'voxa-camera-bg', 'voxa-game-on', 'voxa-game-name']) localStorage.removeItem(k); } catch (_) { /* private mode */ }
   let personalLimits={upload_kib:0,download_kib:0,uploads:3,downloads:3};
   try { Object.assign(personalLimits,JSON.parse(localStorage.getItem('voxa-transfer-limits')||'{}')); } catch (_) {}
   function transferFields(limits) {
@@ -378,36 +380,24 @@
     ]));
     return {fields, read};
   }
-  const cameraPrefs={ rotation:Number(localStorage.getItem('voxa-camera-rotation')||0)%4,
-    background:localStorage.getItem('voxa-camera-bg')||'Off',picture:null };
   function personalOptions() {
-    const transfer=transferFields(personalLimits);
-    const clock=el('select',null,['24','12'].map(n=>el('option',{value:n,selected:n===(localStorage.getItem('voxa-clock')||'24')},n+' hour')));
-    const rotation=el('select',null,[0,1,2,3].map(n=>el('option',{value:n,selected:n===cameraPrefs.rotation},n*90+'°')));
-    const bg=el('select',null,['Off','Blur','Solid','Picture'].map(n=>el('option',{value:n,selected:n===cameraPrefs.background},T(n))));
-    const picture=el('input',{type:'file',accept:'image/png,image/jpeg,image/webp'});
-    const game=el('input',{maxlength:60,placeholder:'Game name',value:localStorage.getItem('voxa-game-name')||''});
-    const share=el('input',{type:'checkbox',checked:localStorage.getItem('voxa-game-on')==='1'});
-    dialog(T('Settings'),el('div',{class:'form'},field(T('Clock'),clock),field(T('Camera rotation'),rotation),field(T('Camera background'),bg),field('Background picture',picture),
-      el('p',{class:'full'},'For backgrounds, step out for the first three seconds and keep the camera still.'),
-      field(T('Game activity'),share,'Browsers cannot detect running games. Choose the game to show manually.'),field(T('Add a game'),game),
-      el('div',{class:'section full'},'Personal transfer limits'),transfer.fields,
-      el('div',{class:'full small'},'Voxa Non-Commercial License 1.0 · ',el('a',{href:'https://github.com/dylan0760/voxa-client',target:'_blank',rel:'noopener noreferrer'},'Original client'), ' · ',
-        el('a',{href:'https://github.com/dylan0760/voxa-server',target:'_blank',rel:'noopener noreferrer'},'Original server'))),[
-      {label:T('Cancel')},{label:T('Save'),onClick:async()=>{
-        if(picture.files[0]){
-          if(picture.files[0].size>16*1024*1024){toast('Choose a picture under 16 MiB','bad');return false;}
-          try {const img=await createImageBitmap(picture.files[0],{resizeWidth:640,resizeHeight:360});cameraPrefs.picture?.close();cameraPrefs.picture=img;bg.value='Picture';}
-          catch(_){toast('Could not open the picture','bad');return false;}
-        }
-        if(bg.value==='Picture' && !cameraPrefs.picture){toast('Choose a picture first','bad');return false;}
-        cameraPrefs.rotation=Number(rotation.value);cameraPrefs.background=bg.value;
-        localStorage.setItem('voxa-camera-rotation',rotation.value);localStorage.setItem('voxa-camera-bg',bg.value==='Picture'?'Off':bg.value);
-        localStorage.setItem('voxa-clock',clock.value);localStorage.setItem('voxa-game-on',share.checked?'1':'0');localStorage.setItem('voxa-game-name',game.value.trim());
-        personalLimits=transfer.read();localStorage.setItem('voxa-transfer-limits',JSON.stringify(personalLimits));send({ClientTransferLimits:personalLimits});
-        send({SetGame:share.checked ? game.value.trim() : null});S.msgDirty=true;schedule();
-      }}]);
+    const transfer = transferFields(personalLimits);
+    const clock = el('select', null, ['24', '12'].map((n) => el('option', { value: n, selected: n === (localStorage.getItem('voxa-clock') || '24') }, n + ' hour')));
+    dialog(T('Settings'), el('div', { class: 'form' }, field(T('Clock'), clock),
+      el('div', { class: 'section full' }, 'Personal transfer limits'), transfer.fields,
+      el('div', { class: 'full small' }, 'Voxa Non-Commercial License 1.0 · ', el('a', { href: 'https://github.com/dylan0760/voxa-client', target: '_blank', rel: 'noopener noreferrer' }, 'Original client'), ' · ',
+        el('a', { href: 'https://github.com/dylan0760/voxa-server', target: '_blank', rel: 'noopener noreferrer' }, 'Original server'))), [
+      { label: T('Cancel') },
+      { label: T('Save'), primary: true, onClick: () => {
+        localStorage.setItem('voxa-clock', clock.value);
+        personalLimits = transfer.read();
+        localStorage.setItem('voxa-transfer-limits', JSON.stringify(personalLimits));
+        send({ ClientTransferLimits: personalLimits });
+        S.msgDirty = true;
+        schedule();
+      } }]);
   }
+  const playing = (id) => S.games.get(id);
 
   function log(key) {
     let l = S.logs.get(key);
@@ -684,7 +674,6 @@
   }
 
   async function signOut() {
-    media.close();
     localStorage.removeItem('voxa-web-key');
     sessionStorage.removeItem('voxa-web-pw');
     try { await post('/api/logout'); } catch (_) { /* already gone */ }
@@ -718,7 +707,6 @@
       handle(kind, v);
     };
     es.onerror = async () => {
-      media.close();
       if (!S.connected) {
         if ((await signedIn()) === false) showLogin(T('Your sign-in expired. Please sign in again.'));
         return;
@@ -768,7 +756,10 @@
   function handle(kind, v) {
     switch (kind) {
       case 'Welcome': {
-        media.close(); S.games.clear(); S.blocks.clear(); S.serverIcon=null;S.transferLimits=null;
+        S.games.clear();
+        S.blocks.clear();
+        S.serverIcon = null;
+        S.transferLimits = null;
         S.me = v.your_id;
         S.uid = v.your_uid;
         S.server = v.server;
@@ -787,8 +778,7 @@
         banner('');
         closeDialogs(true);
         buildApp();
-        send({ClientTransferLimits:personalLimits});
-        if(localStorage.getItem('voxa-game-on')==='1')send({SetGame:localStorage.getItem('voxa-game-name')||null});
+        send({ ClientTransferLimits: personalLimits });
         loadPrefs();
         activateTab(S.tab);
         // Your status from last time (invisible was already asked for when joining).
@@ -802,10 +792,6 @@
       case 'ServerIcon': S.serverIcon=v; break;
       case 'Playing': if(v.game)S.games.set(v.client,v.game);else S.games.delete(v.client);break;
       case 'DmBlocks': S.blocks=new Set(v);break;
-      case 'MediaOffer': media.offer(v,S.clients.get(v.from));break;
-      case 'MediaAnswer': media.answer(v);break;
-      case 'MediaEnded': media.ended(v);break;
-      case 'OfflineVideoSent': openDm(v.uid,personName(v.uid));pushMsg('dm:'+v.uid,{id:0,target:{Private:0},from:S.me,from_uid:S.uid,from_name:S.clients.get(S.me)?.nickname||'',ts:v.ts,text:v.text});break;
       case 'Refused':
         stopped(T('Could not join the server'), v);
         break;
@@ -1246,7 +1232,6 @@
       el('span', { class: 'ico', style: full ? 'color:var(--red)' : mine ? 'color:var(--green)' : '' }, ch.has_password ? '🔒' : '🔊'),
       el('span', { class: 'label' }, ch.name),
       el('span', { class: 'badges' },
-        S.games.has(c.id)?el('span',{title:'Playing '+S.games.get(c.id)},'🎮 '+S.games.get(c.id)):null,
         ch.is_default ? el('span', { title: T('Default channel') }, '🏠') : null,
         ch.kind === 'Temporary' ? el('span', { title: T('Temporary channel') }, '⏳') : null,
         ch.max_clients != null ? el('span', { title: T('Max clients') }, n + '/' + ch.max_clients) : n && S.collapsed.has(ch.id) ? el('span', null, String(n)) : null));
@@ -1269,6 +1254,7 @@
     },
       avatar(c.nickname, c.uid, 22),
       el('span', { class: 'label' }, el('span', { class: 'nick' }, c.nickname),
+        playing(c.id) ? el('span', { class: 'dim small', title: 'Playing ' + playing(c.id) }, '🎮 ' + playing(c.id)) : null,
         tags.map((t) => { const col = nameColor(t); return el('span', { class: 'gtag', style: `color:${col};background:${col}40` }, t); })),
       el('span', { class: 'badges' },
         c.platform === 'Web' ? el('span', { class: 'webtag', title: T('On the web admin page') }, T('WEB')) : null,
@@ -1324,7 +1310,7 @@
       !isDm && !(S.tab === 'server' && !can(P.SERVER_EVENTS)) ? el('button', { class: 'icon-btn' + (S.showPins ? ' on' : ''), title: T('Pinned messages'), onclick: togglePins }, '📌') : null,
       !isDm && can(P.CHAT_CLEAR) ? el('button', { class: 'icon-btn', title: T('Clear the entire chat history'), onclick: clearChat }, '🗑') : null,
       isDm ? el('button', { class: 'icon-btn', title: T('Close this conversation'), onclick: () => closeDm(S.tab.slice(3)) }, '✕') : null,
-      isDm ? privateButtons(S.tab.slice(3)) : null,
+      isDm ? blockButton(S.tab.slice(3)) : null,
       el('button', { class: 'icon-btn' + (S.showRight ? ' on' : ''), title: T('Show / hide info panel'), onclick: () => { S.showRight = !S.showRight; schedule(); } }, 'ℹ'),
       el('button', { class: 'pill' + (peopleOn ? ' on' : ''), title: T('Everyone on this server, online and offline'), onclick: () => { S.showRight = !peopleOn; S.right = 'people'; schedule(); } }, T('👥 People')));
   }
@@ -1341,7 +1327,6 @@
   }
 
   function closeDm(uid) {
-    media.close(uid);
     S.dms = S.dms.filter((d) => d.uid !== uid);
     if (S.tab === 'dm:' + uid) activateTab('channel');
     schedule();
@@ -1367,8 +1352,7 @@
   }
 
   function messageText(text) {
-    const clip=/^🎥 Video message\n\[voxa-clip:(\d+)\]$/.exec(text);
-    if(clip)return el('button',{class:'btn',onclick:()=>media.playClip(clip[1]).catch(e=>toast(e.message,'bad'))},'▶ '+T('Video message'));
+    if (/^🎥 Video message\n\[voxa-clip:\d+\]$/.test(text)) return el('span', { class: 'dim' }, '🎥 ' + T('Video message') + ' · play it in the Voxa app');
     const img = IMAGE_RE.exec(text);
     if (img) {
       const src = '/api/image/' + img[2];
@@ -1545,15 +1529,10 @@
     }
   }
 
-  function blockDm(uid){ send({BlockDm:{uid,block:!S.blocks.has(uid)}});media.close(uid); }
-  function privateButtons(uid){
-    const c=onlineByUid(uid);
-    const button=(label,title,fn)=>el('button',{class:'icon-btn',title,onclick:fn},label);
-    const blocked=S.blocks.has(uid);
-    return [button(blocked?'🔓':'🚫',blocked?T('Unblock DMs'):T('Block DMs'),()=>blockDm(uid)),
-      !blocked && can(P.PRIVATE_MESSAGE) ? button('⏺',T('Record video message'),()=>media.start(uid,c?.id,true,true,cameraPrefs)):null,
-      !blocked && c && can(P.SCREEN_SHARE) ? button('📷',T('Private camera'),()=>media.start(uid,c.id,true,false,cameraPrefs)):null,
-      !blocked && c && can(P.SCREEN_SHARE) && navigator.mediaDevices?.getDisplayMedia ? button('🖥',T('Private screen share'),()=>media.start(uid,c.id,false,false,cameraPrefs)):null];
+  function blockDm(uid) { send({ BlockDm: { uid, block: !S.blocks.has(uid) } }); }
+  function blockButton(uid) {
+    const blocked = S.blocks.has(uid);
+    return el('button', { class: 'icon-btn', title: blocked ? T('Unblock DMs') : T('Block DMs'), onclick: () => blockDm(uid) }, blocked ? '🔓' : '🚫');
   }
 
   // ---------------------------------------------------------------- info panel
@@ -1659,6 +1638,7 @@
         ['Microphone', c.input_muted ? T('Muted') : T('On')],
         ['Speakers', c.output_muted ? T('Muted') : T('On')],
         c.streaming ? ['Sharing', c.streaming.title + ' (' + c.streaming.width + '×' + c.streaming.height + ')'] : null,
+        playing(c.id) ? ['Playing', playing(c.id)] : null,
         ['Unique ID', c.uid, true],
       ]),
       c.description ? [el('div', { class: 'section' }, T('Description')), el('div', { class: 'desc' }, c.description)] : null,
@@ -1697,7 +1677,9 @@
       const place = ch ? 'in ' + ch.name : T('on the server');
       const p = S.presences.get(c.id);
       const [dot, st] = c.away != null ? ['var(--yellow)', awayText(c.away)] : p === 'Busy' ? ['var(--red)', T('Do not disturb')] : p === 'Invisible' ? ['var(--dim)', 'Invisible'] : ['var(--green)', ''];
-      return [dot, (st ? st + ' · ' : '') + place + (c.platform === 'Web' ? ' · web' : '')];
+      // One row per identity: their desktop session may be the one that is playing.
+      const game = [...S.clients.values()].filter((x) => x.uid === c.uid).map((x) => playing(x.id)).find(Boolean);
+      return [dot, (game ? '🎮 Playing ' + game + ' · ' : '') + (st ? st + ' · ' : '') + place + (c.platform === 'Web' ? ' · web' : '')];
     };
     return [
       el('div', { class: 'section' }, T('Online — ') + online.length),

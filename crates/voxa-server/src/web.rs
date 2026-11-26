@@ -155,7 +155,7 @@ pub async fn run(server: Arc<Server>, listener: TcpListener) {
 
 async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
     let _ = s.set_nodelay(true);
-    let Ok(Some((req, _media_slot))) = timeout(Duration::from_secs(30), read_request(&mut s, &web)).await else {
+    let Ok(Some(req)) = timeout(Duration::from_secs(30), read_request(&mut s, &web)).await else {
         return respond(&mut s, "400 Bad Request", "text/plain", &[], b"Bad request").await;
     };
     let ip = client_ip(peer, &req);
@@ -166,44 +166,11 @@ async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: 
         ("GET", "/style.css") => static_file(&mut s, "text/css; charset=utf-8", STYLE).await,
         ("GET", "/crypto.js") => static_file(&mut s, "text/javascript; charset=utf-8", CRYPTO_JS).await,
         ("GET", "/app.js") => static_file(&mut s, "text/javascript; charset=utf-8", APP_JS).await,
-        ("GET", "/media.js") => static_file(&mut s, "text/javascript; charset=utf-8", include_str!("web/media.js")).await,
         ("GET", "/api/server-icon") if live_client(&web, &req).is_some() => {
             let icon = server.state.lock().server_icon.clone();
             match icon {
                 Some(b) => respond(&mut s, "200 OK", if image_kind(&b) == Some("png") { "image/png" } else { "image/jpeg" }, &[], &b).await,
                 None => respond(&mut s, "404 Not Found", "text/plain", &[], b"No icon").await,
-            }
-        }
-        ("GET" | "POST", "/api/media/frame" | "/api/media/clip") if req.method == "GET" || req.sent_by_page() => {
-            let Some((me, _lease)) = live_session(&web, &req) else {
-                return respond(&mut s, "403 Forbidden", "text/plain", &[], b"Sign in first").await;
-            };
-            if req.path.ends_with("/frame") {
-                let peer = req.param("peer").and_then(|p| p.parse().ok()).unwrap_or(0);
-                let stream = req.param("stream").and_then(|p| p.parse().ok()).unwrap_or(0);
-                if req.method == "GET" {
-                    match server.web_frame(me, peer, stream, req.param("after").and_then(|p| p.parse().ok()).unwrap_or(0)) {
-                        Some((seq, jpeg)) => respond(&mut s, "200 OK", "image/jpeg", &[("X-Sequence", seq.to_string())], &jpeg).await,
-                        None => respond(&mut s, "204 No Content", "text/plain", &[], b"").await,
-                    }
-                } else {
-                    media_reply(&mut s, server.direct_frame(me, peer, stream, req.body)).await
-                }
-            } else if req.method == "POST" {
-                let uid = req.param("uid").unwrap_or_default();
-                let result = tokio::task::spawn_blocking(move || {
-                    let _hold_id = _lease;
-                    server.video_message(me, &uid, &req.body)
-                }).await.unwrap_or(Err("Upload failed".into()));
-                media_reply(&mut s, result).await
-            } else {
-                let id = req.param("id").and_then(|p| p.parse().ok()).unwrap_or(0);
-                match server.chat_image(me, id) {
-                    Ok(bytes) if bytes.starts_with(voxa_proto::direct::MAGIC) => {
-                        respond(&mut s, "200 OK", "application/octet-stream", &[], &bytes).await
-                    }
-                    _ => respond(&mut s, "404 Not Found", "text/plain", &[], b"Video unavailable").await,
-                }
             }
         }
         ("GET", "/icon.svg") | ("GET", "/favicon.ico") => static_file(&mut s, "image/svg+xml", ICON).await,
@@ -575,8 +542,21 @@ async fn send(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> s
         Ok(m) => m,
         Err(e) => return json(s, "400 Bad Request", &[], &serde_json::json!({ "error": format!("Bad message: {e}") })).await,
     };
-    // Browser media uses the DM endpoints; channel broadcasts use the native bulk connection.
-    if matches!(msg, C2S::Hello { .. } | C2S::AttachBulk(_) | C2S::Disconnect(_) | C2S::StartStream(_) | C2S::StopStream | C2S::WatchStream { .. } | C2S::StartCamera(_) | C2S::StopCamera) {
+    // The page is an administration tool: no voice, capture, live media or game status.
+    if matches!(
+        msg,
+        C2S::Hello { .. }
+            | C2S::AttachBulk(_)
+            | C2S::Disconnect(_)
+            | C2S::StartStream(_)
+            | C2S::StopStream
+            | C2S::WatchStream { .. }
+            | C2S::StartCamera(_)
+            | C2S::StopCamera
+            | C2S::OfferMedia { .. }
+            | C2S::AnswerMedia { .. }
+            | C2S::SetGame(_)
+    ) {
         return json(s, "400 Bad Request", &[], &serde_json::json!({ "error": "Not available on the web page" })).await;
     }
     if let Err(e) = server.prepare(id, &msg).await {
@@ -783,7 +763,10 @@ async fn web_files(server: &Arc<Server>, web: &Web, req: &Request, s: &mut TcpSt
             u.finish(server, me).await
         }
         .await;
-        return media_reply(s, result).await;
+        return match result {
+            Ok(()) => respond(s, "204 No Content", "text/plain", &[], b"").await,
+            Err(e) => respond(s, "400 Bad Request", "text/plain", &[], e.as_bytes()).await,
+        };
     }
     let download = req.path == "/api/files/download";
     if req.method != "GET" || (!download && req.path != "/api/files") {
@@ -836,14 +819,7 @@ async fn web_files(server: &Arc<Server>, web: &Web, req: &Request, s: &mut TcpSt
     Ok(())
 }
 
-async fn media_reply(s: &mut TcpStream, result: Result<(), String>) -> std::io::Result<()> {
-    match result {
-        Ok(()) => respond(s, "204 No Content", "text/plain", &[], b"").await,
-        Err(e) => respond(s, "400 Bad Request", "text/plain", &[], e.as_bytes()).await,
-    }
-}
-
-async fn read_request(s: &mut TcpStream, web: &Web) -> Option<(Request, Option<tokio::sync::SemaphorePermit<'static>>)> {
+async fn read_request(s: &mut TcpStream, web: &Web) -> Option<Request> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -878,20 +854,11 @@ async fn read_request(s: &mut TcpStream, web: &Web) -> Option<(Request, Option<t
     if req.path == "/api/files/upload" && req.method == "POST" && req.sent_by_page() && live_client(web, &req).is_some() {
         let mut body = buf.split_off(head_end + 4);
         body.truncate(len);
-        return Some((Request { body, ..req }, None));
+        return Some(Request { body, ..req });
     }
-    static MEDIA_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
-    let slot = if req.path == "/api/media/clip" {
-        if !req.sent_by_page() || live_client(web, &req).is_none() || len > voxa_proto::direct::MAX_CLIP {
-            return None;
-        }
-        Some(MEDIA_READERS.try_acquire().ok()?)
-    } else {
-        if len > MAX_BODY {
-            return None;
-        }
-        None
-    };
+    if len > MAX_BODY {
+        return None;
+    }
     let mut body = buf[head_end + 4..].to_vec();
     while body.len() < len {
         let n = s.read(&mut chunk).await.ok()?;
@@ -901,7 +868,7 @@ async fn read_request(s: &mut TcpStream, web: &Web) -> Option<(Request, Option<t
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(len);
-    Some((Request { body, ..req }, slot))
+    Some(Request { body, ..req })
 }
 
 /// Where the web page's address is remembered when `web_allowed_origins` is empty.
@@ -957,7 +924,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\
-Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n";
+Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n";
 
 async fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n{SECURITY_HEADERS}", body.len());

@@ -122,13 +122,12 @@ a picker with a preview of every theme, the solid ones (including Mustard, Slate
 Obsidian) and the two-tone ones where one colour blends into another.
 
 * **Open it:** `http://<server>:9980/`, or **🌐 Open Web Admin** in Voxa Server Manager.
-* **Client settings (⚙):** 12/24-hour time, personal upload/download limits, game
-  status, and camera rotation/background. Browsers cannot enumerate running games;
-  they can display others' activity and share a manually entered game. Open
-  **Channel files** from a channel menu to transfer files. In a DM, use the
-  camera/screen buttons for private sharing, or record a video message. Camera,
-  microphone and display capture require HTTPS (or localhost) and browser consent.
-  Screen sharing is available where the browser offers a display picker.
+* **Settings (⚙):** 12/24-hour time and personal upload/download limits for the
+  page's file transfers. Open **Channel files** from a channel menu to transfer files.
+  The page is for administration: it has no voice, screen sharing, camera or video
+  messages (1.31.1), and shows a received video message as a note to open in Voxa.
+  It does show what people are playing, in the channel tree, **👥 People** and their
+  info panel.
 * **Languages** (1.30.0): the page uses your browser's language when Voxa has it (41
   languages); 🌐 (on the sign-in page and at the bottom left) opens a list with flag
   icons and each language's own name (1.30.1), kept in this browser. The server serves
@@ -246,14 +245,16 @@ their update window by themselves. To allow older clients, set
   a slot count is reduced. A native connection has safety ceilings of eight uploads
   and 64 downloads; the Windows and Android clients queue remaining files.
 * **Private media and DM blocking:** an invitation is for one authenticated
-  recipient and must be accepted before live pictures are relayed. Neither person
+  recipient and must be accepted before live pictures are relayed. Both people must
+  use the Voxa app (the web admin page cannot send or receive them). Neither person
   leaves their current channel. Stopping capture, closing the preview, blocking,
   disconnecting or losing permission ends the share. Block lists are persistent
   per recipient and checked for online/offline DMs and private attachments.
   Video notes have participant-only access, encrypted storage, a 15-second /
   8 MiB limit, up to 30 days’ retention and a 1 GiB server-wide storage budget.
 * **Playing status:** clients opt in and publish only the game name. The server
-  sends it to people who can already see that client. It is not stored in chat.
+  sends it to people who can already see that client, including people who connect
+  later. It is not stored in chat. Web admin sessions cannot set a game.
 * **Languages** (1.30.0, Voxa 1.38.0): Voxa, Voxa Server Manager and the web admin page
   come in 41 languages. The server's usual messages (errors such as "Insufficient
   permissions", notices) are shown in each person's own language by their Voxa.
@@ -699,8 +700,8 @@ Tests:
   `names_test` (unique names and the platform field) and `web_origin_test` (the web
   page's address pin; needs the web page on, and a third argument with its address,
   e.g. `127.0.0.1:9980`).
-* The client repository has more: `security_test`, `feature_test`, `spacer_test` and
-  others. Build those from the client repository: they report the client's version,
+* The client repository has more: `security_test`, `feature_test`, `spacer_test`,
+  `game_presence_test` and others. Build those from the client repository: they report the client's version,
   which the server's version check expects.
 * Start each test with a **fresh data folder**: the tests claim the one-time admin
   privilege key, and names stay reserved between runs. `feature_test` also needs

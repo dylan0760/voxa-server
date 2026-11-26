@@ -382,7 +382,6 @@ table.grid td { padding: 5px 6px; border-bottom: 1px solid var(--card); vertical
 .lang-row.on { background: var(--accent); color: #fff; }
 .lang-row .lang-name { flex: 1; }
 .lang-row .lang-sub { font-size: 12px; opacity: .7; }
-.dm-preview { display:block; background:#121417; width:min(100%,640px); max-height:40vh; object-fit:contain; margin:6px auto; }
 .srv img { width:100%; height:100%; object-fit:cover; border-radius:inherit; }
 @media (prefers-reduced-motion:no-preference) {
   .dialog, .menu:not(.hidden), .toast { animation:voxa-rise 160ms ease-out; }
