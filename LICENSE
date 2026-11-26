@@ -1,0 +1,26 @@
+Voxa Non-Commercial License 1.0
+Copyright 2026 Voxa contributors
+
+You may use, study, copy, modify, fork and redistribute Voxa, in source or
+binary form, free of charge, for non-commercial purposes under these terms:
+
+1. You must not sell, rent, license for a fee, monetize, or otherwise use
+   Voxa or a modified version to make money or profit. This includes paid
+   hosting, paid features, advertising revenue and bundling it with a paid
+   product or service.
+2. Keep this license and the copyright notices. Credit the original Voxa
+   project and link to its source in the documentation and in a place users
+   can readily find in any distributed app or hosted fork:
+     https://github.com/dylan0760/voxa-client
+     https://github.com/dylan0760/voxa-server
+3. Identify your changes. Distribute any fork, modified version or copy under
+   these same terms. Do not imply endorsement by the original contributors.
+
+This license covers the original Voxa material in this distribution. It does
+not replace third-party licenses or revoke rights granted in earlier releases.
+Rights not expressly granted are reserved. If you breach these terms, your
+permission under this license ends.
+
+The software is provided "as is", without warranty of any kind. To the extent
+permitted by law, the authors and copyright holders are not liable for claims,
+damages or other liability arising from the software or its use.

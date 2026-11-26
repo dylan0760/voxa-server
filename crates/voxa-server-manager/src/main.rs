@@ -249,6 +249,7 @@ fn autostart_off_file() -> PathBuf {
 impl ManagerApp {
     fn new(cc: &eframe::CreationContext<'_>, inst: Option<instance::Instance>) -> ManagerApp {
         let ctx = cc.egui_ctx.clone();
+        voxa_proto::motion::install(&ctx);
         // The language (and with it the fonts: symbols, emoji and the language's letters).
         i18n::apply(&i18n::chosen(i18n::saved().as_deref()), &ctx);
 

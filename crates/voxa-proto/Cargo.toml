@@ -3,9 +3,10 @@ name = "voxa-proto"
 description = "Shared wire protocol, models and cryptography for Voxa"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
+egui = { version = "0.37.0", optional = true, default-features = false }
 base64 = "0.22"
 bincode = "1"
 chacha20poly1305 = "0.10"
@@ -15,7 +16,7 @@ serde_json = "1.0.154"
 sha2 = "0.10"
 snow = { version = "0.10.0", default-features = false, features = ["default-resolver", "default-resolver-crypto", "std"] }
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["net", "io-util"] }
+tokio = { version = "1.54.1", features = ["net", "io-util", "sync", "time"] }
 
 # HTTPS for the update check: Windows' own TLS; rustls on Android (no OpenSSL there).
 [target.'cfg(not(target_os = "android"))'.dependencies]
@@ -30,6 +31,7 @@ sha1 = "0.10"
 tokio = { version = "1.54.1", features = ["full"] }
 
 [features]
+native-ui = ["dep:egui"]
 update = ["dep:ureq"]
 
 [[example]]

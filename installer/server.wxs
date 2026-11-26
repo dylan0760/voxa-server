@@ -10,14 +10,14 @@
   <Product Id="*" Name="Voxa Server" Language="1033" Version="$(var.Version)"
            Manufacturer="Voxa Project" UpgradeCode="A3ED94D6-65F1-4538-BB52-C9E442646576">
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
-             Description="Voxa voice, chat and screen sharing server" Comments="Free and open source software" />
+             Description="Voxa voice, chat and screen sharing server" Comments="Free for non-commercial use" />
 
     <MajorUpgrade DowngradeErrorMessage="A newer version of Voxa Server is already installed." AllowSameVersionUpgrades="yes" />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <Icon Id="ServerIcon" SourceFile="$(var.Assets)\voxa-server.ico" />
     <Property Id="ARPPRODUCTICON" Value="ServerIcon" />
-    <Property Id="ARPCOMMENTS" Value="Free and open source voice chat server. No license keys required." />
+    <Property Id="ARPCOMMENTS" Value="Non-commercial voice chat server. No license keys required." />
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
               Value="Voxa Server now runs in the background as a Windows service on port 9987 (TCP and UDP). Use Voxa Server Manager (Start menu and system tray) to see its status, start/stop it and get the Server Admin privilege key. The web admin page is on port 9980." />
@@ -73,8 +73,8 @@
                        Type="string" Value="&quot;[INSTALLFOLDER]voxa-server-manager.exe&quot; --minimized" />
       </Component>
       <Component Id="DocReadme" Guid="*" Win64="yes"><File Id="Readme" Source="$(var.Docs)\README.txt" KeyPath="yes" /></Component>
-      <Component Id="DocMit" Guid="*" Win64="yes"><File Id="LicenseMit" Source="$(var.Docs)\LICENSE-MIT.txt" KeyPath="yes" /></Component>
-      <Component Id="DocApache" Guid="*" Win64="yes"><File Id="LicenseApache" Source="$(var.Docs)\LICENSE-APACHE.txt" KeyPath="yes" /></Component>
+      <Component Id="DocLicense" Guid="*" Win64="yes"><File Id="VoxaLicense" Source="$(var.Docs)\LICENSE.txt" KeyPath="yes" /></Component>
+
       <Component Id="DocNotices" Guid="*" Win64="yes"><File Id="Notices" Source="$(var.Docs)\THIRD-PARTY-NOTICES.txt" KeyPath="yes" /></Component>
     </DirectoryRef>
 
@@ -115,8 +115,7 @@
     <Feature Id="Main" Title="Voxa Server" Level="1" ConfigurableDirectory="INSTALLFOLDER" Absent="disallow" AllowAdvertise="no">
       <ComponentRef Id="ServerExe" />
       <ComponentRef Id="DocReadme" />
-      <ComponentRef Id="DocMit" />
-      <ComponentRef Id="DocApache" />
+      <ComponentRef Id="DocLicense" />
       <ComponentRef Id="DocNotices" />
       <ComponentRef Id="DataFolder" />
       <ComponentRef Id="MenuShortcuts" />

@@ -24,6 +24,8 @@ const CLIENT_PERMS: TableDefinition<&str, u64> = TableDefinition::new("client_pe
 /// so clean-ups never have to decrypt whole images.
 const IMAGE_META: TableDefinition<u64, &[u8]> = TableDefinition::new("image_meta");
 const IMAGE_DATA: TableDefinition<u64, &[u8]> = TableDefinition::new("image_data");
+/// Video note id -> (creation time, accounted bytes).
+const CLIPS: TableDefinition<u64, (u64, u64)> = TableDefinition::new("video_notes");
 /// Pinned messages (1.8.0+): (chat, message) -> sealed PinMeta.
 const PINS: TableDefinition<(u64, u64), &[u8]> = TableDefinition::new("pins");
 /// Direct messages waiting for an offline recipient: (recipient uid, id) -> sealed message.
@@ -251,6 +253,22 @@ fn dec<T: DeserializeOwned>(b: &[u8]) -> Option<T> {
 type R<T> = anyhow::Result<T>;
 
 impl Store {
+    pub fn preference<T: DeserializeOwned + Default>(&self, key: &str) -> R<T> {
+        let r = self.db.begin_read()?;
+        let t = r.open_table(META)?;
+        match t.get(key)? {
+            Some(v) => Ok(bincode::deserialize(v.value())?),
+            None => Ok(T::default()),
+        }
+    }
+
+    pub fn save_preference<T: Serialize>(&self, key: &str, value: &T) -> R<()> {
+        let w = self.db.begin_write()?;
+        w.open_table(META)?.insert(key, enc(value).as_slice())?;
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: &Path, master_key: &[u8]) -> R<Store> {
         let db = Database::create(path)?;
         {
@@ -266,6 +284,7 @@ impl Store {
             w.open_table(CLIENT_PERMS)?;
             w.open_table(IMAGE_META)?;
             w.open_table(IMAGE_DATA)?;
+            w.open_table(CLIPS)?;
             w.open_table(PINS)?;
             w.open_table(OFFLINE)?;
             w.open_table(EDITS)?;
@@ -305,6 +324,7 @@ impl Store {
             CLIENT_PERMS.name(),
             IMAGE_META.name(),
             IMAGE_DATA.name(),
+            CLIPS.name(),
             PINS.name(),
             OFFLINE.name(),
             EDITS.name(),
@@ -336,7 +356,7 @@ impl Store {
                 }
             })*};
         }
-        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS, GROUP_CHATS, GROUP_QUEUE, CALENDARS, ACCOUNTS, USERNAMES);
+        copy!(META, CHANNELS, GROUPS, CLIENTS, CHANNEL_GROUPS, BANS, PRIVKEYS, CHAT, CLIENT_PERMS, IMAGE_META, IMAGE_DATA, CLIPS, PINS, OFFLINE, EDITS, AVATARS, WEB_PREFS, HW_BANS, GROUP_CHATS, GROUP_QUEUE, CALENDARS, ACCOUNTS, USERNAMES);
         w.commit()?;
         Ok(())
     }
@@ -698,6 +718,7 @@ impl Store {
             existed = w.open_table(CLIENTS)?.remove(uid)?.is_some();
             w.open_table(CLIENT_PERMS)?.remove(uid)?;
             w.open_table(WEB_PREFS)?.remove(uid)?;
+            w.open_table(META)?.remove(format!("dm-blocks:{uid}").as_str())?;
             let mut cg = w.open_table(CHANNEL_GROUPS)?;
             let keys: Vec<u64> = cg.range((uid, 0)..=(uid, u64::MAX))?.filter_map(|r| r.ok()).map(|(k, _)| k.value().1).collect();
             for ch in keys {
@@ -1253,6 +1274,70 @@ impl Store {
         Ok(t.get(id)?.and_then(|v| self.unseal_raw(&Self::image_aad(b"meta", id), v.value())).and_then(|p| dec(&p)))
     }
 
+    /// Commit the encrypted attachment, quota and any offline delivery together.
+    pub fn put_clip(&self, id: u64, meta: &ImageMeta, data: &[u8], offline: Option<(&str, &OfflineMessage)>) -> R<()> {
+        let queue = if let Some((uid, msg)) = offline {
+            let next = self.next_id("next_offline")?;
+            Some((uid, next, self.seal_raw(&Self::offline_aad(uid, next), &enc(msg))))
+        } else {
+            None
+        };
+        let info = self.seal_raw(&Self::image_aad(b"meta", id), &enc(meta));
+        let sealed = self.seal_raw(&Self::image_aad(b"data", id), data);
+        let w = self.db.begin_write()?;
+        {
+            let mut totals = w.open_table(META)?;
+            let charged = (sealed.len() as u64).max(65536);
+            let used = totals.get("video_bytes")?.and_then(|v| dec::<u64>(v.value())).unwrap_or(0);
+            anyhow::ensure!(used.saturating_add(charged) <= 1024 * 1024 * 1024, "Server video message storage is full");
+            totals.insert("video_bytes", enc(&(used + charged)).as_slice())?;
+            w.open_table(CLIPS)?.insert(id, (meta.ts, charged))?;
+            w.open_table(IMAGE_META)?.insert(id, info.as_slice())?;
+            w.open_table(IMAGE_DATA)?.insert(id, sealed.as_slice())?;
+            if let Some((uid, n, blob)) = queue {
+                w.open_table(OFFLINE)?.insert((uid, n), blob.as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    pub fn expire_clips(&self, cutoff: u64) -> R<()> {
+        let ids = {
+            let r = self.db.begin_read()?;
+            let t = r.open_table(CLIPS)?;
+            t.iter()?.filter_map(|row| row.ok()).filter(|(_, v)| v.value().0 < cutoff).map(|(k, _)| k.value()).collect::<Vec<_>>()
+        };
+        self.remove_attachments(&ids)
+    }
+
+    fn remove_attachments(&self, ids: &[u64]) -> R<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let w = self.db.begin_write()?;
+        {
+            let mut m = w.open_table(IMAGE_META)?;
+            let mut d = w.open_table(IMAGE_DATA)?;
+            let mut clips = w.open_table(CLIPS)?;
+            let mut freed = 0;
+            for &id in ids {
+                m.remove(id)?;
+                d.remove(id)?;
+                if let Some(v) = clips.remove(id)? {
+                    freed += v.value().1;
+                }
+            }
+            if freed > 0 {
+                let mut t = w.open_table(META)?;
+                let used = t.get("video_bytes")?.and_then(|v| dec::<u64>(v.value())).unwrap_or(0);
+                t.insert("video_bytes", enc(&used.saturating_sub(freed)).as_slice())?;
+            }
+        }
+        w.commit()?;
+        Ok(())
+    }
+
     pub fn image_data(&self, id: u64) -> R<Option<Vec<u8>>> {
         let r = self.db.begin_read()?;
         let t = r.open_table(IMAGE_DATA)?;
@@ -1277,19 +1362,7 @@ impl Store {
             }
             v
         };
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let w = self.db.begin_write()?;
-        {
-            let mut m = w.open_table(IMAGE_META)?;
-            let mut d = w.open_table(IMAGE_DATA)?;
-            for id in &ids {
-                m.remove(*id)?;
-                d.remove(*id)?;
-            }
-        }
-        w.commit()?;
+        self.remove_attachments(&ids)?;
         Ok(ids.len())
     }
 

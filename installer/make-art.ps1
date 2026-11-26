@@ -27,7 +27,7 @@ function New-Art([string]$ico, [string]$prefix, [string]$title, [System.Drawing.
     $sf = New-Object System.Drawing.StringFormat; $sf.Alignment = 'Center'
     $g.DrawString($title, $font, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF 0, 185, 164, 40), $sf)
     $small = New-Object System.Drawing.Font("Segoe UI", 8)
-    $g.DrawString("Free & open source", $small, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF 0, 220, 164, 20), $sf)
+    $g.DrawString("Free for non-commercial use", $small, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF 0, 220, 164, 20), $sf)
     $d.Save((Join-Path $Assets "$prefix-dialog.bmp"), [System.Drawing.Imaging.ImageFormat]::Bmp)
     $g.Dispose(); $d.Dispose()
 }

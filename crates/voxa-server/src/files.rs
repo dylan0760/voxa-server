@@ -57,7 +57,7 @@ pub fn resolve(data: &Path, ch: ChannelId, rel: &str) -> Result<PathBuf, String>
         if part == "." || part == ".." || part.contains(':') || part.chars().any(|c| c.is_control() || "<>\"|?*".contains(c)) {
             return Err("Invalid path".into());
         }
-        if part.ends_with('.') || part.ends_with(' ') || is_device_name(part) || part.ends_with(".voxa-part") {
+        if part.ends_with('.') || part.ends_with(' ') || is_device_name(part) || part.to_ascii_lowercase().ends_with(".voxa-part") {
             return Err("Invalid file name".into());
         }
         p.push(part);

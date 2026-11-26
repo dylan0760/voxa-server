@@ -14,6 +14,7 @@ pub struct Config {
     /// Default maximum total size of all files per channel in megabytes (0 = unlimited).
     /// Only used until an administrator changes it in the client.
     pub channel_quota_mb: u64,
+    pub transfers: voxa_proto::transfers::TransferLimits,
     /// Log level: error, warn, info, debug, trace.
     pub log_level: String,
     /// Only let clients connect that are at least the newest Voxa version this server
@@ -46,6 +47,7 @@ impl Default for Config {
             port: voxa_proto::DEFAULT_PORT,
             max_upload_mb: 2048,
             channel_quota_mb: 0,
+            transfers: Default::default(),
             log_level: "info".into(),
             require_latest_client: true,
             web_enabled: true,

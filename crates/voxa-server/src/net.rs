@@ -178,7 +178,8 @@ async fn control(
                 // GIF searches and sends wait on the GIF service: in their own task (1.27.0+).
                 Ok(Ok(msg @ (C2S::SearchGifs { .. } | C2S::SendGif { .. } | C2S::ServerGifs { .. } | C2S::RemoveServerGif(_)))) => {
                     bad = 0;
-                    tokio::spawn(server.clone().gif_message(id, msg));
+                    let (srv,lease)=(server.clone(),close.clone());
+                    tokio::spawn(async move { let _lease=lease; srv.gif_message(id,msg).await; });
                 }
                 Ok(Ok(msg)) => {
                     bad = 0;
@@ -213,12 +214,79 @@ const MAX_UPLOADS: usize = 8;
 /// Chat images one bulk connection may have in work (posted or fetched) at once.
 const MAX_IMAGE_JOBS: usize = 4;
 
-struct Upload {
-    file: tokio::fs::File,
+pub(crate) struct Upload {
+    _slot: crate::state::TransferSlot,
+    file: Option<tokio::fs::File>,
     temp: PathBuf,
     target: PathBuf,
     remaining: u64,
+    relative: String,
+    overwrite: bool,
     _space: Reservation,
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = std::fs::remove_file(&self.temp);
+    }
+}
+
+impl Upload {
+    pub(crate) async fn chunk(&mut self, server: &Server, me: ClientId, data: &[u8]) -> Result<(), String> {
+        if data.len() > FILE_CHUNK || data.len() as u64 > self.remaining {
+            return Err("File larger than announced".into());
+        }
+        let rate = server.state.lock().sessions.get(&me).map(|s| s.upload_rate.clone()).ok_or("Disconnected")?;
+        let active = || server.state.lock().sessions.contains_key(&me);
+        let paced = tokio::join!(server.upload_rate.pace_while(data.len(), active), rate.pace_while(data.len(), active));
+        if paced != (true, true) {
+            return Err("Disconnected".into());
+        }
+        server.file_perm(me, self._space.channel, perm::FILE_UPLOAD)?;
+        self.file.as_mut().ok_or("Upload closed")?.write_all(data).await.map_err(|e| e.to_string())?;
+        self.remaining -= data.len() as u64;
+        Ok(())
+    }
+    pub(crate) async fn finish(mut self, server: &Server, me: ClientId) -> Result<(), String> {
+        if self.remaining != 0 {
+            return Err("Upload incomplete".into());
+        }
+        let mut file = self.file.take().ok_or("Upload closed")?;
+        file.flush().await.map_err(|e| e.to_string())?;
+        drop(file);
+        let ch = self._space.channel;
+        server.file_perm(me, ch, perm::FILE_UPLOAD)?;
+        let dst = crate::files::resolve(&server.data_dir, ch, &self.relative)?;
+        if dst != self.target || crate::files::is_link(&self.temp) {
+            return Err("Invalid upload path".into());
+        }
+        if self.overwrite && server.file_perm(me, ch, perm::FILE_DELETE).is_ok() {
+            // Replace atomically; a failed rename leaves the existing file intact.
+            tokio::fs::rename(&self.temp, &dst).await.map_err(|e| e.to_string())
+        } else {
+            // A file could have appeared since UploadBegin. Never replace it
+            // without delete permission, even with two uploads racing to finish.
+            publish_new(&self.temp, &dst).map_err(|e| e.to_string())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn publish_new(temp: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide = |p: &std::path::Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let (from, to) = (wide(temp), wide(dst));
+    // No REPLACE_EXISTING flag: creation must fail atomically if dst exists.
+    if unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+#[cfg(not(windows))]
+fn publish_new(temp: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::hard_link(temp, dst)
 }
 
 /// Disk space promised to a running upload, so parallel uploads cannot exceed the
@@ -250,7 +318,7 @@ async fn bulk(
 ) -> anyhow::Result<()> {
     let (btx, mut brx) = mpsc::channel::<BulkS2C>(48);
     let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let Some(id) = server.attach_bulk(&token, &uid, btx.clone(), frames.clone()) else {
+    let Some((id, lease)) = server.attach_bulk(&token, &uid, btx.clone(), frames.clone()) else {
         return Ok(());
     };
     writer.send(&BulkS2C::Attached).await?;
@@ -284,7 +352,31 @@ async fn bulk(
                 continue;
             }
         };
+        if !server.state.lock().sessions.get(&id).and_then(|s| s.bulk_tx.as_ref()).is_some_and(|tx| tx.same_channel(&btx)) {
+            break;
+        }
         match msg {
+            BulkC2S::DirectFrame { to, stream, jpeg } => {
+                let _ = server.direct_frame(id, to, stream, jpeg);
+            }
+            BulkC2S::VideoMessage { id: tid, uid, data } => {
+                let Ok(slot) = image_jobs.clone().acquire_owned().await else { break };
+                let (srv, tx, lease) = (server.clone(), btx.clone(), lease.clone());
+                tokio::spawn(async move {
+                    let _slot = slot;
+                    let result = tokio::task::spawn_blocking(move || {
+                        let _lease = lease;
+                        srv.video_message(id, &uid, &data)
+                    })
+                    .await;
+                    let reply = match result {
+                        Ok(Ok(())) => BulkS2C::ChatImageSent { id: tid },
+                        Ok(Err(message)) => BulkS2C::TransferError { id: tid, message },
+                        Err(_) => BulkS2C::TransferError { id: tid, message: "Video message failed".into() },
+                    };
+                    let _ = tx.send(reply).await;
+                });
+            }
             BulkC2S::Frame(f) => server.relay_frame(id, f),
             BulkC2S::RequestKeyframe(streamer) => server.request_keyframe(streamer),
             BulkC2S::StreamAudio(data) => server.relay_audio(id, data),
@@ -313,38 +405,21 @@ async fn bulk(
             BulkC2S::UploadChunk { id: tid, data } => {
                 let mut failed = None;
                 if let Some(u) = uploads.get_mut(&tid) {
-                    if data.len() as u64 > u.remaining {
-                        failed = Some("File larger than announced".to_string());
-                    } else if let Err(e) = u.file.write_all(&data).await {
-                        failed = Some(format!("Write failed: {e}"));
-                    } else {
-                        u.remaining -= data.len() as u64;
-                    }
+                    failed = u.chunk(&server, id, &data).await.err();
                 }
                 if let Some(msg) = failed {
-                    if let Some(u) = uploads.remove(&tid) {
-                        drop(u.file);
-                        let _ = tokio::fs::remove_file(&u.temp).await;
-                    }
+                    uploads.remove(&tid);
                     let _ = btx.send(BulkS2C::TransferError { id: tid, message: msg }).await;
                 }
             }
             BulkC2S::UploadEnd { id: tid } => {
-                if let Some(mut u) = uploads.remove(&tid) {
-                    let _ = u.file.flush().await;
-                    drop(u.file);
-                    let res = if u.remaining != 0 {
-                        Err("Upload incomplete".to_string())
-                    } else {
-                        let _ = tokio::fs::remove_file(&u.target).await;
-                        tokio::fs::rename(&u.temp, &u.target).await.map_err(|e| e.to_string())
-                    };
+                if let Some(u) = uploads.remove(&tid) {
+                    let res = u.finish(&server, id).await;
                     match res {
                         Ok(()) => {
                             let _ = btx.send(BulkS2C::UploadDone { id: tid }).await;
                         }
                         Err(e) => {
-                            let _ = tokio::fs::remove_file(&u.temp).await;
                             let _ = btx.send(BulkS2C::TransferError { id: tid, message: e }).await;
                         }
                     }
@@ -363,29 +438,44 @@ async fn bulk(
                     }
                 };
                 let tx = btx.clone();
+                if downloads.contains_key(&tid) || downloads.len() >= 64 {
+                    let _ = tx.send(BulkS2C::TransferError { id: tid, message: "Too many or duplicate downloads".into() }).await;
+                    continue;
+                }
+                let slot = match server.transfer_slot(id, false) {
+                    Ok(s) => s,
+                    Err(message) => {
+                        let _ = tx.send(BulkS2C::TransferError { id: tid, message }).await;
+                        continue;
+                    }
+                };
+                let local = server.state.lock().sessions.get(&id).map(|s| s.download_rate.clone());
+                let Some(local) = local else { break };
+                let srv = server.clone();
+                let lease = lease.clone();
                 let h = tokio::spawn(async move {
-                    if let Err(e) = send_file(&tx, tid, p).await {
+                    let _slot = slot;
+                    let _lease = lease;
+                    if let Err(e) = send_file(&tx, tid, p, &srv, id, channel, &local).await {
                         let _ = tx.send(BulkS2C::TransferError { id: tid, message: e }).await;
                     }
                 });
                 downloads.insert(tid, h.abort_handle());
             }
             BulkC2S::Cancel { id: tid } => {
-                if let Some(u) = uploads.remove(&tid) {
-                    drop(u.file);
-                    let _ = tokio::fs::remove_file(&u.temp).await;
-                }
+                uploads.remove(&tid);
                 if let Some(h) = downloads.remove(&tid) {
                     h.abort();
                 }
             }
             BulkC2S::ChatImage { id: tid, target, name, width, height, data } => {
+                let job_lease = lease.clone();
                 // Waiting for a slot here also stops reading more data from this client.
                 let Ok(slot) = image_jobs.clone().acquire_owned().await else { break };
                 let (srv, tx) = (server.clone(), btx.clone());
                 tokio::spawn(async move {
                     let _slot = slot;
-                    let r = tokio::task::spawn_blocking(move || srv.post_image(id, target, &name, width, height, data))
+                    let r = tokio::task::spawn_blocking(move || {let _lease=job_lease;srv.post_image(id, target, &name, width, height, data)})
                         .await
                         .unwrap_or_else(|e| Err(e.to_string()));
                     let _ = tx
@@ -397,6 +487,7 @@ async fn bulk(
                 });
             }
             m @ (BulkC2S::AddServerGif { .. } | BulkC2S::AddServerGifTagged { .. }) => {
+                let job_lease = lease.clone();
                 let (tid, category, name, tags, data) = match m {
                     BulkC2S::AddServerGifTagged { id, category, name, tags, data } => (id, category, name, tags, data),
                     BulkC2S::AddServerGif { id, category, name, data } => (id, category, name, Vec::new(), data),
@@ -406,11 +497,17 @@ async fn bulk(
                 let (srv, tx) = (server.clone(), btx.clone());
                 tokio::spawn(async move {
                     let _slot = slot;
-                    let r = tokio::task::spawn_blocking(move || srv.add_server_gif(id, &category, &name, &tags, &data)).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let r = tokio::task::spawn_blocking(move || {
+                        let _lease = job_lease;
+                        srv.add_server_gif(id, &category, &name, &tags, &data)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
                     let _ = tx.send(BulkS2C::ServerGifAdded { id: tid, error: r.err() }).await;
                 });
             }
             BulkC2S::GifPreview(gif) => {
+                let job_lease = lease.clone();
                 let Ok(slot) = image_jobs.clone().acquire_owned().await else { break };
                 let (srv, tx) = (server.clone(), btx.clone());
                 tokio::spawn(async move {
@@ -418,7 +515,10 @@ async fn bulk(
                     let g = gif.chars().take(40).collect::<String>();
                     let data = tokio::task::spawn_blocking({
                         let g = g.clone();
-                        move || srv.gif_preview(id, &g)
+                        move || {
+                            let _lease = job_lease;
+                            srv.gif_preview(id, &g)
+                        }
                     })
                     .await
                     .unwrap_or_default();
@@ -426,13 +526,19 @@ async fn bulk(
                 });
             }
             BulkC2S::GetImage(image) => {
+                let job_lease = lease.clone();
                 let Ok(slot) = image_jobs.clone().acquire_owned().await else { break };
                 let (srv, tx) = (server.clone(), btx.clone());
                 tokio::spawn(async move {
                     // Held until the image is queued for sending, so only a few decrypted
                     // images can wait in memory per connection.
                     let _slot = slot;
-                    let r = tokio::task::spawn_blocking(move || srv.chat_image(id, image)).await.unwrap_or_else(|e| Err(e.to_string()));
+                    let r = tokio::task::spawn_blocking(move || {
+                        let _lease = job_lease;
+                        srv.chat_image(id, image)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()));
                     let _ = tx
                         .send(match r {
                             Ok(data) => BulkS2C::Image { image, data },
@@ -444,10 +550,7 @@ async fn bulk(
         }
         downloads.retain(|_, h| !h.is_finished());
     }
-    for (_, u) in uploads {
-        drop(u.file);
-        let _ = tokio::fs::remove_file(&u.temp).await;
-    }
+    drop(uploads);
     for (_, h) in downloads {
         h.abort();
     }
@@ -455,7 +558,7 @@ async fn bulk(
     Ok(())
 }
 
-async fn begin_upload(
+pub(crate) async fn begin_upload(
     server: &Arc<Server>,
     me: ClientId,
     channel: ChannelId,
@@ -464,6 +567,7 @@ async fn begin_upload(
     overwrite: bool,
 ) -> Result<Upload, String> {
     server.file_perm(me, channel, perm::FILE_UPLOAD)?;
+    let slot = server.transfer_slot(me, true)?;
     let limits = server.state.lock().file_limits;
     const MB: u64 = 1024 * 1024;
     if limits.max_upload_mb > 0 && size > limits.max_upload_mb.saturating_mul(MB) {
@@ -492,7 +596,8 @@ async fn begin_upload(
         if limits.channel_quota_mb > 0 && used.saturating_add(pending).saturating_add(size) > limits.channel_quota_mb.saturating_mul(MB) {
             return Err(format!("Channel file quota exceeded ({} MB per channel)", limits.channel_quota_mb));
         }
-        *r.entry(channel).or_insert(0) += size;
+        let entry = r.entry(channel).or_insert(0);
+        *entry = entry.checked_add(size).ok_or("Too much space reserved")?;
         Reservation { server: server.clone(), channel, bytes: size }
     };
     if let Some(parent) = target.parent() {
@@ -505,20 +610,32 @@ async fn begin_upload(
     temp.push(format!(".{}.voxa-part", tag.iter().map(|b| format!("{b:02x}")).collect::<String>()));
     let temp = PathBuf::from(temp);
     let file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await.map_err(|e| format!("Cannot create file: {e}"))?;
-    Ok(Upload { file, temp, target, remaining: size, _space: space })
+    Ok(Upload { file: Some(file), temp, target, remaining: size, _space: space, _slot: slot, relative: path.into(), overwrite })
 }
 
-async fn send_file(tx: &mpsc::Sender<BulkS2C>, id: u32, path: PathBuf) -> Result<(), String> {
+async fn send_file(
+    tx: &mpsc::Sender<BulkS2C>,
+    id: u32,
+    path: PathBuf,
+    server: &Server,
+    me: ClientId,
+    channel: ChannelId,
+    client: &voxa_proto::transfers::Rate,
+) -> Result<(), String> {
     use tokio::io::AsyncReadExt;
+    let global = &server.download_rate;
     let mut f = tokio::fs::File::open(&path).await.map_err(|_| "File not found".to_string())?;
     let size = f.metadata().await.map_err(|e| e.to_string())?.len();
     tx.send(BulkS2C::DownloadBegin { id, size }).await.map_err(|_| "closed")?;
     let mut buf = vec![0u8; FILE_CHUNK];
     loop {
-        let n = f.read(&mut buf).await.map_err(|e| e.to_string())?;
+        let chunk = global.chunk().min(client.chunk());
+        let n = f.read(&mut buf[..chunk]).await.map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
+        tokio::join!(global.pace(n), client.pace(n));
+        server.file_perm(me, channel, perm::FILE_DOWNLOAD)?;
         tx.send(BulkS2C::DownloadChunk { id, data: buf[..n].to_vec() }).await.map_err(|_| "closed")?;
     }
     tx.send(BulkS2C::DownloadEnd { id }).await.map_err(|_| "closed")?;

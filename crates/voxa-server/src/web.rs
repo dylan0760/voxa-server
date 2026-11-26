@@ -155,7 +155,7 @@ pub async fn run(server: Arc<Server>, listener: TcpListener) {
 
 async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: SocketAddr) -> std::io::Result<()> {
     let _ = s.set_nodelay(true);
-    let Ok(Some(req)) = timeout(Duration::from_secs(15), read_request(&mut s)).await else {
+    let Ok(Some((req, _media_slot))) = timeout(Duration::from_secs(30), read_request(&mut s, &web)).await else {
         return respond(&mut s, "400 Bad Request", "text/plain", &[], b"Bad request").await;
     };
     let ip = client_ip(peer, &req);
@@ -166,6 +166,46 @@ async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: 
         ("GET", "/style.css") => static_file(&mut s, "text/css; charset=utf-8", STYLE).await,
         ("GET", "/crypto.js") => static_file(&mut s, "text/javascript; charset=utf-8", CRYPTO_JS).await,
         ("GET", "/app.js") => static_file(&mut s, "text/javascript; charset=utf-8", APP_JS).await,
+        ("GET", "/media.js") => static_file(&mut s, "text/javascript; charset=utf-8", include_str!("web/media.js")).await,
+        ("GET", "/api/server-icon") if live_client(&web, &req).is_some() => {
+            let icon = server.state.lock().server_icon.clone();
+            match icon {
+                Some(b) => respond(&mut s, "200 OK", if image_kind(&b) == Some("png") { "image/png" } else { "image/jpeg" }, &[], &b).await,
+                None => respond(&mut s, "404 Not Found", "text/plain", &[], b"No icon").await,
+            }
+        }
+        ("GET" | "POST", "/api/media/frame" | "/api/media/clip") if req.method == "GET" || req.sent_by_page() => {
+            let Some((me, _lease)) = live_session(&web, &req) else {
+                return respond(&mut s, "403 Forbidden", "text/plain", &[], b"Sign in first").await;
+            };
+            if req.path.ends_with("/frame") {
+                let peer = req.param("peer").and_then(|p| p.parse().ok()).unwrap_or(0);
+                let stream = req.param("stream").and_then(|p| p.parse().ok()).unwrap_or(0);
+                if req.method == "GET" {
+                    match server.web_frame(me, peer, stream, req.param("after").and_then(|p| p.parse().ok()).unwrap_or(0)) {
+                        Some((seq, jpeg)) => respond(&mut s, "200 OK", "image/jpeg", &[("X-Sequence", seq.to_string())], &jpeg).await,
+                        None => respond(&mut s, "204 No Content", "text/plain", &[], b"").await,
+                    }
+                } else {
+                    media_reply(&mut s, server.direct_frame(me, peer, stream, req.body)).await
+                }
+            } else if req.method == "POST" {
+                let uid = req.param("uid").unwrap_or_default();
+                let result = tokio::task::spawn_blocking(move || {
+                    let _hold_id = _lease;
+                    server.video_message(me, &uid, &req.body)
+                }).await.unwrap_or(Err("Upload failed".into()));
+                media_reply(&mut s, result).await
+            } else {
+                let id = req.param("id").and_then(|p| p.parse().ok()).unwrap_or(0);
+                match server.chat_image(me, id) {
+                    Ok(bytes) if bytes.starts_with(voxa_proto::direct::MAGIC) => {
+                        respond(&mut s, "200 OK", "application/octet-stream", &[], &bytes).await
+                    }
+                    _ => respond(&mut s, "404 Not Found", "text/plain", &[], b"Video unavailable").await,
+                }
+            }
+        }
         ("GET", "/icon.svg") | ("GET", "/favicon.ico") => static_file(&mut s, "image/svg+xml", ICON).await,
         // Languages (1.30.0+): the list (with procedural flag shapes), and each language's
         // translations (Voxa's files).
@@ -187,6 +227,11 @@ async fn connection(server: Arc<Server>, web: Arc<Web>, mut s: TcpStream, peer: 
         },
         ("POST", "/api/login") if req.sent_by_page() => login(&server, &web, &mut s, &req, ip, secure, proxied).await,
         ("GET", "/api/channels") => channels(&server, &mut s).await,
+        ("GET" | "POST", "/api/files" | "/api/files/upload" | "/api/files/download")
+            if req.sent_by_page() || req.method == "GET" && req.path == "/api/files/download" =>
+        {
+            web_files(&server, &web, &req, &mut s).await
+        }
         ("GET", "/api/prefs") => prefs(&server, &web, &mut s, &req).await,
         ("POST", "/api/prefs") if req.sent_by_page() => save_prefs(&server, &web, &mut s, &req).await,
         ("GET", "/api/avatar") => avatar(&server, &web, &mut s, &req).await,
@@ -448,7 +493,10 @@ async fn events(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip
         channel
     };
     let channel = (!channel.is_empty()).then_some(channel);
-    let _ = server.check_login_passwords(ip, password.as_deref(), channel.as_deref(), channel_password.as_deref()).await;
+    if let Err(e) = server.check_login_passwords(ip, password.as_deref(), channel.as_deref(), channel_password.as_deref()).await {
+        s.write_all(event(&S2C::Refused(e)).as_bytes()).await?;
+        return Ok(());
+    }
     let (tx, mut rx) = mpsc::channel::<Out>(OUTBOX_SIZE);
     let close = Arc::new(Notify::new());
     let hello = C2S::Hello {
@@ -507,6 +555,7 @@ async fn events(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, ip
 /// One Server-Sent Event. Secrets meant for the voice and bulk connections are left out.
 fn event(m: &S2C) -> String {
     let json = match m {
+        S2C::ServerIcon(icon) => serde_json::json!({"ServerIcon": icon.as_ref().map(|b|avatar_hash(b).to_string())}).to_string(),
         S2C::Welcome { your_id, your_uid, server, channels, clients, groups, .. } => serde_json::json!({ "Welcome": {
             "your_id": your_id, "your_uid": your_uid, "server": server, "channels": channels, "clients": clients, "groups": groups,
         } })
@@ -519,14 +568,14 @@ fn event(m: &S2C) -> String {
 }
 
 async fn send(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) -> std::io::Result<()> {
-    let Some(id) = live_client(web, req) else {
+    let Some((id, _lease)) = live_session(web, req) else {
         return json(s, "409 Conflict", &[], &serde_json::json!({ "error": "Not connected" })).await;
     };
     let msg = match parse_c2s(&req.body) {
         Ok(m) => m,
         Err(e) => return json(s, "400 Bad Request", &[], &serde_json::json!({ "error": format!("Bad message: {e}") })).await,
     };
-    // The page has no voice, bulk connection or screen sharing.
+    // Browser media uses the DM endpoints; channel broadcasts use the native bulk connection.
     if matches!(msg, C2S::Hello { .. } | C2S::AttachBulk(_) | C2S::Disconnect(_) | C2S::StartStream(_) | C2S::StopStream | C2S::WatchStream { .. } | C2S::StartCamera(_) | C2S::StopCamera) {
         return json(s, "400 Bad Request", &[], &serde_json::json!({ "error": "Not available on the web page" })).await;
     }
@@ -679,13 +728,16 @@ async fn avatar(server: &Server, web: &Web, s: &mut TcpStream, req: &Request) ->
 }
 
 fn live_client(web: &Web, req: &Request) -> Option<ClientId> {
+    live_session(web, req).map(|p| p.0)
+}
+fn live_session(web: &Web, req: &Request) -> Option<(ClientId, Arc<Notify>)> {
     let token = req.cookie(COOKIE)?;
     let logins = web.logins.lock();
-    logins.get(&token).filter(|l| l.created.elapsed() < LOGIN_LIFETIME)?.client.as_ref().map(|(id, _)| *id)
+    logins.get(&token).filter(|l| l.created.elapsed() < LOGIN_LIFETIME)?.client.clone()
 }
 
 async fn image(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, id: &str) -> std::io::Result<()> {
-    let (Some(me), Ok(image)) = (live_client(web, req), id.parse::<u64>()) else {
+    let (Some((me, _lease)), Ok(image)) = (live_session(web, req), id.parse::<u64>()) else {
         return respond(s, "404 Not Found", "text/plain", &[], b"Not found").await;
     };
     match server.chat_image(me, image) {
@@ -706,7 +758,92 @@ async fn image(server: &Server, web: &Web, s: &mut TcpStream, req: &Request, id:
 
 // ------------------------------------------------------------------ HTTP
 
-async fn read_request(s: &mut TcpStream) -> Option<Request> {
+async fn web_files(server: &Arc<Server>, web: &Web, req: &Request, s: &mut TcpStream) -> std::io::Result<()> {
+    let Some((me, _lease)) = live_session(web, req) else { return respond(s, "403 Forbidden", "text/plain", &[], b"Sign in first").await };
+    let channel = req.param("channel").and_then(|p| p.parse().ok()).unwrap_or(0);
+    let path = req.param("path").unwrap_or_default();
+    let fail = |e: String| std::io::Error::other(e);
+    if req.path == "/api/files/upload" && req.method == "POST" {
+        let result = async {
+            let size = req.header("content-length").and_then(|n| n.parse::<u64>().ok()).ok_or("File length required")?;
+            let mut u = crate::net::begin_upload(server, me, channel, &path, size, false).await?;
+            u.chunk(server, me, &req.body).await?;
+            let mut left = size - req.body.len() as u64;
+            let mut buf = [0u8; 16 * 1024];
+            while left > 0 {
+                let count = left.min(buf.len() as u64) as usize;
+                let n =
+                    timeout(Duration::from_secs(30), s.read(&mut buf[..count])).await.map_err(|_| "Upload timed out")?.map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("Upload incomplete".into());
+                }
+                u.chunk(server, me, &buf[..n]).await?;
+                left -= n as u64;
+            }
+            u.finish(server, me).await
+        }
+        .await;
+        return media_reply(s, result).await;
+    }
+    let download = req.path == "/api/files/download";
+    if req.method != "GET" || (!download && req.path != "/api/files") {
+        return respond(s, "404 Not Found", "text/plain", &[], b"Not found").await;
+    }
+    if let Err(e) = server.file_perm(me, channel, if download { perm::FILE_DOWNLOAD } else { perm::FILE_BROWSE }) {
+        return respond(s, "403 Forbidden", "text/plain", &[], e.as_bytes()).await;
+    }
+    if !download {
+        return match crate::files::list(&server.data_dir, channel, &path) {
+            Ok(list) => json(s, "200 OK", &[], &serde_json::json!(list)).await,
+            Err(e) => respond(s, "400 Bad Request", "text/plain", &[], e.as_bytes()).await,
+        };
+    }
+    let _slot = match server.transfer_slot(me, false) {
+        Ok(slot) => slot,
+        Err(e) => return respond(s, "429 Too Many Requests", "text/plain", &[], e.as_bytes()).await,
+    };
+    let file = match crate::files::resolve(&server.data_dir, channel, &path) {
+        Ok(p) => p,
+        Err(e) => return respond(s, "400 Bad Request", "text/plain", &[], e.as_bytes()).await,
+    };
+    let mut f = match tokio::fs::File::open(file).await {
+        Ok(f) => f,
+        Err(_) => return respond(s, "404 Not Found", "text/plain", &[], b"File not found").await,
+    };
+    let local = server.state.lock().sessions.get(&me).map(|x| x.download_rate.clone()).ok_or_else(|| fail("Disconnected".into()))?;
+    let mut left = f.metadata().await?.len();
+    let name: String = path
+        .rsplit('/')
+        .next()
+        .unwrap_or("file")
+        .bytes()
+        .map(|c| if c.is_ascii_alphanumeric() { (c as char).to_string() } else { format!("%{c:02X}") })
+        .collect();
+    let header=format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename*=UTF-8''{name}\r\nContent-Length: {left}\r\nCache-Control: no-store\r\nConnection: close\r\n{SECURITY_HEADERS}\r\n");
+    s.write_all(header.as_bytes()).await?;
+    let mut buf = vec![0; FILE_CHUNK];
+    while left > 0 {
+        let count = server.download_rate.chunk().min(local.chunk()).min(left.min(FILE_CHUNK as u64) as usize);
+        let n = f.read(&mut buf[..count]).await?;
+        if n == 0 {
+            break;
+        }
+        tokio::join!(server.download_rate.pace(n), local.pace(n));
+        server.file_perm(me, channel, perm::FILE_DOWNLOAD).map_err(fail)?;
+        timeout(Duration::from_secs(30), s.write_all(&buf[..n])).await??;
+        left -= n as u64;
+    }
+    Ok(())
+}
+
+async fn media_reply(s: &mut TcpStream, result: Result<(), String>) -> std::io::Result<()> {
+    match result {
+        Ok(()) => respond(s, "204 No Content", "text/plain", &[], b"").await,
+        Err(e) => respond(s, "400 Bad Request", "text/plain", &[], e.as_bytes()).await,
+    }
+}
+
+async fn read_request(s: &mut TcpStream, web: &Web) -> Option<(Request, Option<tokio::sync::SemaphorePermit<'static>>)> {
     let mut buf = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -735,9 +872,26 @@ async fn read_request(s: &mut TcpStream) -> Option<Request> {
         return None;
     }
     let len: usize = headers.iter().find(|(k, _)| k == "content-length").map(|(_, v)| v.parse().ok()).unwrap_or(Some(0))?;
-    if len > MAX_BODY {
-        return None;
+    let req = Request { method, path, query, headers, body: Vec::new() };
+    // File uploads are streamed into the same quota-reserved temp files as TCP
+    // uploads. Never buffer an entire file as an HTTP request body.
+    if req.path == "/api/files/upload" && req.method == "POST" && req.sent_by_page() && live_client(web, &req).is_some() {
+        let mut body = buf.split_off(head_end + 4);
+        body.truncate(len);
+        return Some((Request { body, ..req }, None));
     }
+    static MEDIA_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let slot = if req.path == "/api/media/clip" {
+        if !req.sent_by_page() || live_client(web, &req).is_none() || len > voxa_proto::direct::MAX_CLIP {
+            return None;
+        }
+        Some(MEDIA_READERS.try_acquire().ok()?)
+    } else {
+        if len > MAX_BODY {
+            return None;
+        }
+        None
+    };
     let mut body = buf[head_end + 4..].to_vec();
     while body.len() < len {
         let n = s.read(&mut chunk).await.ok()?;
@@ -747,7 +901,7 @@ async fn read_request(s: &mut TcpStream) -> Option<Request> {
         body.extend_from_slice(&chunk[..n]);
     }
     body.truncate(len);
-    Some(Request { method, path, query, headers, body })
+    Some((Request { body, ..req }, slot))
 }
 
 /// Where the web page's address is remembered when `web_allowed_origins` is empty.
@@ -803,7 +957,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 const SECURITY_HEADERS: &str = "X-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n\
-Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n";
+Content-Security-Policy: default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'\r\n";
 
 async fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n{SECURITY_HEADERS}", body.len());

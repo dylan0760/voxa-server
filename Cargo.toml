@@ -3,9 +3,9 @@ resolver = "2"
 members = ["crates/voxa-proto", "crates/voxa-server", "crates/voxa-server-manager"]
 
 [workspace.package]
-version = "1.30.1"
+version = "1.31.0"
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license-file = "LICENSE"
 authors = ["Voxa contributors"]
 repository = "https://github.com/dylan0760/voxa-server"
 

@@ -4,13 +4,17 @@
 //! control/bulk messages, the Noise based secure stream used for TCP traffic and the
 //! encrypted UDP voice packet format.
 
+pub mod direct;
 pub mod flags;
 pub mod i18n;
 pub mod identity;
 pub mod lossless;
 pub mod model;
+#[cfg(feature = "native-ui")]
+pub mod motion;
 pub mod msg;
 pub mod traffic;
+pub mod transfers;
 pub mod transport;
 #[cfg(feature = "update")]
 pub mod update;

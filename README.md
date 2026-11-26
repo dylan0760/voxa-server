@@ -1,6 +1,6 @@
 # Voxa Server
 
-Voxa is free, open source voice chat with persistent encrypted text chat and screen
+Voxa is free, source-available voice chat with persistent encrypted text chat and screen
 sharing. It is written in Rust for Windows. There are no license keys, registrations or
 fees. Servers can optionally ask for per-server accounts (username, password and an
 authenticator app) on top of each identity.
@@ -122,6 +122,13 @@ a picker with a preview of every theme, the solid ones (including Mustard, Slate
 Obsidian) and the two-tone ones where one colour blends into another.
 
 * **Open it:** `http://<server>:9980/`, or **🌐 Open Web Admin** in Voxa Server Manager.
+* **Client settings (⚙):** 12/24-hour time, personal upload/download limits, game
+  status, and camera rotation/background. Browsers cannot enumerate running games;
+  they can display others' activity and share a manually entered game. Open
+  **Channel files** from a channel menu to transfer files. In a DM, use the
+  camera/screen buttons for private sharing, or record a video message. Camera,
+  microphone and display capture require HTTPS (or localhost) and browser consent.
+  Screen sharing is available where the browser offers a display picker.
 * **Languages** (1.30.0): the page uses your browser's language when Voxa has it (41
   languages); 🌐 (on the sign-in page and at the bottom left) opens a list with flag
   icons and each language's own name (1.30.1), kept in this browser. The server serves
@@ -226,6 +233,27 @@ their update window by themselves. To allow older clients, set
 `require_latest_client = false` and restart the server.
 
 ## Features
+* **Server 1.31 / client 1.40:** choose a server icon or restore the initials
+  under **Edit Virtual Server**. The server accepts square PNG/JPEG icons up to
+  256 pixels and 96 KiB. Icons and settings are part of database backups.
+* **Transfer limits:** the **File transfers** section in the native and web server
+  editors controls total upload and download speeds (KiB/s) and concurrent jobs,
+  independently in each direction. An upload goes *to* this server. Zero means
+  unlimited. Before the first admin edit, `[transfers]` in `server.toml` supplies
+  `upload_kib`, `download_kib`, `uploads` and `downloads` (all default to zero).
+  Limits apply across connections alongside the existing quota and permission
+  checks; personal caps can only lower throughput. Existing jobs may finish when
+  a slot count is reduced. A native connection has safety ceilings of eight uploads
+  and 64 downloads; the Windows and Android clients queue remaining files.
+* **Private media and DM blocking:** an invitation is for one authenticated
+  recipient and must be accepted before live pictures are relayed. Neither person
+  leaves their current channel. Stopping capture, closing the preview, blocking,
+  disconnecting or losing permission ends the share. Block lists are persistent
+  per recipient and checked for online/offline DMs and private attachments.
+  Video notes have participant-only access, encrypted storage, a 15-second /
+  8 MiB limit, up to 30 days’ retention and a 1 GiB server-wide storage budget.
+* **Playing status:** clients opt in and publish only the game name. The server
+  sends it to people who can already see that client. It is not stored in chat.
 * **Languages** (1.30.0, Voxa 1.38.0): Voxa, Voxa Server Manager and the web admin page
   come in 41 languages. The server's usual messages (errors such as "Insufficient
   permissions", notices) are shown in each person's own language by their Voxa.
@@ -702,4 +730,4 @@ Keep both copies identical.
   version supports them.
 
 ## License
-Dual-licensed under MIT or Apache-2.0, at your option.
+The [Voxa Non-Commercial License 1.0](LICENSE) permits free non-commercial use and forks. Credit and link the original [client](https://github.com/dylan0760/voxa-client) and [server](https://github.com/dylan0760/voxa-server), identify changes and keep the same terms. Monetizing Voxa or a fork is not permitted. Earlier releases keep their original licenses; dependencies retain their own licenses.

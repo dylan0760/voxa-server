@@ -6,7 +6,7 @@ fn main() {
             .set("ProductName", "Voxa Server")
             .set("FileDescription", "Voxa Server Manager")
             .set("CompanyName", "Voxa Project")
-            .set("LegalCopyright", "Voxa contributors - MIT OR Apache-2.0");
+            .set("LegalCopyright", "Voxa contributors - Voxa Non-Commercial License 1.0");
         if let Err(e) = res.compile() {
             println!("cargo:warning=could not embed Windows resources: {e}");
         }

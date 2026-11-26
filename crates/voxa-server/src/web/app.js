@@ -139,7 +139,8 @@
   const pad = (n) => String(n).padStart(2, '0');
   function fmtTime(ts) {
     const d = new Date(ts * 1000);
-    return pad(d.getHours()) + ':' + pad(d.getMinutes());
+    const h=d.getHours();
+    return localStorage.getItem('voxa-clock')==='12' ? (h%12||12)+':'+pad(d.getMinutes())+(h<12?' AM':' PM') : pad(h)+':'+pad(d.getMinutes());
   }
   function fmtDate(ts) {
     const d = new Date(ts * 1000);
@@ -355,6 +356,58 @@
     connected: false, msgDirty: true, presences: new Map(),
   };
   let es = null;
+  S.blocks=new Set(); S.games=new Map();
+  const media=globalThis.VoxaMedia({el,dialog,send,T,report:m=>toast(m,'bad'),openDm:c=>{openDm(c.uid,c.nickname);activateTab('dm:'+c.uid);}});
+  let personalLimits={upload_kib:0,download_kib:0,uploads:3,downloads:3};
+  try { Object.assign(personalLimits,JSON.parse(localStorage.getItem('voxa-transfer-limits')||'{}')); } catch (_) {}
+  function transferFields(limits) {
+    const fields = [], inputs = {};
+    for (const [key, label] of [['upload_kib', 'Upload speed'], ['download_kib', 'Download speed'], ['uploads', 'Concurrent uploads'], ['downloads', 'Concurrent downloads']]) {
+      const rate = key.endsWith('_kib');
+      const input = inputs[key] = el('input', {type:'number', min:rate ? 1 : 0, max:rate ? 1000000 : 1024, value:String(limits[key] || (rate ? 128 : 0))});
+      if (rate) {
+        input.disabled = !limits[key];
+        const unlimited = el('input', {type:'checkbox', checked:input.disabled, onchange:() => { input.disabled = unlimited.checked; }});
+        fields.push(field(T(label)+' (KiB/s)', el('div',null,input,el('label',null,unlimited,' '+T('Unlimited')))));
+      } else {
+        fields.push(field(T(label),input,'0 = '+T('Unlimited')));
+      }
+    }
+    const read = () => Object.fromEntries(Object.entries(inputs).map(([key,i]) => [
+      key, i.disabled ? 0 : Math.min(Number(i.max),Math.max(Number(i.min),Math.trunc(Number(i.value) || 0))),
+    ]));
+    return {fields, read};
+  }
+  const cameraPrefs={ rotation:Number(localStorage.getItem('voxa-camera-rotation')||0)%4,
+    background:localStorage.getItem('voxa-camera-bg')||'Off',picture:null };
+  function personalOptions() {
+    const transfer=transferFields(personalLimits);
+    const clock=el('select',null,['24','12'].map(n=>el('option',{value:n,selected:n===(localStorage.getItem('voxa-clock')||'24')},n+' hour')));
+    const rotation=el('select',null,[0,1,2,3].map(n=>el('option',{value:n,selected:n===cameraPrefs.rotation},n*90+'°')));
+    const bg=el('select',null,['Off','Blur','Solid','Picture'].map(n=>el('option',{value:n,selected:n===cameraPrefs.background},T(n))));
+    const picture=el('input',{type:'file',accept:'image/png,image/jpeg,image/webp'});
+    const game=el('input',{maxlength:60,placeholder:'Game name',value:localStorage.getItem('voxa-game-name')||''});
+    const share=el('input',{type:'checkbox',checked:localStorage.getItem('voxa-game-on')==='1'});
+    dialog(T('Settings'),el('div',{class:'form'},field(T('Clock'),clock),field(T('Camera rotation'),rotation),field(T('Camera background'),bg),field('Background picture',picture),
+      el('p',{class:'full'},'For backgrounds, step out for the first three seconds and keep the camera still.'),
+      field(T('Game activity'),share,'Browsers cannot detect running games. Choose the game to show manually.'),field(T('Add a game'),game),
+      el('div',{class:'section full'},'Personal transfer limits'),transfer.fields,
+      el('div',{class:'full small'},'Voxa Non-Commercial License 1.0 · ',el('a',{href:'https://github.com/dylan0760/voxa-client',target:'_blank',rel:'noopener noreferrer'},'Original client'), ' · ',
+        el('a',{href:'https://github.com/dylan0760/voxa-server',target:'_blank',rel:'noopener noreferrer'},'Original server'))),[
+      {label:T('Cancel')},{label:T('Save'),onClick:async()=>{
+        if(picture.files[0]){
+          if(picture.files[0].size>16*1024*1024){toast('Choose a picture under 16 MiB','bad');return false;}
+          try {const img=await createImageBitmap(picture.files[0],{resizeWidth:640,resizeHeight:360});cameraPrefs.picture?.close();cameraPrefs.picture=img;bg.value='Picture';}
+          catch(_){toast('Could not open the picture','bad');return false;}
+        }
+        if(bg.value==='Picture' && !cameraPrefs.picture){toast('Choose a picture first','bad');return false;}
+        cameraPrefs.rotation=Number(rotation.value);cameraPrefs.background=bg.value;
+        localStorage.setItem('voxa-camera-rotation',rotation.value);localStorage.setItem('voxa-camera-bg',bg.value==='Picture'?'Off':bg.value);
+        localStorage.setItem('voxa-clock',clock.value);localStorage.setItem('voxa-game-on',share.checked?'1':'0');localStorage.setItem('voxa-game-name',game.value.trim());
+        personalLimits=transfer.read();localStorage.setItem('voxa-transfer-limits',JSON.stringify(personalLimits));send({ClientTransferLimits:personalLimits});
+        send({SetGame:share.checked ? game.value.trim() : null});S.msgDirty=true;schedule();
+      }}]);
+  }
 
   function log(key) {
     let l = S.logs.get(key);
@@ -631,6 +684,7 @@
   }
 
   async function signOut() {
+    media.close();
     localStorage.removeItem('voxa-web-key');
     sessionStorage.removeItem('voxa-web-pw');
     try { await post('/api/logout'); } catch (_) { /* already gone */ }
@@ -664,6 +718,7 @@
       handle(kind, v);
     };
     es.onerror = async () => {
+      media.close();
       if (!S.connected) {
         if ((await signedIn()) === false) showLogin(T('Your sign-in expired. Please sign in again.'));
         return;
@@ -713,6 +768,7 @@
   function handle(kind, v) {
     switch (kind) {
       case 'Welcome': {
+        media.close(); S.games.clear(); S.blocks.clear(); S.serverIcon=null;S.transferLimits=null;
         S.me = v.your_id;
         S.uid = v.your_uid;
         S.server = v.server;
@@ -731,6 +787,8 @@
         banner('');
         closeDialogs(true);
         buildApp();
+        send({ClientTransferLimits:personalLimits});
+        if(localStorage.getItem('voxa-game-on')==='1')send({SetGame:localStorage.getItem('voxa-game-name')||null});
         loadPrefs();
         activateTab(S.tab);
         // Your status from last time (invisible was already asked for when joining).
@@ -740,6 +798,14 @@
       case 'ClientPresence':
         if (v.presence === 'Online') S.presences.delete(v.id); else S.presences.set(v.id, v.presence);
         break;
+      case 'TransferLimits': S.transferLimits=v; break;
+      case 'ServerIcon': S.serverIcon=v; break;
+      case 'Playing': if(v.game)S.games.set(v.client,v.game);else S.games.delete(v.client);break;
+      case 'DmBlocks': S.blocks=new Set(v);break;
+      case 'MediaOffer': media.offer(v,S.clients.get(v.from));break;
+      case 'MediaAnswer': media.answer(v);break;
+      case 'MediaEnded': media.ended(v);break;
+      case 'OfflineVideoSent': openDm(v.uid,personName(v.uid));pushMsg('dm:'+v.uid,{id:0,target:{Private:0},from:S.me,from_uid:S.uid,from_name:S.clients.get(S.me)?.nickname||'',ts:v.ts,text:v.text});break;
       case 'Refused':
         stopped(T('Could not join the server'), v);
         break;
@@ -782,6 +848,7 @@
         if (c && v.id !== S.me && inChannel() && c.channel === myChannel()) tones(LEAVE_TONES);
         if (c) pushEvent('server', c.nickname + ' ' + leaveText(v.reason), v.reason.Kicked || v.reason.Banned ? 'bad' : '');
         S.clients.delete(v.id);
+        S.games.delete(v.id);
         S.presences.delete(v.id);
         if (S.selected.kind === 'client' && S.selected.id === v.id) S.selected = { kind: 'server' };
         break;
@@ -1070,11 +1137,13 @@
   function renderRail() {
     const name = S.server ? S.server.name : '';
     put(R.rail, 
-      el('div', { class: 'srv', title: name, onclick: () => { S.selected = { kind: 'server' }; S.right = 'info'; S.showRight = true; schedule(); } }, initials(name)),
+      el('div', { class: 'srv', title: name, onclick: () => { S.selected = { kind: 'server' }; S.right = 'info'; S.showRight = true; schedule(); } },
+        S.serverIcon ? el('img',{src:'/api/server-icon?v='+encodeURIComponent(S.serverIcon),alt:name,onerror:e=>e.target.replaceWith(initials(name))}) : initials(name)),
       el('div', { class: 'sep' }),
       el('div', { class: 'grow' }),
       el('button', { class: 'icon-btn', title: T('Join / leave sounds (click to turn ') + (localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off') + ')', onclick: () => { localStorage.setItem('voxa-web-sounds', localStorage.getItem('voxa-web-sounds') === 'off' ? 'on' : 'off'); schedule(); } }, localStorage.getItem('voxa-web-sounds') === 'off' ? '🔕' : '🔔'),
       el('button', { class: 'icon-btn', title: T('Language'), onclick: languageDialog }, '🌐'),
+      el('button', {class:'icon-btn',title:T('Settings'),onclick:personalOptions},'⚙'),
       el('button', { class: 'icon-btn', title: T('Theme'), onclick: (e) => themeMenu(e.clientX + 10, e.clientY - 250) }, '🎨'),
       el('button', { class: 'icon-btn', title: T('Sign out'), onclick: () => confirmDialog(T('Sign out'), T('Sign out of the web admin page?'), T('Sign out')).then((ok) => ok && signOut()) }, '⏻'));
   }
@@ -1177,6 +1246,7 @@
       el('span', { class: 'ico', style: full ? 'color:var(--red)' : mine ? 'color:var(--green)' : '' }, ch.has_password ? '🔒' : '🔊'),
       el('span', { class: 'label' }, ch.name),
       el('span', { class: 'badges' },
+        S.games.has(c.id)?el('span',{title:'Playing '+S.games.get(c.id)},'🎮 '+S.games.get(c.id)):null,
         ch.is_default ? el('span', { title: T('Default channel') }, '🏠') : null,
         ch.kind === 'Temporary' ? el('span', { title: T('Temporary channel') }, '⏳') : null,
         ch.max_clients != null ? el('span', { title: T('Max clients') }, n + '/' + ch.max_clients) : n && S.collapsed.has(ch.id) ? el('span', null, String(n)) : null));
@@ -1254,6 +1324,7 @@
       !isDm && !(S.tab === 'server' && !can(P.SERVER_EVENTS)) ? el('button', { class: 'icon-btn' + (S.showPins ? ' on' : ''), title: T('Pinned messages'), onclick: togglePins }, '📌') : null,
       !isDm && can(P.CHAT_CLEAR) ? el('button', { class: 'icon-btn', title: T('Clear the entire chat history'), onclick: clearChat }, '🗑') : null,
       isDm ? el('button', { class: 'icon-btn', title: T('Close this conversation'), onclick: () => closeDm(S.tab.slice(3)) }, '✕') : null,
+      isDm ? privateButtons(S.tab.slice(3)) : null,
       el('button', { class: 'icon-btn' + (S.showRight ? ' on' : ''), title: T('Show / hide info panel'), onclick: () => { S.showRight = !S.showRight; schedule(); } }, 'ℹ'),
       el('button', { class: 'pill' + (peopleOn ? ' on' : ''), title: T('Everyone on this server, online and offline'), onclick: () => { S.showRight = !peopleOn; S.right = 'people'; schedule(); } }, T('👥 People')));
   }
@@ -1270,6 +1341,7 @@
   }
 
   function closeDm(uid) {
+    media.close(uid);
     S.dms = S.dms.filter((d) => d.uid !== uid);
     if (S.tab === 'dm:' + uid) activateTab('channel');
     schedule();
@@ -1295,6 +1367,8 @@
   }
 
   function messageText(text) {
+    const clip=/^🎥 Video message\n\[voxa-clip:(\d+)\]$/.exec(text);
+    if(clip)return el('button',{class:'btn',onclick:()=>media.playClip(clip[1]).catch(e=>toast(e.message,'bad'))},'▶ '+T('Video message'));
     const img = IMAGE_RE.exec(text);
     if (img) {
       const src = '/api/image/' + img[2];
@@ -1435,7 +1509,7 @@
     R.composer.classList.toggle('hidden', S.tab === 'server');
     if (S.tab === 'server') { placeholder = ''; allowed = false; note = can(P.SERVER_EVENTS) ? T('ℹ This tab shows what happens on the server. Chat in a channel, or with direct messages.') : ''; }
     else if (S.tab === 'channel') { const ch = S.channels.get(myChannel()); placeholder = T('Message #') + (ch ? ch.name : ''); allowed = can(P.CHANNEL_CHAT); note = T('🔒 Messages are encrypted in transit and stored encrypted on the server'); }
-    else { placeholder = T('Message @') + personName(S.tab.slice(3)); allowed = can(P.PRIVATE_MESSAGE); note = T('🔒 Encrypted in transit · direct messages are not kept by the web page'); }
+    else { placeholder = T('Message @') + personName(S.tab.slice(3)); allowed = can(P.PRIVATE_MESSAGE) && !S.blocks.has(S.tab.slice(3)); note = T('🔒 Encrypted in transit · direct messages are not kept by the web page'); }
     if (!allowed) placeholder = T('You do not have permission to write here');
     R.input.placeholder = placeholder + (allowed ? '  ·  Shift+Enter for a new line' : '');
     R.input.disabled = !allowed;
@@ -1469,6 +1543,17 @@
         schedule();
       }
     }
+  }
+
+  function blockDm(uid){ send({BlockDm:{uid,block:!S.blocks.has(uid)}});media.close(uid); }
+  function privateButtons(uid){
+    const c=onlineByUid(uid);
+    const button=(label,title,fn)=>el('button',{class:'icon-btn',title,onclick:fn},label);
+    const blocked=S.blocks.has(uid);
+    return [button(blocked?'🔓':'🚫',blocked?T('Unblock DMs'):T('Block DMs'),()=>blockDm(uid)),
+      !blocked && can(P.PRIVATE_MESSAGE) ? button('⏺',T('Record video message'),()=>media.start(uid,c?.id,true,true,cameraPrefs)):null,
+      !blocked && c && can(P.SCREEN_SHARE) ? button('📷',T('Private camera'),()=>media.start(uid,c.id,true,false,cameraPrefs)):null,
+      !blocked && c && can(P.SCREEN_SHARE) && navigator.mediaDevices?.getDisplayMedia ? button('🖥',T('Private screen share'),()=>media.start(uid,c.id,false,false,cameraPrefs)):null];
   }
 
   // ---------------------------------------------------------------- info panel
@@ -1599,6 +1684,7 @@
     const personMenu = (uid, name, online, x, y) => menu(x, y, [
       { head: name },
       { label: T('💬  Send Message'), onClick: () => { openDm(uid, name); activateTab('dm:' + uid); } },
+      {label:S.blocks.has(uid)?T('Unblock DMs'):T('Block DMs'),onClick:()=>blockDm(uid)},
       !online && can(P.GROUP_MANAGE) ? { label: T('🗑  Remove from Server…'), onClick: () => forgetPerson(uid, name) } : null,
       S.accountPolicy && can(P.SERVER_EDIT) && uid !== S.uid ? { label: T('🔑  Reset Account Password…'), onClick: () => resetAccount(uid, name) } : null,
     ]);
@@ -1680,6 +1766,7 @@
     const i = sib.findIndex((c) => c.id === ch.id);
     menu(x, y, [
       { head: sp ? T('Separator') : ch.name },
+      !sp && can(P.FILE_BROWSE)?{label:'📁 Channel files',onClick:()=>channelFiles(ch)}:null,
       !sp && ch.id !== myChannel() ? { label: T('➜  Join Channel'), onClick: () => joinChannel(ch) } : null,
       ch.id === myChannel() ? { label: T('🚪  Leave Channel'), onClick: leaveChannel } : null,
       { label: T('ℹ  Channel Info'), onClick: () => { select({ kind: 'channel', id: ch.id }); S.showRight = true; } },
@@ -1694,6 +1781,50 @@
       can(P.CHANNEL_DELETE) ? { sep: true } : null,
       can(P.CHANNEL_DELETE) ? { label: T('🗑  Delete Channel…'), danger: true, onClick: () => deleteChannel(ch) } : null,
     ]);
+  }
+
+  function channelFiles(ch) {
+    let dir='',closed=false,serial=0;
+    const running=new Set();
+    const list=el('div'), notice=el('div',{class:'dim small'}), where=el('strong');
+    const endpoint=(route,path)=>route+'?'+new URLSearchParams({channel:String(ch.id),path});
+    const refresh=async()=>{
+      const gen=++serial;where.textContent='/'+dir;
+      try {
+        const r=await fetch(endpoint('/api/files',dir),{headers:{'X-Voxa':'1'}});
+        if(!r.ok)throw new Error(await r.text());
+        const entries=await r.json();
+        if(closed||serial!==gen)return;
+        put(list,...entries.map(f=>{
+          const path=dir?dir+'/'+f.name:f.name;
+          return f.is_dir ? el('button',{class:'btn',onclick:()=>{dir=path;refresh();}},'📁 '+f.name) :
+            el('a',{class:'btn',href:endpoint('/api/files/download',path),download:f.name},'⬇ '+f.name);
+        }));
+      }catch(e){if(!closed)notice.textContent=e.message;}
+    };
+    const file=el('input',{type:'file',multiple:true});
+    const upload=async()=>{
+      const files=Array.from(file.files),prefix=dir;
+      if(!files.length)return;
+      start.disabled=true;
+      const worker=async()=>{
+        while(files.length && !closed){
+          const f=files.shift(),ctrl=new AbortController();running.add(ctrl);
+          try{
+            notice.textContent='Uploading '+f.name;
+            const r=await fetch(endpoint('/api/files/upload',prefix?prefix+'/'+f.name:f.name),{method:'POST',headers:{'X-Voxa':'1'},body:f,signal:ctrl.signal});
+            if(!r.ok)throw new Error(await r.text());
+          }catch(e){if(!closed)toast(f.name+': '+e.message,'bad');}
+          finally{running.delete(ctrl);}
+        }
+      };
+      await Promise.all(Array.from({length:Math.min(files.length,personalLimits.uploads||8,S.transferLimits?.uploads||8,8)},worker));
+      if(!closed){start.disabled=false;notice.textContent='';file.value='';refresh();}
+    };
+    const start=el('button',{class:'btn',onclick:upload},'Upload');
+    dialog(ch.name+' · Channel files',el('div',null,where,el('button',{class:'btn',onclick:()=>{dir=dir.split('/').slice(0,-1).join('/');refresh();}},'⬆ Up'),list,
+      can(P.FILE_UPLOAD)?[file,start]:null,notice),[{label:T('Close')}],{onClose:()=>{closed=true;for(const c of running)c.abort();}});
+    refresh();
   }
 
   function clientMenu(c, x, y) {
@@ -1711,6 +1842,7 @@
     menu(x, y, [
       { head: c.nickname },
       { label: T('💬  Send Message'), onClick: () => { openDm(c.uid, c.nickname); activateTab('dm:' + c.uid); } },
+      { label:S.blocks.has(c.uid)?T('Unblock DMs'):T('Block DMs'),onClick:()=>blockDm(c.uid) },
       can(P.CLIENT_POKE) ? { label: T('👉  Poke…'), onClick: () => pokeClient(c) } : null,
       can(P.CLIENT_MOVE) ? { label: T('➜  Move to Channel…'), onClick: () => moveClientDialog(c) } : null,
       can(P.CLIENT_MOVE) && inChannel() && c.channel !== myChannel() ? { label: T('⤵  Move to My Channel'), onClick: () => send({ MoveClient: { target: c.id, channel: myChannel() } }) } : null,
@@ -2120,6 +2252,23 @@
 
   function editServer() {
     const s = S.server;
+    let removeIcon = false;
+    const icon = el('input',{type:'file',accept:'image/png,image/jpeg'});
+    async function chosenIcon() {
+      const file = icon.files[0];
+      if (!file) return removeIcon ? null : undefined;
+      if (file.size > 16 * 1024 * 1024) throw new Error('Choose a picture under 16 MiB');
+      const img = await createImageBitmap(file);
+      try {
+        const side = Math.min(img.width,img.height);
+        const canvas = el('canvas',{width:128,height:128});
+        canvas.getContext('2d').drawImage(img,(img.width-side)/2,(img.height-side)/2,side,side,0,0,128,128);
+        const blob = await new Promise(ok => canvas.toBlob(ok,'image/png'));
+        return Array.from(new Uint8Array(await blob.arrayBuffer()));
+      } finally { img.close(); }
+    }
+    const caps=S.transferLimits||{};
+    const transferForm=transferFields(caps);
     const name = el('input', { type: 'text', value: s.name, maxlength: '60' });
     const welcome = el('textarea', { rows: '3', value: s.welcome_message });
     const host = el('textarea', { rows: '2', value: s.host_message });
@@ -2141,6 +2290,7 @@
     send('GetFileLimits');
     dialog(T('Edit virtual server'), el('div', { class: 'form' },
       field(T('Server name'), name),
+      field(T('Server icon'),el('div',null,icon,el('button',{type:'button',class:'btn',onclick:()=>{icon.value='';removeIcon=true;}},T('Use initials')))),
       field(T('Welcome message'), welcome),
       field(T('Host message'), host),
       field(T('Max clients'), maxc),
@@ -2156,9 +2306,12 @@
           T('Forgotten passwords: a recovery code, or right-click the person ▸ Reset Account Password.'))] : null,
       el('div', { class: 'section full' }, T('File browser')),
       field(T('Largest upload (MB)'), upload, '0 = unlimited'),
+      transferForm.fields,
       field(T('Storage per channel (MB)'), quota, '0 = unlimited')), [
       { label: T('Cancel') },
-      { label: T('Save'), primary: true, onClick: () => {
+      { label: T('Save'), primary: true, onClick: async () => {
+        let iconChange;
+        try { iconChange = await chosenIcon(); } catch (e) { toast(e.message,'bad'); return false; }
         send({ EditServer: {
           name: name.value.trim() || s.name, welcome_message: welcome.value, host_message: host.value,
           max_clients: Math.max(1, Number(maxc.value) || s.max_clients),
@@ -2167,6 +2320,9 @@
           chat_retention_days: Math.max(0, Number(retention.value) || 0),
         } });
         if (S.accountPolicy && (accMode.value !== pol.mode || accMfa.checked !== pol.mfa_for_staff)) send({ SetAccountPolicy: { mode: accMode.value, mfa_for_staff: accMfa.checked } });
+        if(iconChange!==undefined)send({SetServerIcon:iconChange});
+        const transfer=transferForm.read();
+        if(Object.keys(transfer).some(k=>transfer[k]!==caps[k]))send({SetTransferLimits:transfer});
         const mins = Math.min(30, Math.max(0, Math.round(Number(away.value) || 0)));
         if (!S.options || mins !== S.options.auto_away_minutes) send({ SetServerOptions: { auto_away_minutes: mins } });
         if (limits && upload.value !== '' && quota.value !== '') {

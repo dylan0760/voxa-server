@@ -17,6 +17,9 @@ use voxa_proto::*;
 
 use crate::config::Config;
 use crate::store::*;
+mod features;
+pub use features::TransferSlot;
+use voxa_proto::transfers::{Rate, TransferLimits};
 
 pub enum Out {
     Msg(S2C),
@@ -80,6 +83,13 @@ pub struct Session {
     /// The camera, while it is on (1.21.0+): pictures go to everyone in the channel.
     pub camera: Option<CameraInfo>,
     pub last_camera_key_req: Option<Instant>,
+    pub game: Option<String>,
+    blocks: Vec<String>,
+    pub download_rate: Arc<Rate>,
+    pub upload_rate: Arc<Rate>,
+    transfer_prefs: TransferLimits,
+    transfers_running: [Arc<AtomicUsize>; 2],
+    private_share: Option<features::PrivateShare>,
     /// Channels whose calendar this client has open (it gets every change).
     pub calendar_subs: HashSet<ChannelId>,
     /// Signed in to the identity's account (1.25.0+), and with the authenticator app (or a
@@ -151,8 +161,13 @@ pub struct State {
     pub channels: BTreeMap<ChannelId, ChannelRec>,
     pub groups: BTreeMap<GroupId, GroupInfo>,
     pub sessions: HashMap<ClientId, Session>,
+    // Keep numeric IDs reserved until outstanding authenticated work for that
+    // session has also finished (bulk transfers, web requests, GIF workers).
+    issued: HashMap<ClientId, std::sync::Weak<Notify>>,
     /// File browser limits (0 = unlimited); editable by admins from the client.
     pub file_limits: FileLimits,
+    pub transfer_limits: TransferLimits,
+    pub server_icon: Option<Vec<u8>>,
     /// Server-wide options (auto-away), editable by admins.
     pub options: ServerOptions,
     /// Who must sign in to an account (1.25.0+).
@@ -174,6 +189,10 @@ pub struct Server {
     pub pw: Mutex<PasswordWork>,
     /// Bytes promised to running uploads, per channel (see net.rs `Reservation`).
     pub reserved: Mutex<HashMap<ChannelId, u64>>,
+    pub upload_rate: Rate,
+    pub download_rate: Rate,
+    upload_slots: Arc<AtomicUsize>,
+    download_slots: Arc<AtomicUsize>,
     /// Oldest client version allowed to connect (`require_latest_client`).
     pub min_client: Mutex<String>,
     /// Argon2 runs at most this many at once, so password floods cannot use every core.
@@ -335,7 +354,7 @@ const MAX_CAMERA_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// The Voxa client released together with this server: the oldest one it accepts when
 /// `require_latest_client` is on (newer releases found on GitHub raise it).
-pub const MIN_CLIENT_VERSION: &str = "1.38.1";
+pub const MIN_CLIENT_VERSION: &str = "1.40.0";
 
 /// Offline direct messages: how many may wait per person, and for how many days.
 pub const MAX_OFFLINE_WAITING: usize = 100;
@@ -488,6 +507,9 @@ impl State {
                 v.tx.send(Out::Msg(S2C::ClientLeft { id, reason: LeaveReason::Disconnected(String::new()) }));
             } else {
                 v.tx.send(Out::Msg(S2C::ClientJoined(sub.info.clone())));
+                if sub.game.is_some() && v.client_at_least("1.40.0") && self.sees(v, sub) {
+                    v.tx.send(Out::Msg(S2C::Playing { client: id, game: sub.game.clone() }));
+                }
                 if let Some(meta) = avatar.as_ref().filter(|_| v.client_at_least("1.20.0")) {
                     v.tx.send(Out::Msg(S2C::AvatarInfo(vec![meta.clone()])));
                 }
@@ -744,6 +766,9 @@ impl State {
             for p in came {
                 if let Some(x) = self.sessions.get(&p) {
                     s.tx.send(Out::Msg(S2C::ClientJoined(x.info.clone())));
+                    if x.game.is_some() && s.client_at_least("1.40.0") {
+                        s.tx.send(Out::Msg(S2C::Playing { client: p, game: x.game.clone() }));
+                    }
                 }
             }
             if limited != old_limited || s.told_limited != *limited {
@@ -936,12 +961,17 @@ impl Server {
         }
         let gifs = crate::gifs::Gifs::new(&cfg);
         let gif_library = crate::gif_library::Library::new(&data_dir);
+        let limits = store.preference::<Option<TransferLimits>>("transfer_limits")?.unwrap_or(cfg.transfers);
+        anyhow::ensure!(limits.valid(), "Invalid transfer limits");
         let srv = Server {
             state: Mutex::new(State {
                 settings,
                 channels,
                 groups,
                 sessions: HashMap::new(),
+                issued: HashMap::new(),
+                transfer_limits: limits,
+                server_icon: store.preference("server_icon")?,
                 // Values saved from the client win; server.toml only provides the default.
                 options: store.server_options()?.unwrap_or_default(),
                 account_policy: store.account_policy()?,
@@ -963,6 +993,10 @@ impl Server {
             started: now_unix(),
             pw: Mutex::new(PasswordWork::default()),
             reserved: Mutex::new(HashMap::new()),
+            upload_rate: Rate::new(limits.upload_kib),
+            download_rate: Rate::new(limits.download_kib),
+            upload_slots: Default::default(),
+            download_slots: Default::default(),
             min_client: Mutex::new(MIN_CLIENT_VERSION.to_string()),
             argon_slots: tokio::sync::Semaphore::new(2),
             gifs,
@@ -982,7 +1016,7 @@ impl Server {
         while store.next_id("next_group")? < 100 {}
         let s = StoredSettings {
             name: "Voxa Server".into(),
-            welcome_message: "Welcome to Voxa - free, open source voice chat.".into(),
+            welcome_message: "Welcome to Voxa - non-commercial voice chat.".into(),
             host_message: String::new(),
             max_clients: 64,
             password_hash: None,
@@ -1280,7 +1314,9 @@ impl Server {
         let wanted = sanitize_nick(&nickname);
         let nickname = self.unique_nickname(&st, &wanted, &uid);
         let renamed = (nickname != wanted).then(|| wanted.clone());
-        let id = (1..=u16::MAX).find(|i| !st.sessions.contains_key(i)).ok_or("No free client slots")?;
+        st.issued.retain(|_, v| v.strong_count() > 0);
+        let id = (1..=u16::MAX).find(|i| !st.issued.contains_key(i)).ok_or("No free client slots")?;
+        st.issued.insert(id, Arc::downgrade(&close));
 
         // Join options (stay out of channels, invisible), then the channel path.
         let (no_channel, invisible, path) = default_channel.as_deref().map(join::parse).map(|(a, b, p)| (a, b, p.to_string())).unwrap_or((false, false, String::new()));
@@ -1361,6 +1397,15 @@ impl Server {
             bulk_token,
         };
         tx.send(Out::Msg(welcome));
+        let blocks: Vec<String> = db(self.store.preference(&format!("dm-blocks:{uid}")))?;
+        if !voxa_proto::update::is_newer("1.40.0", &info.version) {
+            tx.send(Out::Msg(S2C::TransferLimits(st.transfer_limits)));
+            tx.send(Out::Msg(S2C::ServerIcon(st.server_icon.clone())));
+            tx.send(Out::Msg(S2C::DmBlocks(blocks.clone())));
+            for other in st.sessions.values().filter(|x| x.game.is_some() && (!x.hidden() || viewer_admin) && visible(x.info.channel)) {
+                tx.send(Out::Msg(S2C::Playing { client: other.info.id, game: other.game.clone() }));
+            }
+        }
         if let Some(w) = &renamed {
             tx.send(Out::Msg(S2C::Notice(format!(
                 "The name \"{w}\" belongs to someone else on this server, so you joined as \"{}\". Choose another name with Change nickname.",
@@ -1374,7 +1419,8 @@ impl Server {
         // Direct messages that arrived while this person was offline.
         if !voxa_proto::update::is_newer("1.18.0", &info.version) {
             match self.store.take_offline(&uid) {
-                Ok(msgs) if !msgs.is_empty() => {
+                Ok(mut msgs) if !msgs.is_empty() => {
+                    msgs.retain(|m| !blocks.contains(&m.from_uid));
                     info!("delivering {} offline message(s) to {uid}", msgs.len());
                     tx.send(Out::Msg(S2C::OfflineMessages(msgs)));
                 }
@@ -1450,6 +1496,13 @@ impl Server {
                 bulk_frames: Arc::new(AtomicUsize::new(0)),
                 camera: None,
                 last_camera_key_req: None,
+                blocks,
+                game: None,
+                download_rate: Arc::new(Rate::new(0)),
+                upload_rate: Arc::new(Rate::new(0)),
+                transfer_prefs: Default::default(),
+                transfers_running: Default::default(),
+                private_share: None,
                 calendar_subs: HashSet::new(),
                 view_as: None,
                 signed_in: false,
@@ -1536,7 +1589,7 @@ impl Server {
     /// Attaches a bulk connection to the session that received `token`. The connection
     /// must come from the same identity (`uid` from its handshake) as the session, so a
     /// token that leaked is useless to anyone else.
-    pub fn attach_bulk(&self, token: &[u8; 32], uid: &str, tx: mpsc::Sender<BulkS2C>, frames: Arc<AtomicUsize>) -> Option<ClientId> {
+    pub fn attach_bulk(&self, token: &[u8; 32], uid: &str, tx: mpsc::Sender<BulkS2C>, frames: Arc<AtomicUsize>) -> Option<(ClientId, Arc<Notify>)> {
         let mut st = self.state.lock();
         let mut found = None;
         // Compare every token in constant time (no early exit that leaks timing).
@@ -1552,7 +1605,7 @@ impl Server {
         }
         s.bulk_tx = Some(tx);
         s.bulk_frames = frames;
-        Some(s.info.id)
+        Some((s.info.id, s.close.clone()))
     }
 
     /// Detaches a bulk connection, unless the session already has a newer one.
@@ -1561,6 +1614,7 @@ impl Server {
         if let Some(s) = st.sessions.get_mut(&id) {
             if s.bulk_tx.as_ref().map(|b| b.same_channel(tx)).unwrap_or(false) {
                 s.bulk_tx = None;
+                st.end_peer_media(id);
             }
         }
     }
@@ -1575,6 +1629,7 @@ impl Server {
             Some(sub) => st.sessions.values().filter(|v| v.info.id != id && st.sees(v, sub)).map(|v| v.info.id).collect(),
             None => return,
         };
+        st.end_peer_media(id);
         let Some(s) = st.sessions.remove(&id) else { return };
         info!("client {} (id {id}) left: {reason:?}", s.info.nickname);
         for other in st.sessions.values_mut() {
@@ -1640,6 +1695,7 @@ impl Server {
         }
         if let Some(b) = before {
             st.prune_view_as();
+            self.prune_media(&mut st);
             st.apply_visibility(b, |st, s| self.account_state(st, s));
         }
         drop(st);
@@ -2233,6 +2289,27 @@ impl Server {
                 st.send(me, S2C::FileLimits(st.file_limits));
                 Ok(())
             }
+            C2S::SetTransferLimits(limits) => self.set_transfer_limits(st, me, limits),
+            C2S::ClientTransferLimits(prefs) => {
+                if !prefs.valid() {
+                    return Err("Invalid transfer limits".into());
+                }
+                let s = st.sessions.get_mut(&me).ok_or("Disconnected")?;
+                s.upload_rate.set(prefs.upload_kib);
+                s.download_rate.set(prefs.download_kib);
+                s.transfer_prefs = prefs;
+                Ok(())
+            }
+            C2S::SetGame(game) => self.set_game(st, me, game),
+            C2S::SetServerIcon(image) => self.set_icon(st, me, image),
+            C2S::BlockDm { uid, block } => self.block_dm(st, me, uid, block),
+            C2S::OfferMedia { to, stream, camera } => self.offer_media(st, me, to, stream, camera),
+            C2S::AnswerMedia { from, stream, accept } => self.answer_media(st, me, from, stream, accept),
+            C2S::EndMedia { peer, stream } => {
+                st.end_media(me, peer, stream);
+                st.end_media(peer, me, stream);
+                Ok(())
+            }
             C2S::SetFileLimits(l) => {
                 self.need(st.server_perms(st.session(me)?), perm::SERVER_EDIT)?;
                 db(self.store.save_file_limits(&l))?;
@@ -2784,7 +2861,7 @@ impl Server {
             }
             TextTarget::Private(other) => {
                 self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
-                st.session(other)?;
+                self.dm_pair(st, me, other)?;
                 let m = ChatMessage { id: 0, target: TextTarget::Private(me), from: Some(me), from_uid, from_name, ts, text };
                 st.send(other, S2C::Text(m.clone()));
                 st.send(me, S2C::Text(ChatMessage { target: TextTarget::Private(other), ..m }));
@@ -3305,6 +3382,7 @@ impl Server {
         let uid = s.info.uid.clone();
         if !was_hidden && s.hidden() {
             self.touch_last_seen(&uid);
+            self.prune_media(st);
         }
         st.announce_visibility(me, was_hidden, self.avatar_meta(&uid));
         st.broadcast_client(me);
@@ -3609,6 +3687,7 @@ impl Server {
         if s.info.uid == to_uid {
             return Err("You cannot message yourself".into());
         }
+        self.check_dm_uid(s, &to_uid)?;
         let online: Vec<ClientId> = st.sessions.values().filter(|x| x.info.uid == to_uid).map(|x| x.info.id).collect();
         if !online.is_empty() {
             // Someone invisible looks offline: hand the message over directly, and answer
@@ -3641,6 +3720,9 @@ impl Server {
 
     /// Undelivered offline messages are kept for `OFFLINE_DAYS`.
     pub fn purge_offline(&self) {
+        if let Err(e) = self.store.expire_clips(now_unix().saturating_sub(30 * 86_400)) {
+            warn!("video message cleanup failed: {e:#}");
+        }
         let cutoff = now_unix().saturating_sub(OFFLINE_DAYS * 86_400);
         match self.store.purge_offline_before(cutoff) {
             Ok(n) if n > 0 => info!("removed {n} undelivered offline message(s) older than {OFFLINE_DAYS} days"),
@@ -3733,6 +3815,7 @@ impl Server {
             }
             TextTarget::Private(other) => {
                 self.need(st.server_perms(s), perm::PRIVATE_MESSAGE)?;
+                self.dm_pair(st, me, other)?;
                 let other_uid = st.session(other)?.info.uid.clone();
                 let image = db(self.store.new_image_id())?;
                 let text = ImageRef { id: image, width, height, name: name.clone() }.to_text();

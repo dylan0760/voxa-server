@@ -209,6 +209,29 @@ pub enum C2S {
     /// own permissions). Needs "Manage groups"; never more than your own permissions.
     /// Ends by itself when you disconnect. Answered with `ViewingAs`.
     ViewAs(Option<Vec<GroupId>>),
+    // Server 1.31+: new messages are appended; existing wire layouts stay intact.
+    SetTransferLimits(crate::transfers::TransferLimits),
+    ClientTransferLimits(crate::transfers::TransferLimits),
+    SetServerIcon(Option<Vec<u8>>),
+    SetGame(Option<String>),
+    BlockDm {
+        uid: String,
+        block: bool,
+    },
+    OfferMedia {
+        to: ClientId,
+        stream: u32,
+        camera: bool,
+    },
+    AnswerMedia {
+        from: ClientId,
+        stream: u32,
+        accept: bool,
+    },
+    EndMedia {
+        peer: ClientId,
+        stream: u32,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -370,6 +393,32 @@ pub enum S2C {
     // --- added in 1.30.0; only sent to clients that are 1.38.0 or newer ---
     /// You now see the server as these groups (`None`: as yourself again).
     ViewingAs(Option<Vec<GroupId>>),
+    TransferLimits(crate::transfers::TransferLimits),
+    ServerIcon(Option<Vec<u8>>),
+    Playing {
+        client: ClientId,
+        game: Option<String>,
+    },
+    DmBlocks(Vec<String>),
+    MediaOffer {
+        from: ClientId,
+        stream: u32,
+        camera: bool,
+    },
+    MediaAnswer {
+        peer: ClientId,
+        stream: u32,
+        accept: bool,
+    },
+    MediaEnded {
+        peer: ClientId,
+        stream: u32,
+    },
+    OfflineVideoSent {
+        uid: String,
+        text: String,
+        ts: u64,
+    },
 }
 
 /// Messages on the secondary "bulk" connection used for screen sharing and file
@@ -413,6 +462,8 @@ pub enum BulkC2S {
     // --- added in 1.29.0; only sent to servers that are 1.29.0 or newer ---
     /// `AddServerGif` with search words (e.g. the tags of the GIF's page on GIPHY).
     AddServerGifTagged { id: u32, category: String, name: String, tags: Vec<String>, data: Vec<u8> },
+    DirectFrame { to: ClientId, stream: u32, jpeg: Vec<u8> },
+    VideoMessage { id: u32, uid: String, data: Vec<u8> },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -449,6 +500,7 @@ pub enum BulkS2C {
     // --- added in 1.28.0; only sent to clients that are 1.36.0 or newer ---
     /// The answer to `AddServerGif` (`error` None: added).
     ServerGifAdded { id: u32, error: Option<String> },
+    DirectFrame { from: ClientId, stream: u32, jpeg: Vec<u8> },
 }
 
 pub const FILE_CHUNK: usize = 256 * 1024;

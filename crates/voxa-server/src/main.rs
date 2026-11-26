@@ -1,4 +1,4 @@
-//! Voxa Server - free and open source voice, chat and screen sharing server.
+//! Voxa Server - non-commercial voice, chat and screen sharing server.
 
 #[cfg(windows)]
 mod accounts;

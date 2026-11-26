@@ -1,7 +1,7 @@
 # Builds Voxa Server (+ Voxa Server Manager) and its MSI installer into .\dist
 #   .\build.ps1             full build
 #   .\build.ps1 -SkipCargo  only re-package the MSI from the last build
-param([switch]$SkipCargo)
+param([switch]$SkipCargo, [switch]$NoCopy)
 
 # ---- product configuration ----------------------------------------------------------
 $Product = @{
@@ -66,8 +66,7 @@ try {
     Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $stage | Out-Null
     Copy-Item (Join-Path $Root 'README.md') (Join-Path $stage 'README.txt')
-    Copy-Item (Join-Path $Root 'LICENSE-MIT') (Join-Path $stage 'LICENSE-MIT.txt')
-    Copy-Item (Join-Path $Root 'LICENSE-APACHE') (Join-Path $stage 'LICENSE-APACHE.txt')
+    Copy-Item (Join-Path $Root 'LICENSE') (Join-Path $stage 'LICENSE.txt')
 
     Write-Host 'Collecting third-party licenses...'
     $meta = (& cargo "+$Toolchain" metadata --format-version 1 --filter-platform $Target) | Out-String | ConvertFrom-Json
@@ -119,7 +118,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'light failed' }
     Write-Host "Built $msi" -ForegroundColor Green
     $copy = Join-Path $Root $Product.CopyTo
-    if ($Product.CopyTo -and (Test-Path $copy)) {
+    if (-not $NoCopy -and $Product.CopyTo -and (Test-Path $copy)) {
         Copy-Item $msi $copy -Force
         Write-Host "Copied to $((Resolve-Path $copy).Path)" -ForegroundColor Green
     }
